@@ -168,6 +168,21 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
             )
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
+    # 할인율 정리 (0~1 비율로 정규화)
+    if "similar_discount_rate" in df.columns:
+        dr = (
+            df["similar_discount_rate"]
+            .astype(str)
+            .str.replace("%", "", regex=False)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+        )
+        dr = pd.to_numeric(dr, errors="coerce")
+        # 30(%) 같은 값이면 0.30으로
+        if dr.notna().any() and dr.max(skipna=True) > 1:
+            dr = dr / 100.0
+        df["similar_discount_rate"] = dr
+
     # week 정렬용 숫자 컬럼 생성
     # 예: 2025-10 -> 202510
     df["week_sort"] = (
@@ -423,8 +438,11 @@ else:
 st.subheader("매출 추세")
 
 sales_total_week_df = (
-    df_filtered.groupby(["similar_week", "week_sort", "week_label"], as_index=False)["similar_gross_sales"]
-    .sum()
+    df_filtered.groupby(["similar_week", "week_sort", "week_label"], as_index=False)
+    .agg(
+        similar_gross_sales=("similar_gross_sales", "sum"),
+        avg_discount_rate=("similar_discount_rate", "mean") if "similar_discount_rate" in df_filtered.columns else ("similar_gross_sales", "size"),
+    )
     .sort_values("week_sort")
 )
 
@@ -440,14 +458,35 @@ fig_sales.add_trace(
         line=dict(color="rgba(120,120,120,0.55)", width=2),
         fill="tozeroy",
         fillcolor="rgba(120,120,120,0.22)",
-        hovertemplate="주차=%{x}<br>전체 매출=%{y:,.0f}<extra></extra>",
+        customdata=(
+            sales_total_week_df["avg_discount_rate"]
+            if "similar_discount_rate" in df_filtered.columns
+            else [None] * len(sales_total_week_df)
+        ),
+        hovertemplate=(
+            "주차=%{x}<br>"
+            "전체 매출=%{y:,.0f}<br>"
+            "평균 할인율=%{customdata:.1%}"
+            "<extra></extra>"
+        )
+        if "similar_discount_rate" in df_filtered.columns
+        else (
+            "주차=%{x}<br>"
+            "전체 매출=%{y:,.0f}<br>"
+            "평균 할인율=-"
+            "<extra></extra>"
+        ),
     )
 )
 
 if selected_store != "전체" and not store_week_df.empty:
+    df_store_filtered = df_filtered[df_filtered["similar_store_name"] == selected_store].copy()
     sales_store_week_df = (
-        store_week_df.groupby(["similar_week", "week_sort", "week_label"], as_index=False)["similar_gross_sales"]
-        .sum()
+        df_store_filtered.groupby(["similar_week", "week_sort", "week_label"], as_index=False)
+        .agg(
+            similar_gross_sales=("similar_gross_sales", "sum"),
+            avg_discount_rate=("similar_discount_rate", "mean") if "similar_discount_rate" in df_store_filtered.columns else ("similar_gross_sales", "size"),
+        )
         .sort_values("week_sort")
     )
     fig_sales.add_trace(
@@ -459,7 +498,24 @@ if selected_store != "전체" and not store_week_df.empty:
             line=dict(color="rgba(220,50,50,0.70)", width=2),
             fill="tozeroy",
             fillcolor="rgba(220,50,50,0.25)",
-            hovertemplate="주차=%{x}<br>선택 매장 매출=%{y:,.0f}<extra></extra>",
+            customdata=(
+                sales_store_week_df["avg_discount_rate"]
+                if "similar_discount_rate" in df_store_filtered.columns
+                else [None] * len(sales_store_week_df)
+            ),
+            hovertemplate=(
+                "주차=%{x}<br>"
+                "선택 매장 매출=%{y:,.0f}<br>"
+                "평균 할인율=%{customdata:.1%}"
+                "<extra></extra>"
+            )
+            if "similar_discount_rate" in df_store_filtered.columns
+            else (
+                "주차=%{x}<br>"
+                "선택 매장 매출=%{y:,.0f}<br>"
+                "평균 할인율=-"
+                "<extra></extra>"
+            ),
         )
     )
 
