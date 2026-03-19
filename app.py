@@ -353,13 +353,16 @@ style_list = sorted(df["style_code"].dropna().unique().tolist())
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    selected_style = st.selectbox("스타일", style_list)
+    default_style = "SPRWG37G01"
+    style_idx = style_list.index(default_style) if default_style in style_list else 0
+    selected_style = st.selectbox("스타일", style_list, index=style_idx)
 
 style_df_for_filter = df[df["style_code"] == selected_style].copy()
 store_list = sorted(style_df_for_filter["similar_store_name"].dropna().unique().tolist())
 
 with col2:
-    selected_store = st.selectbox("매장", ["전체"] + store_list)
+    store_options = ["전체"] + store_list
+    selected_store = st.selectbox("매장", store_options, index=store_options.index("코엑스몰"))
 
 with col3:
     try:
@@ -600,18 +603,6 @@ try:
     if "week" in sa.columns:
         sa["week"] = sa["week"].astype(str).str.strip()
 
-        with st.expander("디버그: sales_actual", expanded=False):
-            st.write("sales_actual columns:", sa.columns.tolist())
-            st.write("sales_actual row count before filter:", len(sa))
-            if "style_code" in sa.columns:
-                st.write("sales_actual style sample:", sa["style_code"].dropna().astype(str).unique()[:10])
-            if "store_name" in sa.columns:
-                st.write("sales_actual store sample:", sa["store_name"].dropna().astype(str).unique()[:10])
-            if "color" in sa.columns:
-                st.write("sales_actual color sample:", sa["color"].dropna().astype(str).unique()[:10])
-            if "size" in sa.columns:
-                st.write("sales_actual size dtype:", sa["size"].astype(str).head().tolist())
-
         # forecast_base.similar_week ↔ sales_actual.week 매핑(표시용 week_label/week_sort 부여)
         week_map_df = (
             df_filtered[["similar_week", "week_sort", "week_label"]]
@@ -665,10 +656,6 @@ try:
 
         # sales_actual에서 올해 "판매량"은 sales_qty를 최우선 사용
         sales_col = "sales_qty" if "sales_qty" in sa_mapped.columns else resolve_sales_actual_sales_column(sa_mapped)
-
-        with st.expander("디버그: sales_actual", expanded=False):
-            st.write("sales_actual row count after filter:", len(sa_mapped))
-            st.write("resolved sales column:", sales_col if sales_col else None)
         if sales_col:
             sa_mapped[sales_col] = (
                 sa_mapped[sales_col]
