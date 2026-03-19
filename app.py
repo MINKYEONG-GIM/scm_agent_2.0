@@ -461,7 +461,6 @@ st.subheader("매출 추세")
 sales_total_week_df = (
     df_filtered.groupby(["similar_week", "week_sort", "week_label"], as_index=False)
     .agg(
-        similar_gross_sales=("similar_gross_sales", "sum"),
         sales_qty=("similar_forecast_qty", "sum") if "similar_forecast_qty" in df_filtered.columns else ("similar_gross_sales", "size"),
         avg_discount_rate=("similar_discount_rate", "mean") if "similar_discount_rate" in df_filtered.columns else ("similar_gross_sales", "size"),
     )
@@ -474,7 +473,7 @@ fig_sales = go.Figure()
 fig_sales.add_trace(
     go.Scatter(
         x=sales_total_week_df["week_label"],
-        y=sales_total_week_df["similar_gross_sales"],
+        y=sales_total_week_df["sales_qty"],
         name="전체 매장(스타일)",
         mode="lines",
         line=dict(color="rgba(120,120,120,0.55)", width=2),
@@ -496,7 +495,7 @@ fig_sales.add_trace(
         hovertemplate=(
             "%{x}<br>"
             "판매수량=%{customdata[0]:,.0f}<br>"
-            "전체 매출=%{y:,.0f}<br>"
+            "전체 판매수량=%{y:,.0f}<br>"
             "평균 할인율=%{customdata[1]:.1%}"
             "<extra></extra>"
         )
@@ -504,7 +503,7 @@ fig_sales.add_trace(
         else (
             "%{x}<br>"
             "판매수량=%{customdata[0]:,.0f}<br>"
-            "전체 매출=%{y:,.0f}<br>"
+            "전체 판매수량=%{y:,.0f}<br>"
             "평균 할인율=-"
             "<extra></extra>"
         )
@@ -512,7 +511,7 @@ fig_sales.add_trace(
         else (
             "판매수량=-<br>"
             "%{x}<br>"
-            "전체 매출=%{y:,.0f}<br>"
+            "전체 판매수량=%{y:,.0f}<br>"
             "평균 할인율=%{customdata[0]:.1%}"
             "<extra></extra>"
         )
@@ -520,7 +519,7 @@ fig_sales.add_trace(
         else (
             "판매수량=-<br>"
             "%{x}<br>"
-            "전체 매출=%{y:,.0f}<br>"
+            "전체 판매수량=%{y:,.0f}<br>"
             "평균 할인율=-"
             "<extra></extra>"
         ),
@@ -532,7 +531,6 @@ if selected_store != "전체" and not store_week_df.empty:
     sales_store_week_df = (
         df_store_filtered.groupby(["similar_week", "week_sort", "week_label"], as_index=False)
         .agg(
-            similar_gross_sales=("similar_gross_sales", "sum"),
             sales_qty=("similar_forecast_qty", "sum") if "similar_forecast_qty" in df_store_filtered.columns else ("similar_gross_sales", "size"),
             avg_discount_rate=("similar_discount_rate", "mean") if "similar_discount_rate" in df_store_filtered.columns else ("similar_gross_sales", "size"),
         )
@@ -541,7 +539,7 @@ if selected_store != "전체" and not store_week_df.empty:
     fig_sales.add_trace(
         go.Scatter(
             x=sales_store_week_df["week_label"],
-            y=sales_store_week_df["similar_gross_sales"],
+            y=sales_store_week_df["sales_qty"],
             name=f"{selected_store}",
             mode="lines",
             line=dict(color="rgba(220,50,50,0.70)", width=2),
@@ -563,7 +561,7 @@ if selected_store != "전체" and not store_week_df.empty:
             hovertemplate=(
                 "%{x}<br>"
                 "판매수량=%{customdata[0]:,.0f}<br>"
-                "선택 매장 매출=%{y:,.0f}<br>"
+                "선택 매장 판매수량=%{y:,.0f}<br>"
                 "평균 할인율=%{customdata[1]:.1%}"
                 "<extra></extra>"
             )
@@ -571,7 +569,7 @@ if selected_store != "전체" and not store_week_df.empty:
             else (
                 "%{x}<br>"
                 "판매수량=%{customdata[0]:,.0f}<br>"
-                "선택 매장 매출=%{y:,.0f}<br>"
+                "선택 매장 판매수량=%{y:,.0f}<br>"
                 "평균 할인율=-"
                 "<extra></extra>"
             )
@@ -579,7 +577,7 @@ if selected_store != "전체" and not store_week_df.empty:
             else (
                 "판매수량=-<br>"
                 "%{x}<br>"
-                "선택 매장 매출=%{y:,.0f}<br>"
+                "선택 매장 판매수량=%{y:,.0f}<br>"
                 "평균 할인율=%{customdata[0]:.1%}"
                 "<extra></extra>"
             )
@@ -587,7 +585,7 @@ if selected_store != "전체" and not store_week_df.empty:
             else (
                 "판매수량=-<br>"
                 "%{x}<br>"
-                "선택 매장 매출=%{y:,.0f}<br>"
+                "선택 매장 판매수량=%{y:,.0f}<br>"
                 "평균 할인율=-"
                 "<extra></extra>"
             ),
@@ -655,19 +653,19 @@ try:
                 go.Scatter(
                     x=sa_week["week_label"],
                     y=sa_week[sales_col],
-                    name="올해 매출",
+                    name="올해 판매수량",
                     mode="lines",
                     line=dict(color="rgba(30,90,220,0.95)", width=4),
-                    hovertemplate="%{x}<br>올해 매출=%{y:,.0f}<extra></extra>",
+                    hovertemplate="%{x}<br>올해 판매수량=%{y:,.0f}<extra></extra>",
                 )
             )
 except Exception:
     pass
 
 fig_sales.update_layout(
-    title=f"{selected_style} 매출 추세 (필터 적용됨)",
+    title=f"{selected_style} 판매수량 추세 (필터 적용됨)",
     xaxis_title="주차",
-    yaxis_title="매출",
+    yaxis_title="판매수량",
     height=420,
     legend_title="추세선",
     xaxis=dict(categoryorder="array", categoryarray=week_order),
