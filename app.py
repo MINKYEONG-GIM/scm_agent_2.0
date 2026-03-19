@@ -122,6 +122,8 @@ def resolve_sales_actual_sales_column(sales_actual_df: pd.DataFrame):
     (실제 컬럼명은 시트마다 다를 수 있어, 후보를 순서대로 탐색합니다.)
     """
     candidates = [
+        "sales_amount",
+        "sales_qty",
         "gross_sales",
         "sales",
         "actual_sales",
@@ -654,8 +656,8 @@ try:
                 sa_mapped["similar_size"] = sa_mapped["similar_size"].astype(str).str.strip()
                 sa_mapped = sa_mapped[sa_mapped["similar_size"].isin(selected_sizes)]
 
-        # sales_actual에서 올해 "판매량"은 sales_qty를 최우선 사용
-        sales_col = "sales_qty" if "sales_qty" in sa_mapped.columns else resolve_sales_actual_sales_column(sa_mapped)
+        # sales_actual에서 올해 "판매량"은 sales_amount를 최우선 사용
+        sales_col = "sales_amount" if "sales_amount" in sa_mapped.columns else resolve_sales_actual_sales_column(sa_mapped)
         if sales_col:
             sa_mapped[sales_col] = (
                 sa_mapped[sales_col]
@@ -672,7 +674,7 @@ try:
                 .sort_values("week_sort")
             )
 
-            line_name = "올해 판매량" if sales_col == "sales_qty" else "올해 매출"
+            line_name = "올해 판매량" if sales_col in ["sales_amount", "sales_qty"] else "올해 매출"
             fig_sales.add_trace(
                 go.Scatter(
                     x=sa_week["week_label"],
