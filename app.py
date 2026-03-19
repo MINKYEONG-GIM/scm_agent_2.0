@@ -357,25 +357,26 @@ if total_week_df.empty:
     st.stop()
 
 
-# 스타일명 하나 가져오기
+# 스타일명: sales_actual 워크시트의 style_name에서 가져오기
 style_name = ""
-temp_name_df = df[df["style_code"] == selected_style]
-if "similar_style_name" in temp_name_df.columns and not temp_name_df.empty:
-    names = temp_name_df["similar_style_name"].dropna().unique().tolist()
-    if names:
-        style_name = names[0]
+try:
+    _sales_actual_df = load_sales_actual_df()
+    _sales_actual_df.columns = [str(c).strip() for c in _sales_actual_df.columns]
+    if "style_code" in _sales_actual_df.columns:
+        _sales_actual_df["style_code"] = _sales_actual_df["style_code"].astype(str).str.strip()
+        _sales_actual_df = _sales_actual_df[_sales_actual_df["style_code"] == selected_style]
+    if "style_name" in _sales_actual_df.columns and not _sales_actual_df.empty:
+        _sales_actual_df["style_name"] = _sales_actual_df["style_name"].astype(str).str.strip()
+        _names = [n for n in _sales_actual_df["style_name"].dropna().unique().tolist() if n and n != "nan"]
+        if _names:
+            style_name = _names[0]
+except Exception:
+    style_name = ""
 
-# KPI
-total_sales = int(store_week_df["similar_gross_sales"].sum())
-store_count = int(store_week_df["similar_store_code"].nunique())
-week_count = int(store_week_df["similar_week"].nunique())
-peak_week = total_week_df.loc[total_week_df["similar_gross_sales"].idxmax(), "similar_week"]
-
+# KPI (스타일코드 + 스타일명만 표시)
 k1, _k2, _k3, _k4 = st.columns(4)
-k1.metric("스타일코드", selected_style)
-
-if style_name:
-    st.caption(f"스타일명 참고: {style_name}")
+style_display = f"{selected_style}  {style_name}" if style_name else selected_style
+k1.metric("스타일코드", style_display)
 
 
 # =========================
