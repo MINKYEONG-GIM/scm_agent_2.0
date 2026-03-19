@@ -1,6 +1,7 @@
 import os
 import json
 from typing import Tuple
+from datetime import date
 
 import pandas as pd
 import plotly.express as px
@@ -176,6 +177,27 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     )
     df["week_sort"] = pd.to_numeric(df["week_sort"], errors="coerce")
 
+    def _week_to_month_week_label(v: str) -> str:
+        """
+        'YYYY-WW' 형태를 'M월 N주차'로 변환.
+        ISO week 기준(해당 주의 월요일)으로 월/월내주차 계산.
+        변환 실패 시 원본 반환.
+        """
+        s = str(v).strip()
+        if not s or s.lower() == "nan" or "-" not in s:
+            return s
+        y, w = s.split("-", 1)
+        try:
+            year = int(y)
+            week = int(w)
+            d = date.fromisocalendar(year, week, 1)  # Monday of ISO week
+            week_in_month = (d.day - 1) // 7 + 1
+            return f"{d.month}월 {week_in_month}주차"
+        except Exception:
+            return s
+
+    df["week_label"] = df["similar_week"].apply(_week_to_month_week_label)
+
     return df
 
 
@@ -197,7 +219,7 @@ def build_style_summary(df: pd.DataFrame, selected_style: str) -> Tuple[pd.DataF
     # 같은 주차/매장에 여러 행이 있을 수 있으므로 합산
     store_week_df = (
         style_df.groupby(
-            ["style_code", "similar_store_code", "similar_store_name", "similar_week", "week_sort"],
+            ["style_code", "similar_store_code", "similar_store_name", "similar_week", "week_sort", "week_label"],
             as_index=False
         )["similar_gross_sales"]
         .sum()
@@ -206,7 +228,7 @@ def build_style_summary(df: pd.DataFrame, selected_style: str) -> Tuple[pd.DataF
 
     # 스타일 전체 주차별 매출
     total_week_df = (
-        store_week_df.groupby(["style_code", "similar_week", "week_sort"], as_index=False)["similar_gross_sales"]
+        store_week_df.groupby(["style_code", "similar_week", "week_sort", "week_label"], as_index=False)["similar_gross_sales"]
         .sum()
         .sort_values("week_sort")
     )
@@ -398,18 +420,20 @@ else:
 # =========================
 # 8) 최상단: 전체 vs 선택 매장 매출 추세 (오버레이)
 # =========================
-st.subheader("1. 매출 추세 (전체 매장 vs 선택 매장)")
+st.subheader("매출 추세")
 
 sales_total_week_df = (
-    df_filtered.groupby(["similar_week", "week_sort"], as_index=False)["similar_gross_sales"]
+    df_filtered.groupby(["similar_week", "week_sort", "week_label"], as_index=False)["similar_gross_sales"]
     .sum()
     .sort_values("week_sort")
 )
 
+week_order = sales_total_week_df.sort_values("week_sort")["week_label"].tolist()
+
 fig_sales = go.Figure()
 fig_sales.add_trace(
     go.Scatter(
-        x=sales_total_week_df["similar_week"],
+        x=sales_total_week_df["week_label"],
         y=sales_total_week_df["similar_gross_sales"],
         name="전체 매장(스타일)",
         mode="lines",
@@ -422,13 +446,13 @@ fig_sales.add_trace(
 
 if selected_store != "전체" and not store_week_df.empty:
     sales_store_week_df = (
-        store_week_df.groupby(["similar_week", "week_sort"], as_index=False)["similar_gross_sales"]
+        store_week_df.groupby(["similar_week", "week_sort", "week_label"], as_index=False)["similar_gross_sales"]
         .sum()
         .sort_values("week_sort")
     )
     fig_sales.add_trace(
         go.Scatter(
-            x=sales_store_week_df["similar_week"],
+            x=sales_store_week_df["week_label"],
             y=sales_store_week_df["similar_gross_sales"],
             name=f"{selected_store}",
             mode="lines",
@@ -445,6 +469,7 @@ fig_sales.update_layout(
     yaxis_title="매출",
     height=420,
     legend_title="추세선",
+    xaxis=dict(categoryorder="array", categoryarray=week_order),
 )
 st.plotly_chart(fig_sales, use_container_width=True)
 
@@ -458,7 +483,7 @@ top_store_df = store_week_df.copy()
 
 fig_store = px.line(
     top_store_df,
-    x="similar_week",
+    x="week_label",
     y="store_plc_index",
     color="similar_store_name",
     markers=True,
@@ -471,6 +496,7 @@ fig_store.update_layout(
     height=500,
     legend_title="매장명"
 )
+fig_store.update_xaxes(categoryorder="array", categoryarray=week_order)
 st.plotly_chart(fig_store, use_container_width=True)
 
 
@@ -482,7 +508,7 @@ st.subheader("3. 매장별 주차 점유율 히트맵")
 heatmap_df = (
     top_store_df.pivot_table(
         index="similar_store_name",
-        columns="similar_week",
+        columns="week_label",
         values="store_share",
         aggfunc="sum",
         fill_value=0
@@ -491,6 +517,9 @@ heatmap_df = (
 )
 
 if not heatmap_df.empty:
+    ordered_cols = [c for c in week_order if c in heatmap_df.columns]
+    remaining = [c for c in heatmap_df.columns if c not in ordered_cols]
+    heatmap_df = heatmap_df[ordered_cols + remaining]
     fig_heatmap = go.Figure(
         data=go.Heatmap(
             z=heatmap_df.values,
@@ -533,7 +562,7 @@ st.subheader("5. 주차별 매장 매출 상세")
 detail_df = store_week_df.copy().rename(columns={
     "similar_store_code": "매장코드",
     "similar_store_name": "매장명",
-    "similar_week": "주차",
+    "week_label": "주차",
     "similar_gross_sales": "매출",
     "total_week_sales": "전체주차매출",
     "store_share": "주차점유율",
