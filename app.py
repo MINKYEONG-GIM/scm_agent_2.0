@@ -441,6 +441,7 @@ sales_total_week_df = (
     df_filtered.groupby(["similar_week", "week_sort", "week_label"], as_index=False)
     .agg(
         similar_gross_sales=("similar_gross_sales", "sum"),
+        sales_qty=("similar_forecast_qty", "sum") if "similar_forecast_qty" in df_filtered.columns else ("similar_gross_sales", "size"),
         avg_discount_rate=("similar_discount_rate", "mean") if "similar_discount_rate" in df_filtered.columns else ("similar_gross_sales", "size"),
     )
     .sort_values("week_sort")
@@ -459,18 +460,44 @@ fig_sales.add_trace(
         fill="tozeroy",
         fillcolor="rgba(120,120,120,0.22)",
         customdata=(
-            sales_total_week_df["avg_discount_rate"]
-            if "similar_discount_rate" in df_filtered.columns
-            else [None] * len(sales_total_week_df)
+            sales_total_week_df[["sales_qty", "avg_discount_rate"]].to_numpy()
+            if ("similar_forecast_qty" in df_filtered.columns and "similar_discount_rate" in df_filtered.columns)
+            else (
+                sales_total_week_df[["sales_qty"]].to_numpy()
+                if "similar_forecast_qty" in df_filtered.columns
+                else (
+                    sales_total_week_df[["avg_discount_rate"]].to_numpy()
+                    if "similar_discount_rate" in df_filtered.columns
+                    else [[None]] * len(sales_total_week_df)
+                )
+            )
         ),
         hovertemplate=(
+            "판매수량=%{customdata[0]:,.0f}<br>"
             "주차=%{x}<br>"
             "전체 매출=%{y:,.0f}<br>"
-            "평균 할인율=%{customdata:.1%}"
+            "평균 할인율=%{customdata[1]:.1%}"
+            "<extra></extra>"
+        )
+        if ("similar_forecast_qty" in df_filtered.columns and "similar_discount_rate" in df_filtered.columns)
+        else (
+            "판매수량=%{customdata[0]:,.0f}<br>"
+            "주차=%{x}<br>"
+            "전체 매출=%{y:,.0f}<br>"
+            "평균 할인율=-"
+            "<extra></extra>"
+        )
+        if "similar_forecast_qty" in df_filtered.columns
+        else (
+            "판매수량=-<br>"
+            "주차=%{x}<br>"
+            "전체 매출=%{y:,.0f}<br>"
+            "평균 할인율=%{customdata[0]:.1%}"
             "<extra></extra>"
         )
         if "similar_discount_rate" in df_filtered.columns
         else (
+            "판매수량=-<br>"
             "주차=%{x}<br>"
             "전체 매출=%{y:,.0f}<br>"
             "평균 할인율=-"
@@ -485,6 +512,7 @@ if selected_store != "전체" and not store_week_df.empty:
         df_store_filtered.groupby(["similar_week", "week_sort", "week_label"], as_index=False)
         .agg(
             similar_gross_sales=("similar_gross_sales", "sum"),
+            sales_qty=("similar_forecast_qty", "sum") if "similar_forecast_qty" in df_store_filtered.columns else ("similar_gross_sales", "size"),
             avg_discount_rate=("similar_discount_rate", "mean") if "similar_discount_rate" in df_store_filtered.columns else ("similar_gross_sales", "size"),
         )
         .sort_values("week_sort")
@@ -499,18 +527,44 @@ if selected_store != "전체" and not store_week_df.empty:
             fill="tozeroy",
             fillcolor="rgba(220,50,50,0.25)",
             customdata=(
-                sales_store_week_df["avg_discount_rate"]
-                if "similar_discount_rate" in df_store_filtered.columns
-                else [None] * len(sales_store_week_df)
+                sales_store_week_df[["sales_qty", "avg_discount_rate"]].to_numpy()
+                if ("similar_forecast_qty" in df_store_filtered.columns and "similar_discount_rate" in df_store_filtered.columns)
+                else (
+                    sales_store_week_df[["sales_qty"]].to_numpy()
+                    if "similar_forecast_qty" in df_store_filtered.columns
+                    else (
+                        sales_store_week_df[["avg_discount_rate"]].to_numpy()
+                        if "similar_discount_rate" in df_store_filtered.columns
+                        else [[None]] * len(sales_store_week_df)
+                    )
+                )
             ),
             hovertemplate=(
+                "판매수량=%{customdata[0]:,.0f}<br>"
                 "주차=%{x}<br>"
                 "선택 매장 매출=%{y:,.0f}<br>"
-                "평균 할인율=%{customdata:.1%}"
+                "평균 할인율=%{customdata[1]:.1%}"
+                "<extra></extra>"
+            )
+            if ("similar_forecast_qty" in df_store_filtered.columns and "similar_discount_rate" in df_store_filtered.columns)
+            else (
+                "판매수량=%{customdata[0]:,.0f}<br>"
+                "주차=%{x}<br>"
+                "선택 매장 매출=%{y:,.0f}<br>"
+                "평균 할인율=-"
+                "<extra></extra>"
+            )
+            if "similar_forecast_qty" in df_store_filtered.columns
+            else (
+                "판매수량=-<br>"
+                "주차=%{x}<br>"
+                "선택 매장 매출=%{y:,.0f}<br>"
+                "평균 할인율=%{customdata[0]:.1%}"
                 "<extra></extra>"
             )
             if "similar_discount_rate" in df_store_filtered.columns
             else (
+                "판매수량=-<br>"
                 "주차=%{x}<br>"
                 "선택 매장 매출=%{y:,.0f}<br>"
                 "평균 할인율=-"
@@ -531,36 +585,11 @@ st.plotly_chart(fig_sales, use_container_width=True)
 
 
 # =========================
-# 9) 매장 PLC 그래프
+# 9) 매장 점유율 히트맵
 # =========================
-st.subheader("2. 매장별 PLC")
+st.subheader("2. 매장별 주차 점유율 히트맵")
 
 top_store_df = store_week_df.copy()
-
-fig_store = px.line(
-    top_store_df,
-    x="week_label",
-    y="store_plc_index",
-    color="similar_store_name",
-    markers=True,
-    title=f"{selected_style} 매장별 PLC"
-)
-fig_store.update_layout(
-    xaxis_title="주차",
-    yaxis_title="매장 PLC Index (0~1)",
-    yaxis=dict(range=[0, 1.1]),
-    height=500,
-    legend_title="매장명"
-)
-fig_store.update_xaxes(categoryorder="array", categoryarray=week_order)
-st.plotly_chart(fig_store, use_container_width=True)
-
-
-# =========================
-# 10) 매장 점유율 히트맵
-# =========================
-st.subheader("3. 매장별 주차 점유율 히트맵")
-
 heatmap_df = (
     top_store_df.pivot_table(
         index="similar_store_name",
@@ -596,9 +625,9 @@ if not heatmap_df.empty:
 
 
 # =========================
-# 11) 매장 요약표
+# 10) 매장 요약표
 # =========================
-st.subheader("4. 매장별 요약")
+st.subheader("3. 매장별 요약")
 display_summary = store_summary_df.copy()
 display_summary = display_summary.rename(columns={
     "similar_store_code": "매장코드",
@@ -612,9 +641,9 @@ st.dataframe(display_summary, use_container_width=True, hide_index=True)
 
 
 # =========================
-# 12) 원본 집계표
+# 11) 원본 집계표
 # =========================
-st.subheader("5. 주차별 매장 매출 상세")
+st.subheader("4. 주차별 매장 매출 상세")
 detail_df = store_week_df.copy().rename(columns={
     "similar_store_code": "매장코드",
     "similar_store_name": "매장명",
