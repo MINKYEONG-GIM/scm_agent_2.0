@@ -62,9 +62,19 @@ def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
     구글시트의 특정 워크시트를 DataFrame으로 읽습니다.
     """
     client = get_gspread_client()
-    sheet_id = st.secrets["sheets"]["sheet_id"]
+    sheets_cfg = get_sheets_config()
+    sheet_id = sheets_cfg.get("sheet_id")
+    if not sheet_id:
+        raise ValueError("secrets.toml의 [sheets].sheet_id 가 비어있습니다.")
+
     sh = client.open_by_key(sheet_id)
-    ws = sh.worksheet(worksheet_name)
+    try:
+        ws = sh.worksheet(worksheet_name)
+    except Exception as e:
+        available = [w.title for w in sh.worksheets()]
+        raise ValueError(
+            f"워크시트 '{worksheet_name}'를 찾지 못했습니다. 사용 가능한 워크시트: {available}"
+        ) from e
     values = ws.get_all_records()
     df = pd.DataFrame(values)
     return df
@@ -253,10 +263,16 @@ def build_store_rank_table(store_week_df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 try:
     forecast_base_sheet = get_forecast_base_sheet_name()
+    sheets_cfg = get_sheets_config()
+    sheet_id = sheets_cfg.get("sheet_id", "")
+    if sheet_id:
+        masked = f"{sheet_id[:6]}...{sheet_id[-6:]}" if len(sheet_id) > 12 else sheet_id
+        st.caption(f"연결 대상: sheet_id={masked}, worksheet={forecast_base_sheet}")
     raw_df = load_sheet_as_df(forecast_base_sheet)
     df = clean_data(raw_df)
 except Exception as e:
-    st.error(f"데이터 로드 중 오류가 발생했습니다: {e}")
+    st.error("데이터 로드 중 오류가 발생했습니다.")
+    st.exception(e)
     st.stop()
 
 
