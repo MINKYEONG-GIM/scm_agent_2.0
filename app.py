@@ -362,7 +362,7 @@ store_list = sorted(style_df_for_filter["similar_store_name"].dropna().unique().
 
 with col2:
     store_options = ["전체"] + store_list
-    selected_store = st.selectbox("매장", store_options, index=store_options.index("코엑스몰"))
+    selected_store = st.selectbox("매장", store_options, index=store_options.index("코엑스몰점"))
 
 with col3:
     try:
