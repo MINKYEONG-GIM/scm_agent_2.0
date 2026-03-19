@@ -104,6 +104,18 @@ def get_forecast_base_sheet_name() -> str:
 
 
 # =========================
+# 2-1) 보조 시트: sales_actual
+# =========================
+@st.cache_data(ttl=300)
+def load_sales_actual_df() -> pd.DataFrame:
+    """
+    sales_actual 워크시트를 DataFrame으로 읽습니다.
+    컬러 필터 옵션을 얻기 위해 사용합니다.
+    """
+    return load_sheet_as_df("sales_actual")
+
+
+# =========================
 # 3) 데이터 전처리
 # =========================
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -292,12 +304,26 @@ with col2:
     selected_store = st.selectbox("매장", ["전체"] + store_list)
 
 with col3:
-    if "color" in style_df_for_filter.columns:
-        color_options = sorted(style_df_for_filter["color"].dropna().unique().tolist())
-        selected_colors = st.multiselect("컬러", color_options, default=color_options)
-    else:
+    try:
+        sales_actual_df = load_sales_actual_df()
+        sales_actual_df.columns = [str(c).strip() for c in sales_actual_df.columns]
+
+        color_source = sales_actual_df.copy()
+        # sales_actual에 style_code가 있으면 선택 스타일 기준으로 컬러 후보를 좁힘
+        if "style_code" in color_source.columns:
+            color_source["style_code"] = color_source["style_code"].astype(str).str.strip()
+            color_source = color_source[color_source["style_code"] == selected_style]
+
+        if "color" in color_source.columns:
+            color_source["color"] = color_source["color"].astype(str).str.strip()
+            color_options = sorted([c for c in color_source["color"].dropna().unique().tolist() if c and c != "nan"])
+            selected_colors = st.multiselect("컬러", color_options, default=color_options)
+        else:
+            selected_colors = None
+            st.caption("sales_actual 워크시트에 color 컬럼이 없어 컬러 필터를 생략합니다.")
+    except Exception:
         selected_colors = None
-        st.caption("컬러 컬럼이 없어 컬러 필터를 생략합니다.")
+        st.caption("sales_actual 워크시트 로드에 실패해 컬러 필터를 생략합니다.")
 
 with col4:
     if "similar_size" in style_df_for_filter.columns:
@@ -314,7 +340,8 @@ with col4:
 df_filtered = df.copy()
 df_filtered = df_filtered[df_filtered["style_code"] == selected_style]
 if selected_colors is not None:
-    df_filtered = df_filtered[df_filtered["color"].isin(selected_colors)]
+    if "color" in df_filtered.columns:
+        df_filtered = df_filtered[df_filtered["color"].isin(selected_colors)]
 if selected_sizes is not None:
     df_filtered = df_filtered[df_filtered["similar_size"].isin(selected_sizes)]
 
