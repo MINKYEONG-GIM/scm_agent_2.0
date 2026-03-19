@@ -282,20 +282,29 @@ if df.empty:
 
 
 style_list = sorted(df["style_code"].dropna().unique().tolist())
+store_list = sorted(df["similar_store_name"].dropna().unique().tolist())
 
-col1, col2 = st.columns([2, 1])
+col1, col2 = st.columns(2)
 
 with col1:
     selected_style = st.selectbox("스타일코드 선택", style_list)
 
 with col2:
-    top_n_store = st.slider("상위 매장 수", min_value=5, max_value=30, value=10, step=1)
+    selected_store = st.selectbox(
+        "store_name",
+        ["전체"] + store_list
+    )
 
 
 # =========================
 # 7) 스타일별 집계
 # =========================
 total_week_df, store_week_df = build_style_summary(df, selected_style)
+if selected_store != "전체":
+    store_week_df = store_week_df[
+        store_week_df["similar_store_name"] == selected_store
+    ]
+
 store_summary_df = build_store_rank_table(store_week_df)
 
 if total_week_df.empty:
@@ -348,12 +357,11 @@ st.plotly_chart(fig_total, use_container_width=True)
 
 
 # =========================
-# 9) 상위 매장 PLC 그래프
+# 9) 매장 PLC 그래프
 # =========================
-st.subheader("2. 상위 매장별 PLC")
+st.subheader("2. 매장별 PLC")
 
-top_stores = store_summary_df.head(top_n_store)["similar_store_code"].tolist()
-top_store_df = store_week_df[store_week_df["similar_store_code"].isin(top_stores)].copy()
+top_store_df = store_week_df.copy()
 
 fig_store = px.line(
     top_store_df,
@@ -361,7 +369,7 @@ fig_store = px.line(
     y="store_plc_index",
     color="similar_store_name",
     markers=True,
-    title=f"{selected_style} 상위 {top_n_store}개 매장 PLC"
+    title=f"{selected_style} 매장별 PLC"
 )
 fig_store.update_layout(
     xaxis_title="주차",
