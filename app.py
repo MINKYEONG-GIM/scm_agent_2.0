@@ -474,7 +474,7 @@ fig_sales.add_trace(
     go.Scatter(
         x=sales_total_week_df["week_label"],
         y=sales_total_week_df["sales_qty"],
-        name="전체 매장(스타일)",
+        name="작년 전체 판매량(유사)",
         mode="lines",
         line=dict(color="rgba(120,120,120,0.55)", width=2),
         fill="tozeroy",
@@ -540,7 +540,7 @@ if selected_store != "전체" and not store_week_df.empty:
         go.Scatter(
             x=sales_store_week_df["week_label"],
             y=sales_store_week_df["sales_qty"],
-            name=f"{selected_store}",
+            name="예측 판매량",
             mode="lines",
             line=dict(color="rgba(220,50,50,0.70)", width=2),
             fill="tozeroy",
@@ -592,7 +592,7 @@ if selected_store != "전체" and not store_week_df.empty:
         )
     )
 
-# 올해 매출(sales_actual) 라인 추가: 파란색 굵은 선, 채움 없음
+# 올해(sales_actual) 라인 추가: 파란색 굵은 선, 채움 없음
 try:
     sa = load_sales_actual_df().copy()
     sa.columns = [str(c).strip() for c in sa.columns]
@@ -600,63 +600,100 @@ try:
     if "week" in sa.columns:
         sa["week"] = sa["week"].astype(str).str.strip()
 
+        with st.expander("디버그: sales_actual", expanded=False):
+            st.write("sales_actual columns:", sa.columns.tolist())
+            st.write("sales_actual row count before filter:", len(sa))
+            if "style_code" in sa.columns:
+                st.write("sales_actual style sample:", sa["style_code"].dropna().astype(str).unique()[:10])
+            if "store_name" in sa.columns:
+                st.write("sales_actual store sample:", sa["store_name"].dropna().astype(str).unique()[:10])
+            if "color" in sa.columns:
+                st.write("sales_actual color sample:", sa["color"].dropna().astype(str).unique()[:10])
+            if "size" in sa.columns:
+                st.write("sales_actual size dtype:", sa["size"].astype(str).head().tolist())
+
         # forecast_base.similar_week ↔ sales_actual.week 매핑(표시용 week_label/week_sort 부여)
         week_map_df = (
             df_filtered[["similar_week", "week_sort", "week_label"]]
             .drop_duplicates()
             .rename(columns={"similar_week": "week"})
         )
-        sa = sa.merge(week_map_df, on="week", how="inner")
+        sa_mapped = sa.merge(week_map_df, on="week", how="inner")
+
+        # 주차가 서로 안 겹치면(예: 작년 2025-xx vs 올해 2026-xx) sales_actual 자체로 라벨/정렬 생성
+        if sa_mapped.empty:
+            sa_mapped = sa.copy()
+            sa_mapped["week_sort"] = (
+                sa_mapped["week"]
+                .astype(str)
+                .str.replace("-", "", regex=False)
+                .str.replace(" ", "", regex=False)
+            )
+            sa_mapped["week_sort"] = pd.to_numeric(sa_mapped["week_sort"], errors="coerce")
+            sa_mapped["week_label"] = sa_mapped["week"].apply(lambda v: clean_data(pd.DataFrame({
+                "style_code": [selected_style],
+                "similar_style_code": [""],
+                "similar_store_code": [""],
+                "similar_store_name": [""],
+                "similar_week": [str(v)],
+                "similar_gross_sales": [0],
+            }))["week_label"].iloc[0])
 
         # 가능한 경우, 필터를 sales_actual에도 적용
-        if "style_code" in sa.columns:
-            sa["style_code"] = sa["style_code"].astype(str).str.strip()
-            sa = sa[sa["style_code"] == selected_style]
+        if "style_code" in sa_mapped.columns:
+            sa_mapped["style_code"] = sa_mapped["style_code"].astype(str).str.strip()
+            sa_mapped = sa_mapped[sa_mapped["style_code"] == selected_style]
 
         if selected_store != "전체":
             for store_col in ["store_name", "store", "store_nm", "similar_store_name", "similar_store"]:
-                if store_col in sa.columns:
-                    sa[store_col] = sa[store_col].astype(str).str.strip()
-                    sa = sa[sa[store_col] == selected_store]
+                if store_col in sa_mapped.columns:
+                    sa_mapped[store_col] = sa_mapped[store_col].astype(str).str.strip()
+                    sa_mapped = sa_mapped[sa_mapped[store_col] == selected_store]
                     break
 
-        if selected_colors is not None and "color" in sa.columns:
-            sa["color"] = sa["color"].astype(str).str.strip()
-            sa = sa[sa["color"].isin(selected_colors)]
+        if selected_colors is not None and "color" in sa_mapped.columns:
+            sa_mapped["color"] = sa_mapped["color"].astype(str).str.strip()
+            sa_mapped = sa_mapped[sa_mapped["color"].isin(selected_colors)]
 
         if selected_sizes is not None:
-            if "size" in sa.columns:
-                sa["size"] = sa["size"].astype(str).str.strip()
-                sa = sa[sa["size"].isin(selected_sizes)]
-            elif "similar_size" in sa.columns:
-                sa["similar_size"] = sa["similar_size"].astype(str).str.strip()
-                sa = sa[sa["similar_size"].isin(selected_sizes)]
+            if "size" in sa_mapped.columns:
+                sa_mapped["size"] = sa_mapped["size"].astype(str).str.strip()
+                sa_mapped = sa_mapped[sa_mapped["size"].isin(selected_sizes)]
+            elif "similar_size" in sa_mapped.columns:
+                sa_mapped["similar_size"] = sa_mapped["similar_size"].astype(str).str.strip()
+                sa_mapped = sa_mapped[sa_mapped["similar_size"].isin(selected_sizes)]
 
-        sales_col = resolve_sales_actual_sales_column(sa)
+        # sales_actual에서 올해 "판매량"은 sales_qty를 최우선 사용
+        sales_col = "sales_qty" if "sales_qty" in sa_mapped.columns else resolve_sales_actual_sales_column(sa_mapped)
+
+        with st.expander("디버그: sales_actual", expanded=False):
+            st.write("sales_actual row count after filter:", len(sa_mapped))
+            st.write("resolved sales column:", sales_col if sales_col else None)
         if sales_col:
-            sa[sales_col] = (
-                sa[sales_col]
+            sa_mapped[sales_col] = (
+                sa_mapped[sales_col]
                 .astype(str)
                 .str.replace(",", "", regex=False)
                 .str.replace("₩", "", regex=False)
                 .str.strip()
             )
-            sa[sales_col] = pd.to_numeric(sa[sales_col], errors="coerce").fillna(0)
+            sa_mapped[sales_col] = pd.to_numeric(sa_mapped[sales_col], errors="coerce").fillna(0)
 
             sa_week = (
-                sa.groupby(["week_label", "week_sort"], as_index=False)[sales_col]
+                sa_mapped.groupby(["week_label", "week_sort"], as_index=False)[sales_col]
                 .sum()
                 .sort_values("week_sort")
             )
 
+            line_name = "올해 판매량" if sales_col == "sales_qty" else "올해 매출"
             fig_sales.add_trace(
                 go.Scatter(
                     x=sa_week["week_label"],
                     y=sa_week[sales_col],
-                    name="올해 판매수량",
+                    name=line_name,
                     mode="lines",
                     line=dict(color="rgba(30,90,220,0.95)", width=4),
-                    hovertemplate="%{x}<br>올해 판매수량=%{y:,.0f}<extra></extra>",
+                    hovertemplate=f"%{{x}}<br>{line_name}=%{{y:,.0f}}<extra></extra>",
                 )
             )
 except Exception:
