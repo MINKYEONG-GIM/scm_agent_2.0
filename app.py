@@ -373,10 +373,13 @@ try:
 except Exception:
     style_name = ""
 
-# KPI (스타일코드 + 스타일명만 표시)
-k1, _k2, _k3, _k4 = st.columns(4)
-style_display = f"{selected_style}  {style_name}" if style_name else selected_style
-k1.metric("스타일코드", style_display)
+# KPI (스타일코드/스타일명 분리 표시: 스타일명 말줄임 방지)
+k1, k2, _k3, _k4 = st.columns(4)
+k1.metric("스타일코드", selected_style)
+if style_name:
+    k2.markdown(f"**스타일명**  \n{style_name}")
+else:
+    k2.markdown("**스타일명**  \n-")
 
 
 # =========================
