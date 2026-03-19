@@ -264,10 +264,12 @@ def build_store_rank_table(store_week_df: pd.DataFrame) -> pd.DataFrame:
 try:
     forecast_base_sheet = get_forecast_base_sheet_name()
     sheets_cfg = get_sheets_config()
-    
+    sheet_id = sheets_cfg.get("sheet_id", "")
+    if sheet_id:
+        masked = f"{sheet_id[:6]}...{sheet_id[-6:]}" if len(sheet_id) > 12 else sheet_id
+        st.caption(f"연결 대상: sheet_id={masked}, worksheet={forecast_base_sheet}")
     raw_df = load_sheet_as_df(forecast_base_sheet)
     df = clean_data(raw_df)
-    
 except Exception as e:
     st.error("데이터 로드 중 오류가 발생했습니다.")
     st.exception(e)
@@ -280,28 +282,49 @@ if df.empty:
 
 
 style_list = sorted(df["style_code"].dropna().unique().tolist())
-store_list = sorted(df["similar_store_name"].dropna().unique().tolist())
 
-col1, col2 = st.columns(2)
+col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    selected_style = st.selectbox("스타일코드 선택", style_list)
+    selected_style = st.selectbox("스타일", style_list)
+
+style_df_for_filter = df[df["style_code"] == selected_style].copy()
+store_list = sorted(style_df_for_filter["similar_store_name"].dropna().unique().tolist())
 
 with col2:
-    selected_store = st.selectbox(
-        "store_name",
-        ["전체"] + store_list
-    )
+    selected_store = st.selectbox("매장", ["전체"] + store_list)
+
+with col3:
+    if "similar_color" in style_df_for_filter.columns:
+        color_options = sorted(style_df_for_filter["similar_color"].dropna().unique().tolist())
+        selected_colors = st.multiselect("컬러", color_options, default=color_options)
+    else:
+        selected_colors = None
+        st.caption("컬러 컬럼이 없어 컬러 필터를 생략합니다.")
+
+with col4:
+    if "similar_size" in style_df_for_filter.columns:
+        size_options = sorted(style_df_for_filter["similar_size"].dropna().unique().tolist())
+        selected_sizes = st.multiselect("사이즈", size_options, default=size_options)
+    else:
+        selected_sizes = None
+        st.caption("사이즈 컬럼이 없어 사이즈 필터를 생략합니다.")
 
 
 # =========================
 # 7) 스타일별 집계
 # =========================
-total_week_df, store_week_df = build_style_summary(df, selected_style)
+df_filtered = df.copy()
+df_filtered = df_filtered[df_filtered["style_code"] == selected_style]
+if selected_colors is not None:
+    df_filtered = df_filtered[df_filtered["similar_color"].isin(selected_colors)]
+if selected_sizes is not None:
+    df_filtered = df_filtered[df_filtered["similar_size"].isin(selected_sizes)]
+
+total_week_df, store_week_df_all = build_style_summary(df_filtered, selected_style)
+store_week_df = store_week_df_all.copy()
 if selected_store != "전체":
-    store_week_df = store_week_df[
-        store_week_df["similar_store_name"] == selected_store
-    ]
+    store_week_df = store_week_df[store_week_df["similar_store_name"] == selected_store]
 
 store_summary_df = build_store_rank_table(store_week_df)
 
@@ -319,32 +342,73 @@ if "similar_style_name" in temp_name_df.columns and not temp_name_df.empty:
         style_name = names[0]
 
 # KPI
-k1 = st.columns(1)[0]
-k1.metric("스타일코드", selected_style)
+total_sales = int(store_week_df["similar_gross_sales"].sum())
+store_count = int(store_week_df["similar_store_code"].nunique())
+week_count = int(store_week_df["similar_week"].nunique())
+peak_week = total_week_df.loc[total_week_df["similar_gross_sales"].idxmax(), "similar_week"]
 
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("스타일코드", selected_style)
+k2.metric("유사스타일 총매출", f"{total_sales:,.0f}")
+k3.metric("매장 수", f"{store_count}")
+k4.metric("피크 주차", peak_week)
 
 if style_name:
     st.caption(f"스타일명 참고: {style_name}")
 
 
 # =========================
-# 8) 전체 PLC 그래프
+# 8) 최상단: 전체 vs 선택 매장 매출 추세 (오버레이)
 # =========================
-st.subheader("1. 전체 평균 PLC")
-fig_total = px.line(
-    total_week_df,
-    x="similar_week",
-    y="plc_index",
-    markers=True,
-    title=f"{selected_style} 전체 PLC 곡선"
+st.subheader("1. 매출 추세 (전체 매장 vs 선택 매장)")
+
+sales_total_week_df = (
+    df_filtered.groupby(["similar_week", "week_sort"], as_index=False)["similar_gross_sales"]
+    .sum()
+    .sort_values("week_sort")
 )
-fig_total.update_layout(
+
+fig_sales = go.Figure()
+fig_sales.add_trace(
+    go.Scatter(
+        x=sales_total_week_df["similar_week"],
+        y=sales_total_week_df["similar_gross_sales"],
+        name="전체 매장(스타일)",
+        mode="lines",
+        line=dict(color="rgba(120,120,120,0.55)", width=2),
+        fill="tozeroy",
+        fillcolor="rgba(120,120,120,0.22)",
+        hovertemplate="주차=%{x}<br>전체 매출=%{y:,.0f}<extra></extra>",
+    )
+)
+
+if selected_store != "전체" and not store_week_df.empty:
+    sales_store_week_df = (
+        store_week_df.groupby(["similar_week", "week_sort"], as_index=False)["similar_gross_sales"]
+        .sum()
+        .sort_values("week_sort")
+    )
+    fig_sales.add_trace(
+        go.Scatter(
+            x=sales_store_week_df["similar_week"],
+            y=sales_store_week_df["similar_gross_sales"],
+            name=f"{selected_store}",
+            mode="lines",
+            line=dict(color="rgba(220,50,50,0.70)", width=2),
+            fill="tozeroy",
+            fillcolor="rgba(220,50,50,0.25)",
+            hovertemplate="주차=%{x}<br>선택 매장 매출=%{y:,.0f}<extra></extra>",
+        )
+    )
+
+fig_sales.update_layout(
+    title=f"{selected_style} 매출 추세 (필터 적용됨)",
     xaxis_title="주차",
-    yaxis_title="PLC Index (0~1)",
-    yaxis=dict(range=[0, 1.1]),
-    height=420
+    yaxis_title="매출",
+    height=420,
+    legend_title="추세선",
 )
-st.plotly_chart(fig_total, use_container_width=True)
+st.plotly_chart(fig_sales, use_container_width=True)
 
 
 # =========================
