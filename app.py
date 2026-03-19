@@ -116,6 +116,27 @@ def load_sales_actual_df() -> pd.DataFrame:
     return load_sheet_as_df("sales_actual")
 
 
+def resolve_sales_actual_sales_column(sales_actual_df: pd.DataFrame):
+    """
+    sales_actual 워크시트에서 '올해 매출'로 사용할 컬럼명을 추정합니다.
+    (실제 컬럼명은 시트마다 다를 수 있어, 후보를 순서대로 탐색합니다.)
+    """
+    candidates = [
+        "gross_sales",
+        "sales",
+        "actual_sales",
+        "net_sales",
+        "sales_amount",
+        "amount",
+        "revenue",
+    ]
+    normalized = {str(c).strip(): c for c in sales_actual_df.columns}
+    for name in candidates:
+        if name in normalized:
+            return normalized[name]  # 원본 컬럼명 반환
+    return None
+
+
 # =========================
 # 3) 데이터 전처리
 # =========================
@@ -572,6 +593,76 @@ if selected_store != "전체" and not store_week_df.empty:
             ),
         )
     )
+
+# 올해 매출(sales_actual) 라인 추가: 파란색 굵은 선, 채움 없음
+try:
+    sa = load_sales_actual_df().copy()
+    sa.columns = [str(c).strip() for c in sa.columns]
+
+    if "week" in sa.columns:
+        sa["week"] = sa["week"].astype(str).str.strip()
+
+        # forecast_base.similar_week ↔ sales_actual.week 매핑(표시용 week_label/week_sort 부여)
+        week_map_df = (
+            df_filtered[["similar_week", "week_sort", "week_label"]]
+            .drop_duplicates()
+            .rename(columns={"similar_week": "week"})
+        )
+        sa = sa.merge(week_map_df, on="week", how="inner")
+
+        # 가능한 경우, 필터를 sales_actual에도 적용
+        if "style_code" in sa.columns:
+            sa["style_code"] = sa["style_code"].astype(str).str.strip()
+            sa = sa[sa["style_code"] == selected_style]
+
+        if selected_store != "전체":
+            for store_col in ["store_name", "store", "store_nm", "similar_store_name", "similar_store"]:
+                if store_col in sa.columns:
+                    sa[store_col] = sa[store_col].astype(str).str.strip()
+                    sa = sa[sa[store_col] == selected_store]
+                    break
+
+        if selected_colors is not None and "color" in sa.columns:
+            sa["color"] = sa["color"].astype(str).str.strip()
+            sa = sa[sa["color"].isin(selected_colors)]
+
+        if selected_sizes is not None:
+            if "size" in sa.columns:
+                sa["size"] = sa["size"].astype(str).str.strip()
+                sa = sa[sa["size"].isin(selected_sizes)]
+            elif "similar_size" in sa.columns:
+                sa["similar_size"] = sa["similar_size"].astype(str).str.strip()
+                sa = sa[sa["similar_size"].isin(selected_sizes)]
+
+        sales_col = resolve_sales_actual_sales_column(sa)
+        if sales_col:
+            sa[sales_col] = (
+                sa[sales_col]
+                .astype(str)
+                .str.replace(",", "", regex=False)
+                .str.replace("₩", "", regex=False)
+                .str.strip()
+            )
+            sa[sales_col] = pd.to_numeric(sa[sales_col], errors="coerce").fillna(0)
+
+            sa_week = (
+                sa.groupby(["week_label", "week_sort"], as_index=False)[sales_col]
+                .sum()
+                .sort_values("week_sort")
+            )
+
+            fig_sales.add_trace(
+                go.Scatter(
+                    x=sa_week["week_label"],
+                    y=sa_week[sales_col],
+                    name="올해 매출",
+                    mode="lines",
+                    line=dict(color="rgba(30,90,220,0.95)", width=4),
+                    hovertemplate="%{x}<br>올해 매출=%{y:,.0f}<extra></extra>",
+                )
+            )
+except Exception:
+    pass
 
 fig_sales.update_layout(
     title=f"{selected_style} 매출 추세 (필터 적용됨)",
