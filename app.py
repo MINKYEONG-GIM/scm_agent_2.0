@@ -264,12 +264,10 @@ def build_store_rank_table(store_week_df: pd.DataFrame) -> pd.DataFrame:
 try:
     forecast_base_sheet = get_forecast_base_sheet_name()
     sheets_cfg = get_sheets_config()
-    sheet_id = sheets_cfg.get("sheet_id", "")
-    if sheet_id:
-        masked = f"{sheet_id[:6]}...{sheet_id[-6:]}" if len(sheet_id) > 12 else sheet_id
-        st.caption(f"연결 대상: sheet_id={masked}, worksheet={forecast_base_sheet}")
+    
     raw_df = load_sheet_as_df(forecast_base_sheet)
     df = clean_data(raw_df)
+    
 except Exception as e:
     st.error("데이터 로드 중 오류가 발생했습니다.")
     st.exception(e)
@@ -321,16 +319,9 @@ if "similar_style_name" in temp_name_df.columns and not temp_name_df.empty:
         style_name = names[0]
 
 # KPI
-total_sales = int(store_week_df["similar_gross_sales"].sum())
-store_count = int(store_week_df["similar_store_code"].nunique())
-week_count = int(store_week_df["similar_week"].nunique())
-peak_week = total_week_df.loc[total_week_df["similar_gross_sales"].idxmax(), "similar_week"]
-
-k1, k2, k3, k4 = st.columns(4)
+k1 = st.columns(1)[0]
 k1.metric("스타일코드", selected_style)
-k2.metric("유사스타일 총매출", f"{total_sales:,.0f}")
-k3.metric("매장 수", f"{store_count}")
-k4.metric("피크 주차", peak_week)
+
 
 if style_name:
     st.caption(f"스타일명 참고: {style_name}")
