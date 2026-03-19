@@ -473,16 +473,16 @@ fig_sales.add_trace(
             )
         ),
         hovertemplate=(
+            "%{x}<br>"
             "판매수량=%{customdata[0]:,.0f}<br>"
-            "주차=%{x}<br>"
             "전체 매출=%{y:,.0f}<br>"
             "평균 할인율=%{customdata[1]:.1%}"
             "<extra></extra>"
         )
         if ("similar_forecast_qty" in df_filtered.columns and "similar_discount_rate" in df_filtered.columns)
         else (
+            "%{x}<br>"
             "판매수량=%{customdata[0]:,.0f}<br>"
-            "주차=%{x}<br>"
             "전체 매출=%{y:,.0f}<br>"
             "평균 할인율=-"
             "<extra></extra>"
@@ -490,7 +490,7 @@ fig_sales.add_trace(
         if "similar_forecast_qty" in df_filtered.columns
         else (
             "판매수량=-<br>"
-            "주차=%{x}<br>"
+            "%{x}<br>"
             "전체 매출=%{y:,.0f}<br>"
             "평균 할인율=%{customdata[0]:.1%}"
             "<extra></extra>"
@@ -498,7 +498,7 @@ fig_sales.add_trace(
         if "similar_discount_rate" in df_filtered.columns
         else (
             "판매수량=-<br>"
-            "주차=%{x}<br>"
+            "%{x}<br>"
             "전체 매출=%{y:,.0f}<br>"
             "평균 할인율=-"
             "<extra></extra>"
@@ -540,16 +540,16 @@ if selected_store != "전체" and not store_week_df.empty:
                 )
             ),
             hovertemplate=(
+                "%{x}<br>"
                 "판매수량=%{customdata[0]:,.0f}<br>"
-                "주차=%{x}<br>"
                 "선택 매장 매출=%{y:,.0f}<br>"
                 "평균 할인율=%{customdata[1]:.1%}"
                 "<extra></extra>"
             )
             if ("similar_forecast_qty" in df_store_filtered.columns and "similar_discount_rate" in df_store_filtered.columns)
             else (
+                "%{x}<br>"
                 "판매수량=%{customdata[0]:,.0f}<br>"
-                "주차=%{x}<br>"
                 "선택 매장 매출=%{y:,.0f}<br>"
                 "평균 할인율=-"
                 "<extra></extra>"
@@ -557,7 +557,7 @@ if selected_store != "전체" and not store_week_df.empty:
             if "similar_forecast_qty" in df_store_filtered.columns
             else (
                 "판매수량=-<br>"
-                "주차=%{x}<br>"
+                "%{x}<br>"
                 "선택 매장 매출=%{y:,.0f}<br>"
                 "평균 할인율=%{customdata[0]:.1%}"
                 "<extra></extra>"
@@ -565,7 +565,7 @@ if selected_store != "전체" and not store_week_df.empty:
             if "similar_discount_rate" in df_store_filtered.columns
             else (
                 "판매수량=-<br>"
-                "주차=%{x}<br>"
+                "%{x}<br>"
                 "선택 매장 매출=%{y:,.0f}<br>"
                 "평균 할인율=-"
                 "<extra></extra>"
