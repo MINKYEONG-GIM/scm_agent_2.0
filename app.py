@@ -373,13 +373,26 @@ try:
 except Exception:
     style_name = ""
 
-# KPI (스타일코드/스타일명 분리 표시: 스타일명 말줄임 방지)
-k1, k2, _k3, _k4 = st.columns(4)
-k1.metric("스타일코드", selected_style)
+# 스타일코드 옆에 스타일명 표시(말줄임 방지)
+st.markdown(
+    """
+<style>
+.km-style-row{display:flex;gap:16px;align-items:baseline;flex-wrap:wrap}
+.km-style-code{font-size:56px;font-weight:800;line-height:1.05;letter-spacing:-0.02em}
+.km-style-name{font-size:44px;font-weight:700;line-height:1.1;word-break:keep-all;overflow-wrap:anywhere}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+st.markdown("스타일코드", help=None)
 if style_name:
-    k2.markdown(f"**스타일명**  \n{style_name}")
+    st.markdown(
+        f'<div class="km-style-row"><div class="km-style-code">{selected_style}</div><div class="km-style-name">{style_name}</div></div>',
+        unsafe_allow_html=True,
+    )
 else:
-    k2.markdown("**스타일명**  \n-")
+    st.markdown(f'<div class="km-style-code">{selected_style}</div>', unsafe_allow_html=True)
 
 
 # =========================
