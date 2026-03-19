@@ -57,16 +57,40 @@ def get_gspread_client():
 
 
 @st.cache_data(ttl=300)
-def load_sheet_as_df(spreadsheet_name: str, worksheet_name: str) -> pd.DataFrame:
+def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
     """
-    구글시트 워크시트를 DataFrame으로 읽습니다.
+    구글시트의 특정 워크시트를 DataFrame으로 읽습니다.
     """
     client = get_gspread_client()
-    sh = client.open(spreadsheet_name)
+    sheet_id = st.secrets["sheets"]["sheet_id"]
+    sh = client.open_by_key(sheet_id)
     ws = sh.worksheet(worksheet_name)
     values = ws.get_all_records()
     df = pd.DataFrame(values)
     return df
+
+
+def get_sheets_config() -> dict:
+    """
+    secrets.toml의 [sheets] 섹션을 dict로 반환합니다.
+    """
+    if "sheets" not in st.secrets:
+        raise ValueError("st.secrets['sheets'] 설정이 없습니다. secrets.toml에 [sheets] 섹션을 추가하세요.")
+    return dict(st.secrets["sheets"])
+
+
+def get_forecast_base_sheet_name() -> str:
+    """
+    기본으로 사용할 워크시트명(=forecast_base)을 반환합니다.
+    - 권장 키: sheets.forecast_base_sheet
+    - 하위 호환: sheets.worksheet
+    """
+    sheets_cfg = get_sheets_config()
+    return (
+        sheets_cfg.get("forecast_base_sheet")
+        or sheets_cfg.get("worksheet")
+        or "forecast_base"
+    )
 
 
 # =========================
@@ -225,37 +249,11 @@ def build_store_rank_table(store_week_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# 5) 사이드바 설정
-# =========================
-with st.sidebar:
-    st.header("데이터 설정")
-
-    spreadsheet_name = st.text_input(
-        "구글시트 파일명",
-        value="your_google_sheet_name"
-    )
-
-    worksheet_name = st.text_input(
-        "워크시트명",
-        value="Sheet1"
-    )
-
-    load_btn = st.button("데이터 불러오기", use_container_width=True)
-
-
-if load_btn:
-    st.session_state["load_requested"] = True
-
-if "load_requested" not in st.session_state:
-    st.info("왼쪽에서 구글시트 파일명과 워크시트명을 입력한 뒤 '데이터 불러오기'를 누르세요.")
-    st.stop()
-
-
-# =========================
 # 6) 데이터 로드
 # =========================
 try:
-    raw_df = load_sheet_as_df(spreadsheet_name, worksheet_name)
+    forecast_base_sheet = get_forecast_base_sheet_name()
+    raw_df = load_sheet_as_df(forecast_base_sheet)
     df = clean_data(raw_df)
 except Exception as e:
     st.error(f"데이터 로드 중 오류가 발생했습니다: {e}")
