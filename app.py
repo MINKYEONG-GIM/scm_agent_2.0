@@ -265,9 +265,6 @@ try:
     forecast_base_sheet = get_forecast_base_sheet_name()
     sheets_cfg = get_sheets_config()
     sheet_id = sheets_cfg.get("sheet_id", "")
-    if sheet_id:
-        masked = f"{sheet_id[:6]}...{sheet_id[-6:]}" if len(sheet_id) > 12 else sheet_id
-        st.caption(f"연결 대상: sheet_id={masked}, worksheet={forecast_base_sheet}")
     raw_df = load_sheet_as_df(forecast_base_sheet)
     df = clean_data(raw_df)
 except Exception as e:
@@ -295,8 +292,8 @@ with col2:
     selected_store = st.selectbox("매장", ["전체"] + store_list)
 
 with col3:
-    if "similar_color" in style_df_for_filter.columns:
-        color_options = sorted(style_df_for_filter["similar_color"].dropna().unique().tolist())
+    if "color" in style_df_for_filter.columns:
+        color_options = sorted(style_df_for_filter["color"].dropna().unique().tolist())
         selected_colors = st.multiselect("컬러", color_options, default=color_options)
     else:
         selected_colors = None
@@ -317,7 +314,7 @@ with col4:
 df_filtered = df.copy()
 df_filtered = df_filtered[df_filtered["style_code"] == selected_style]
 if selected_colors is not None:
-    df_filtered = df_filtered[df_filtered["similar_color"].isin(selected_colors)]
+    df_filtered = df_filtered[df_filtered["color"].isin(selected_colors)]
 if selected_sizes is not None:
     df_filtered = df_filtered[df_filtered["similar_size"].isin(selected_sizes)]
 
@@ -347,11 +344,8 @@ store_count = int(store_week_df["similar_store_code"].nunique())
 week_count = int(store_week_df["similar_week"].nunique())
 peak_week = total_week_df.loc[total_week_df["similar_gross_sales"].idxmax(), "similar_week"]
 
-k1, k2, k3, k4 = st.columns(4)
+k1, _k2, _k3, _k4 = st.columns(4)
 k1.metric("스타일코드", selected_style)
-k2.metric("유사스타일 총매출", f"{total_sales:,.0f}")
-k3.metric("매장 수", f"{store_count}")
-k4.metric("피크 주차", peak_week)
 
 if style_name:
     st.caption(f"스타일명 참고: {style_name}")
