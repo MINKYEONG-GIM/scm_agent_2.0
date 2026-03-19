@@ -363,8 +363,9 @@ style_df_for_filter = df[df["style_code"] == selected_style].copy()
 store_list = sorted(style_df_for_filter["similar_store_name"].dropna().unique().tolist())
 
 with col2:
-    store_options = ["전체"] + store_list
-    selected_store = st.selectbox("매장", store_options, index=store_options.index("코엑스몰점"))
+    # 기본값은 항상 "코엑스몰" (옵션에 없으면 강제로 포함)
+    store_options = ["코엑스몰", "전체"] + [s for s in store_list if s not in ["코엑스몰", "전체"]]
+    selected_store = st.selectbox("매장", store_options, index=0)
 
 with col3:
     try:
@@ -697,84 +698,3 @@ fig_sales.update_layout(
     xaxis=dict(categoryorder="array", categoryarray=week_order),
 )
 st.plotly_chart(fig_sales, use_container_width=True)
-
-
-# =========================
-# 9) 매장 점유율 히트맵
-# =========================
-st.subheader("2. 매장별 주차 점유율 히트맵")
-
-top_store_df = store_week_df.copy()
-heatmap_df = (
-    top_store_df.pivot_table(
-        index="similar_store_name",
-        columns="week_label",
-        values="store_share",
-        aggfunc="sum",
-        fill_value=0
-    )
-    .sort_index()
-)
-
-if not heatmap_df.empty:
-    ordered_cols = [c for c in week_order if c in heatmap_df.columns]
-    remaining = [c for c in heatmap_df.columns if c not in ordered_cols]
-    heatmap_df = heatmap_df[ordered_cols + remaining]
-    fig_heatmap = go.Figure(
-        data=go.Heatmap(
-            z=heatmap_df.values,
-            x=heatmap_df.columns,
-            y=heatmap_df.index,
-            text=[[f"{v:.1%}" for v in row] for row in heatmap_df.values],
-            texttemplate="%{text}",
-            hovertemplate="주차=%{x}<br>매장=%{y}<br>점유율=%{z:.2%}<extra></extra>",
-        )
-    )
-    fig_heatmap.update_layout(
-        title="주차별 매장 점유율",
-        xaxis_title="주차",
-        yaxis_title="매장명",
-        height=500
-    )
-    st.plotly_chart(fig_heatmap, use_container_width=True)
-
-
-# =========================
-# 10) 매장 요약표
-# =========================
-st.subheader("3. 매장별 요약")
-display_summary = store_summary_df.copy()
-display_summary = display_summary.rename(columns={
-    "similar_store_code": "매장코드",
-    "similar_store_name": "매장명",
-    "total_sales": "총매출",
-    "avg_store_share_pct": "평균 점유율(%)",
-    "peak_sales": "피크매출",
-    "weeks": "주차수"
-})
-st.dataframe(display_summary, use_container_width=True, hide_index=True)
-
-
-# =========================
-# 11) 원본 집계표
-# =========================
-st.subheader("4. 주차별 매장 매출 상세")
-detail_df = store_week_df.copy().rename(columns={
-    "similar_store_code": "매장코드",
-    "similar_store_name": "매장명",
-    "week_label": "주차",
-    "similar_gross_sales": "매출",
-    "total_week_sales": "전체주차매출",
-    "store_share": "주차점유율",
-    "store_plc_index": "매장PLC"
-})
-detail_df["주차점유율"] = (detail_df["주차점유율"] * 100).round(2)
-detail_df["매장PLC"] = detail_df["매장PLC"].round(4)
-
-st.dataframe(
-    detail_df[
-        ["매장코드", "매장명", "주차", "매출", "전체주차매출", "주차점유율", "매장PLC"]
-    ],
-    use_container_width=True,
-    hide_index=True
-)
