@@ -88,7 +88,10 @@ def clean_text(series: pd.Series) -> pd.Series:
 
 def to_numeric_safe(series: pd.Series) -> pd.Series:
     return pd.to_numeric(
-        series.astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False),
+        series.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("%", "", regex=False)
+        .str.replace("₩", "", regex=False),
         errors="coerce"
     )
 
@@ -301,60 +304,92 @@ if not style_item:
 
 base_df = plc_df[plc_df["item"] == style_item].copy()
 
-# 컬러 필터 적용
+# 컬러 필터 적용 (bi_item_plc는 similar_color)
 if selected_color != "전체":
     base_df = base_df[base_df["similar_color"] == selected_color].copy()
 
-# 회색 그래프용: 전체 매장
+# 월-주차 라벨 생성 (예: '2025-23' -> '5월 3주차')
+base_df["month_week_label"] = base_df["similar_week"].apply(week_to_month_week_label)
+
+# 회색 그래프용: 작년 전체 매장
 grey_df = (
-    base_df.groupby("similar_week", as_index=False)["similar_forecast_qty_num"]
+    base_df.groupby("month_week_label", as_index=False)["similar_forecast_qty_num"]
     .sum()
-    .rename(columns={"similar_forecast_qty_num": "qty_raw"})
+    .rename(columns={"similar_forecast_qty_num": "qty"})
 )
-# 빨간 그래프용: 선택 매장
-if selected_store != "전체" and selected_store_code is not None:
-    red_source_df = base_df[base_df["similar_store_code"] == selected_store_code].copy()
-elif selected_store != "전체" and selected_store_code is None:
-    red_source_df = base_df.iloc[0:0].copy()
+
+# 빨간 그래프용: 작년 선택 매장 (bi_item_plc 기준)
+if selected_store != "전체":
+    if selected_store_code is not None:
+        red_source_df = base_df[base_df["similar_store_code"] == selected_store_code].copy()
+    else:
+        # sales_actual 매장코드 매핑이 없어도, bi_item_plc 매장명으로 fallback
+        red_source_df = base_df[base_df["similar_store_name"] == selected_store].copy()
 else:
     red_source_df = base_df.copy()
 
 red_df = (
-    red_source_df.groupby("similar_week", as_index=False)["similar_forecast_qty_num"]
+    red_source_df.groupby("month_week_label", as_index=False)["similar_forecast_qty_num"]
     .sum()
-    .rename(columns={"similar_forecast_qty_num": "qty_raw"})
+    .rename(columns={"similar_forecast_qty_num": "qty"})
 )
 
-# 주차 정렬
-all_weeks = sort_weeks(list(set(grey_df["similar_week"].tolist()) | set(red_df["similar_week"].tolist())))
+# -------------------------
+# 7-2) 올해 데이터: sales_actual
+# -------------------------
+sales_base_df = sales_df[sales_df["style_code"] == selected_style].copy()
 
-grey_df = grey_df.set_index("similar_week").reindex(all_weeks, fill_value=0).reset_index()
-red_df = red_df.set_index("similar_week").reindex(all_weeks, fill_value=0).reset_index()
+if selected_store != "전체" and selected_store_code is not None:
+    sales_base_df = sales_base_df[sales_base_df["store_code"] == selected_store_code].copy()
 
-grey_df.columns = ["similar_week", "qty_raw"]
-red_df.columns = ["similar_week", "qty_raw"]
+if selected_color != "전체":
+    sales_base_df = sales_base_df[sales_base_df["color"] == selected_color].copy()
 
-grey_df["qty"] = grey_df["qty_raw"]
-red_df["qty"] = red_df["qty_raw"]
+if selected_size != "전체":
+    sales_base_df = sales_base_df[sales_base_df["size"] == selected_size].copy()
+
+if "sales_amount" not in sales_base_df.columns:
+    st.error("sales_actual 시트에 sales_amount 컬럼이 없습니다.")
+    st.stop()
+
+sales_base_df["sales_amount_num"] = to_numeric_safe(sales_base_df["sales_amount"]).fillna(0)
+if "week" not in sales_base_df.columns:
+    st.error("sales_actual 시트에 week 컬럼이 없습니다.")
+    st.stop()
+sales_base_df["month_week_label"] = sales_base_df["week"].apply(week_to_month_week_label)
+
+blue_df = (
+    sales_base_df.groupby("month_week_label", as_index=False)["sales_amount_num"]
+    .sum()
+    .rename(columns={"sales_amount_num": "qty"})
+)
+
+# -------------------------
+# 7-3) 월-주차 전체 축 통합
+# -------------------------
+all_labels = sorted(
+    list(set(grey_df["month_week_label"].tolist()) | set(red_df["month_week_label"].tolist()) | set(blue_df["month_week_label"].tolist())),
+    key=month_week_sort_key
+)
+
+grey_total = grey_df["qty"].sum()
+red_total = red_df["qty"].sum()
+blue_total = blue_df["qty"].sum()
+
+grey_df = grey_df.set_index("month_week_label").reindex(all_labels, fill_value=0).reset_index()
+red_df = red_df.set_index("month_week_label").reindex(all_labels, fill_value=0).reset_index()
+blue_df = blue_df.set_index("month_week_label").reindex(all_labels, fill_value=0).reset_index()
+
+grey_df.columns = ["month_week_label", "qty"]
+red_df.columns = ["month_week_label", "qty"]
+blue_df.columns = ["month_week_label", "qty"]
+
 # -------------------------
 # 비중(%) 계산
 # -------------------------
-grey_total = grey_df["qty"].sum()
-red_total = red_df["qty"].sum()
-
-if grey_total > 0:
-    grey_df["ratio"] = grey_df["qty"] / grey_total
-else:
-    grey_df["ratio"] = 0
-
-if red_total > 0:
-    red_df["ratio"] = red_df["qty"] / red_total
-else:
-    red_df["ratio"] = 0
-
-# 퍼센트 표시용 컬럼
-grey_df["ratio_pct"] = grey_df["ratio"] * 100
-red_df["ratio_pct"] = red_df["ratio"] * 100
+grey_df["ratio_pct"] = (grey_df["qty"] / grey_total * 100) if grey_total > 0 else 0
+red_df["ratio_pct"] = (red_df["qty"] / red_total * 100) if red_total > 0 else 0
+blue_df["ratio_pct"] = (blue_df["qty"] / blue_total * 100) if blue_total > 0 else 0
 
 
 
@@ -365,9 +400,9 @@ red_df["ratio_pct"] = red_df["ratio"] * 100
 st.markdown("### 스타일코드")
 st.markdown(f"## {selected_style}")
 
-st.markdown("### 매출 추세")
+st.markdown("### 월별 주차 판매 비중 비교")
 
-sub_title = f"{selected_style} 주차별 판매 비중 추세"
+sub_title = f"{selected_style} 작년/올해 월별 주차 판매 비중 비교"
 if selected_store != "전체":
     sub_title += f" / 매장: {selected_store}"
 if selected_color != "전체":
@@ -382,35 +417,62 @@ fig = go.Figure()
 # 회색 그래프
 fig.add_trace(
     go.Scatter(
-        x=grey_df["similar_week"],
+        x=grey_df["month_week_label"],
         y=grey_df["ratio_pct"],
-        customdata=grey_df["qty_raw"],
+        customdata=grey_df["qty"],
         mode="lines",
-        name="유사상품 전체 추세",
+        name="작년 유사상품 전체 추세",
         line=dict(color="rgba(150,150,150,1)", width=2),
         fill="tozeroy",
         fillcolor="rgba(180,180,180,0.35)",
-        hovertemplate="판매량:%{customdata}장 <br>전체 비중=%{y:.2f}%<extra></extra>",
+        hovertemplate=
+            "월주차=%{x}"
+            "<br>작년 전체 비중=%{y:.2f}%"
+            "<br>작년 전체 판매량=%{customdata}"
+            "<extra></extra>",
     )
 )
 
 # 빨간 그래프
 fig.add_trace(
     go.Scatter(
-        x=red_df["similar_week"],
+        x=red_df["month_week_label"],
         y=red_df["ratio_pct"],
-        customdata=grey_df["qty_raw"],
+        customdata=red_df["qty"],
         mode="lines",
-        name="선택 매장 추세",
+        name="작년 선택 매장 추세",
         line=dict(color="rgba(220,70,70,1)", width=2),
         fill="tozeroy",
         fillcolor="rgba(220,70,70,0.25)",
-        hovertemplate="판매량:%{customdata}장 <br>전체 비중=%{y:.2f}%<extra></extra>",
+        hovertemplate=
+            "월주차=%{x}"
+            "<br>작년 매장 비중=%{y:.2f}%"
+            "<br>작년 매장 판매량=%{customdata}"
+            "<extra></extra>",
+    )
+)
+
+# 파란 그래프
+fig.add_trace(
+    go.Scatter(
+        x=blue_df["month_week_label"],
+        y=blue_df["ratio_pct"],
+        customdata=blue_df["qty"],
+        mode="lines",
+        name="올해 실제 추세",
+        line=dict(color="rgba(60,120,220,1)", width=2),
+        fill="tozeroy",
+        fillcolor="rgba(60,120,220,0.18)",
+        hovertemplate=
+            "월주차=%{x}"
+            "<br>올해 비중=%{y:.2f}%"
+            "<br>올해 판매량=%{customdata}"
+            "<extra></extra>",
     )
 )
 fig.update_layout(
     height=520,
-    xaxis_title="주차",
+    xaxis_title="월주차",
     yaxis_title="판매 비중(%)",
     hovermode="x unified",
     legend_title="구분",
@@ -441,3 +503,10 @@ with st.expander("디버깅용 데이터 확인"):
 
     st.markdown("#### 빨간 그래프 데이터")
     st.dataframe(red_df, use_container_width=True)
+
+    st.markdown("#### 파란 그래프 데이터")
+    st.dataframe(blue_df, use_container_width=True)
+
+    st.write("회색 전체 합계:", grey_total)
+    st.write("빨간 전체 합계:", red_total)
+    st.write("파란 전체 합계:", blue_total)
