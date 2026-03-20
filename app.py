@@ -265,9 +265,8 @@ if selected_color != "전체":
 grey_df = (
     base_df.groupby("similar_week", as_index=False)["similar_forecast_qty_num"]
     .sum()
-    .rename(columns={"similar_forecast_qty_num": "qty"})
+    .rename(columns={"similar_forecast_qty_num": "qty_raw"})
 )
-
 # 빨간 그래프용: 선택 매장
 if selected_store != "전체" and selected_store_code is not None:
     red_source_df = base_df[base_df["similar_store_code"] == selected_store_code].copy()
@@ -279,7 +278,7 @@ else:
 red_df = (
     red_source_df.groupby("similar_week", as_index=False)["similar_forecast_qty_num"]
     .sum()
-    .rename(columns={"similar_forecast_qty_num": "qty"})
+    .rename(columns={"similar_forecast_qty_num": "qty_raw"})
 )
 
 # 주차 정렬
@@ -288,9 +287,11 @@ all_weeks = sort_weeks(list(set(grey_df["similar_week"].tolist()) | set(red_df["
 grey_df = grey_df.set_index("similar_week").reindex(all_weeks, fill_value=0).reset_index()
 red_df = red_df.set_index("similar_week").reindex(all_weeks, fill_value=0).reset_index()
 
-grey_df.columns = ["similar_week", "qty"]
-red_df.columns = ["similar_week", "qty"]
+grey_df.columns = ["similar_week", "qty_raw"]
+red_df.columns = ["similar_week", "qty_raw"]
 
+grey_df["qty"] = grey_df["qty_raw"]
+red_df["qty"] = red_df["qty_raw"]
 # -------------------------
 # 비중(%) 계산
 # -------------------------
@@ -339,6 +340,7 @@ fig.add_trace(
     go.Scatter(
         x=grey_df["similar_week"],
         y=grey_df["ratio_pct"],
+        customdata=grey_df["qty_raw"],
         mode="lines",
         name="유사상품 전체 추세",
         line=dict(color="rgba(150,150,150,1)", width=2),
@@ -353,6 +355,7 @@ fig.add_trace(
     go.Scatter(
         x=red_df["similar_week"],
         y=red_df["ratio_pct"],
+        customdata=grey_df["qty_raw"],
         mode="lines",
         name="선택 매장 추세",
         line=dict(color="rgba(220,70,70,1)", width=2),
