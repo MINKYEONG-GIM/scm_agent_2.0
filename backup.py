@@ -1,6 +1,7 @@
 import os
 import json
 from typing import Tuple
+from datetime import date
 
 import pandas as pd
 import plotly.express as px
@@ -62,9 +63,19 @@ def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
     구글시트의 특정 워크시트를 DataFrame으로 읽습니다.
     """
     client = get_gspread_client()
-    sheet_id = st.secrets["sheets"]["sheet_id"]
+    sheets_cfg = get_sheets_config()
+    sheet_id = sheets_cfg.get("sheet_id")
+    if not sheet_id:
+        raise ValueError("secrets.toml의 [sheets].sheet_id 가 비어있습니다.")
+
     sh = client.open_by_key(sheet_id)
-    ws = sh.worksheet(worksheet_name)
+    try:
+        ws = sh.worksheet(worksheet_name)
+    except Exception as e:
+        available = [w.title for w in sh.worksheets()]
+        raise ValueError(
+            f"워크시트 '{worksheet_name}'를 찾지 못했습니다. 사용 가능한 워크시트: {available}"
+        ) from e
     values = ws.get_all_records()
     df = pd.DataFrame(values)
     return df
@@ -91,6 +102,150 @@ def get_forecast_base_sheet_name() -> str:
         or sheets_cfg.get("worksheet")
         or "forecast_base"
     )
+
+
+
+
+
+# =========================
+# 2-1) 보조 시트: bi_item_plc
+# =========================
+@st.cache_data(ttl=300)
+def load_bi_item_plc_df() -> pd.DataFrame:
+    """
+    bi_item_plc 워크시트를 DataFrame으로 읽습니다.
+    """
+    return load_sheet_as_df("bi_item_plc")
+
+
+def resolve_bi_item_plc_sales_column(bi_item_plc_df: pd.DataFrame):
+    """
+    bi_item_plc 워크시트에서 '판매량'으로 사용할 컬럼명을 추정합니다.
+    (실제 컬럼명은 시트마다 다를 수 있어, 후보를 순서대로 탐색합니다.)
+    """
+    candidates = [
+        "sales_amount",
+        "sales_qty",
+        "gross_sales",
+        "sales",
+        "actual_sales",
+        "net_sales",
+        "amount",
+        "revenue",
+    ]
+    normalized = {str(c).strip(): c for c in bi_item_plc_df.columns}
+    for name in candidates:
+        if name in normalized:
+            return normalized[name]  # 원본 컬럼명 반환
+    return None
+
+
+def _week_to_month_week_label(v: str) -> str:
+    """
+    'YYYY-WW' 형태를 'M월 N주차'로 변환.
+    ISO week 기준(해당 주의 월요일)으로 월/월내주차 계산.
+    변환 실패 시 원본 반환.
+    """
+    s = str(v).strip()
+    if not s or s.lower() == "nan" or "-" not in s:
+        return s
+    y, w = s.split("-", 1)
+    try:
+        year = int(y)
+        week = int(w)
+        d = date.fromisocalendar(year, week, 1)  # Monday of ISO week
+        week_in_month = (d.day - 1) // 7 + 1
+        return f"{d.month}월 {week_in_month}주차"
+    except Exception:
+        return s
+
+
+def add_week_sort_and_label_from_similar_week(df: pd.DataFrame) -> pd.DataFrame:
+    """similar_week 기준으로 week_sort, week_label 생성."""
+    out = df.copy()
+    if "similar_week" not in out.columns:
+        return out
+    out["similar_week"] = out["similar_week"].astype(str).str.strip()
+    out["week_sort"] = (
+        out["similar_week"]
+        .str.replace("-", "", regex=False)
+        .str.replace(" ", "", regex=False)
+    )
+    out["week_sort"] = pd.to_numeric(out["week_sort"], errors="coerce")
+    out["week_label"] = out["similar_week"].apply(_week_to_month_week_label)
+    return out
+
+
+def normalize_bi_item_plc_for_pipeline(plc_df: pd.DataFrame, selected_style: str) -> pd.DataFrame:
+    """
+    build_style_summary / 그래프 집계에 맞게 bi_item_plc 행을 정규화합니다.
+    - similar_forecast_qty → similar_gross_sales 가 없으면 복사 (PLC 파이프라인용)
+    - 주차: week 또는 similar_week 통일
+    - style_code: 선택 스타일로 통일
+    """
+    out = plc_df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+
+    out["style_code"] = str(selected_style).strip()
+
+    if "similar_week" not in out.columns and "week" in out.columns:
+        out = out.rename(columns={"week": "similar_week"})
+
+    if "similar_week" in out.columns:
+        out = add_week_sort_and_label_from_similar_week(out)
+    else:
+        out["week_sort"] = pd.NA
+        out["week_label"] = ""
+
+    if "similar_gross_sales" not in out.columns and "similar_forecast_qty" in out.columns:
+        s = (
+            out["similar_forecast_qty"]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("₩", "", regex=False)
+            .str.strip()
+        )
+        out["similar_gross_sales"] = pd.to_numeric(s, errors="coerce").fillna(0)
+    elif "similar_gross_sales" in out.columns:
+        out["similar_gross_sales"] = (
+            out["similar_gross_sales"]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("₩", "", regex=False)
+            .str.strip()
+        )
+        out["similar_gross_sales"] = pd.to_numeric(out["similar_gross_sales"], errors="coerce").fillna(0)
+
+    if "similar_forecast_qty" in out.columns:
+        out["similar_forecast_qty"] = (
+            out["similar_forecast_qty"]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("₩", "", regex=False)
+            .str.strip()
+        )
+        out["similar_forecast_qty"] = pd.to_numeric(out["similar_forecast_qty"], errors="coerce").fillna(0)
+
+    if "similar_store_name" in out.columns:
+        out["similar_store_name"] = out["similar_store_name"].astype(str).str.strip()
+
+    if "similar_store_code" not in out.columns and "similar_store_name" in out.columns:
+        out["similar_store_code"] = out["similar_store_name"]
+
+    if "similar_discount_rate" in out.columns:
+        dr = (
+            out["similar_discount_rate"]
+            .astype(str)
+            .str.replace("%", "", regex=False)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+        )
+        dr = pd.to_numeric(dr, errors="coerce")
+        if dr.notna().any() and dr.max(skipna=True) > 1:
+            dr = dr / 100.0
+        out["similar_discount_rate"] = dr
+
+    return out
 
 
 # =========================
@@ -145,6 +300,21 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
             )
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
+    # 할인율 정리 (0~1 비율로 정규화)
+    if "similar_discount_rate" in df.columns:
+        dr = (
+            df["similar_discount_rate"]
+            .astype(str)
+            .str.replace("%", "", regex=False)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+        )
+        dr = pd.to_numeric(dr, errors="coerce")
+        # 30(%) 같은 값이면 0.30으로
+        if dr.notna().any() and dr.max(skipna=True) > 1:
+            dr = dr / 100.0
+        df["similar_discount_rate"] = dr
+
     # week 정렬용 숫자 컬럼 생성
     # 예: 2025-10 -> 202510
     df["week_sort"] = (
@@ -154,7 +324,21 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     )
     df["week_sort"] = pd.to_numeric(df["week_sort"], errors="coerce")
 
+    df["week_label"] = df["similar_week"].apply(_week_to_month_week_label)
+
     return df
+
+
+def extract_item_code(style_code: str) -> str:
+    style_code = str(style_code).strip()
+    if len(style_code) >= 4:
+        return style_code[2:4]
+
+    return ""
+
+
+
+
 
 
 # =========================
@@ -175,7 +359,7 @@ def build_style_summary(df: pd.DataFrame, selected_style: str) -> Tuple[pd.DataF
     # 같은 주차/매장에 여러 행이 있을 수 있으므로 합산
     store_week_df = (
         style_df.groupby(
-            ["style_code", "similar_store_code", "similar_store_name", "similar_week", "week_sort"],
+            ["style_code", "similar_store_code", "similar_store_name", "similar_week", "week_sort", "week_label"],
             as_index=False
         )["similar_gross_sales"]
         .sum()
@@ -184,7 +368,7 @@ def build_style_summary(df: pd.DataFrame, selected_style: str) -> Tuple[pd.DataF
 
     # 스타일 전체 주차별 매출
     total_week_df = (
-        store_week_df.groupby(["style_code", "similar_week", "week_sort"], as_index=False)["similar_gross_sales"]
+        store_week_df.groupby(["style_code", "similar_week", "week_sort", "week_label"], as_index=False)["similar_gross_sales"]
         .sum()
         .sort_values("week_sort")
     )
@@ -253,182 +437,371 @@ def build_store_rank_table(store_week_df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 try:
     forecast_base_sheet = get_forecast_base_sheet_name()
+    sheets_cfg = get_sheets_config()
+    sheet_id = sheets_cfg.get("sheet_id", "")
     raw_df = load_sheet_as_df(forecast_base_sheet)
     df = clean_data(raw_df)
+
+    bi_item_plc_df = load_bi_item_plc_df()
+    bi_item_plc_df.columns = [str(c).strip() for c in bi_item_plc_df.columns]
 except Exception as e:
-    st.error(f"데이터 로드 중 오류가 발생했습니다: {e}")
+    st.error("데이터 로드 중 오류가 발생했습니다.")
+    st.exception(e)
     st.stop()
 
 
 if df.empty:
-    st.warning("시트에 데이터가 없습니다.")
+    st.warning("기준 시트에 데이터가 없습니다.")
     st.stop()
 
 
-style_list = sorted(df["style_code"].dropna().unique().tolist())
+style_list = sorted(df["style_code"].dropna().astype(str).str.strip().unique().tolist())
 
-col1, col2 = st.columns([2, 1])
+col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    selected_style = st.selectbox("스타일코드 선택", style_list)
+    default_style = "SPRWG37G01"
+    style_idx = style_list.index(default_style) if default_style in style_list else 0
+    selected_style = st.selectbox("스타일", style_list, index=style_idx)
+
+# 스타일코드 3·4번째 2자리 → bi_item_plc.item 과 매칭
+selected_item_code = extract_item_code(selected_style)
+
+plc_filter_df = bi_item_plc_df.copy()
+if "item" in plc_filter_df.columns:
+    plc_filter_df["item"] = plc_filter_df["item"].astype(str).str.strip()
+    plc_filter_df = plc_filter_df[plc_filter_df["item"] == selected_item_code]
+else:
+    plc_filter_df = pd.DataFrame()
+
+if "similar_store_name" in plc_filter_df.columns:
+    plc_filter_df["similar_store_name"] = plc_filter_df["similar_store_name"].astype(str).str.strip()
+    store_list = sorted([s for s in plc_filter_df["similar_store_name"].dropna().unique().tolist() if s and s != "nan"])
+else:
+    store_list = []
 
 with col2:
-    top_n_store = st.slider("상위 매장 수", min_value=5, max_value=30, value=10, step=1)
+    store_options = ["전체"] + store_list
+    default_store_idx = store_options.index("코엑스몰") if "코엑스몰" in store_options else 0
+    selected_store = st.selectbox("매장", store_options, index=default_store_idx)
+
+with col3:
+    try:
+        color_source = plc_filter_df.copy()
+        if "color" in color_source.columns:
+            color_source["color"] = color_source["color"].astype(str).str.strip()
+            color_options = sorted([c for c in color_source["color"].dropna().unique().tolist() if c and c != "nan"])
+            selected_colors = st.multiselect("컬러", color_options, default=color_options)
+        else:
+            selected_colors = None
+            st.caption("bi_item_plc 워크시트에 color 컬럼이 없어 컬러 필터를 생략합니다.")
+    except Exception:
+        selected_colors = None
+        st.caption("bi_item_plc 워크시트 로드에 실패해 컬러 필터를 생략합니다.")
+
+with col4:
+    if "similar_size" in plc_filter_df.columns:
+        size_options = sorted(plc_filter_df["similar_size"].dropna().unique().tolist())
+        selected_sizes = st.multiselect("사이즈", size_options, default=size_options)
+    else:
+        selected_sizes = None
+        st.caption("similar_size 컬럼이 없어 사이즈 필터를 생략합니다.")
 
 
 # =========================
-# 7) 스타일별 집계
+# 7) item 기준 집계 (회색=전체 매장, 빨강=선택 매장은 그래프에서 분리)
 # =========================
-total_week_df, store_week_df = build_style_summary(df, selected_style)
+df_filtered = plc_filter_df.copy()
+
+if selected_colors is not None and "color" in df_filtered.columns:
+    df_filtered = df_filtered[df_filtered["color"].isin(selected_colors)]
+
+if selected_sizes is not None and "similar_size" in df_filtered.columns:
+    df_filtered = df_filtered[df_filtered["similar_size"].isin(selected_sizes)]
+
+# 매장은 그래프 전체(회색)에 적용하지 않음 — 선택 매장은 빨간 선만 필터
+
+df_filtered = normalize_bi_item_plc_for_pipeline(df_filtered, selected_style)
+
+total_week_df, store_week_df_all = build_style_summary(df_filtered, selected_style)
+store_week_df = store_week_df_all.copy()
+if selected_store != "전체":
+    store_week_df = store_week_df[store_week_df["similar_store_name"] == selected_store]
+
 store_summary_df = build_store_rank_table(store_week_df)
 
 if total_week_df.empty:
-    st.warning("선택한 스타일의 데이터가 없습니다.")
+    st.warning("선택한 item 코드 기준 데이터가 없습니다.")
     st.stop()
 
 
-# 스타일명 하나 가져오기
+# 스타일명: bi_item_plc의 style_name에서 가져오기 (item 코드 기준)
 style_name = ""
-temp_name_df = df[df["style_code"] == selected_style]
-if "similar_style_name" in temp_name_df.columns and not temp_name_df.empty:
-    names = temp_name_df["similar_style_name"].dropna().unique().tolist()
-    if names:
-        style_name = names[0]
+try:
+    _plc_name_df = bi_item_plc_df.copy()
+    _plc_name_df.columns = [str(c).strip() for c in _plc_name_df.columns]
 
-# KPI
-total_sales = int(store_week_df["similar_gross_sales"].sum())
-store_count = int(store_week_df["similar_store_code"].nunique())
-week_count = int(store_week_df["similar_week"].nunique())
-peak_week = total_week_df.loc[total_week_df["similar_gross_sales"].idxmax(), "similar_week"]
+    if "item" in _plc_name_df.columns:
+        _plc_name_df["item"] = _plc_name_df["item"].astype(str).str.strip()
+        _plc_name_df = _plc_name_df[_plc_name_df["item"] == selected_item_code]
 
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("스타일코드", selected_style)
-k2.metric("유사스타일 총매출", f"{total_sales:,.0f}")
-k3.metric("매장 수", f"{store_count}")
-k4.metric("피크 주차", peak_week)
+    if "style_name" in _plc_name_df.columns and not _plc_name_df.empty:
+        _plc_name_df["style_name"] = _plc_name_df["style_name"].astype(str).str.strip()
+        _names = [n for n in _plc_name_df["style_name"].dropna().unique().tolist() if n and n != "nan"]
+        if _names:
+            style_name = _names[0]
+except Exception:
+    style_name = ""
 
+# 스타일코드 옆에 스타일명 표시(말줄임 방지)
+st.markdown(
+    """
+<style>
+.km-style-row{display:flex;gap:16px;align-items:baseline;flex-wrap:wrap}
+.km-style-code{font-size:56px;font-weight:800;line-height:1.05;letter-spacing:-0.02em}
+.km-style-name{font-size:44px;font-weight:700;line-height:1.1;word-break:keep-all;overflow-wrap:anywhere}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+st.markdown("스타일코드", help=None)
 if style_name:
-    st.caption(f"스타일명 참고: {style_name}")
-
-
-# =========================
-# 8) 전체 PLC 그래프
-# =========================
-st.subheader("1. 전체 평균 PLC")
-fig_total = px.line(
-    total_week_df,
-    x="similar_week",
-    y="plc_index",
-    markers=True,
-    title=f"{selected_style} 전체 PLC 곡선"
-)
-fig_total.update_layout(
-    xaxis_title="주차",
-    yaxis_title="PLC Index (0~1)",
-    yaxis=dict(range=[0, 1.1]),
-    height=420
-)
-st.plotly_chart(fig_total, use_container_width=True)
-
-
-# =========================
-# 9) 상위 매장 PLC 그래프
-# =========================
-st.subheader("2. 상위 매장별 PLC")
-
-top_stores = store_summary_df.head(top_n_store)["similar_store_code"].tolist()
-top_store_df = store_week_df[store_week_df["similar_store_code"].isin(top_stores)].copy()
-
-fig_store = px.line(
-    top_store_df,
-    x="similar_week",
-    y="store_plc_index",
-    color="similar_store_name",
-    markers=True,
-    title=f"{selected_style} 상위 {top_n_store}개 매장 PLC"
-)
-fig_store.update_layout(
-    xaxis_title="주차",
-    yaxis_title="매장 PLC Index (0~1)",
-    yaxis=dict(range=[0, 1.1]),
-    height=500,
-    legend_title="매장명"
-)
-st.plotly_chart(fig_store, use_container_width=True)
-
-
-# =========================
-# 10) 매장 점유율 히트맵
-# =========================
-st.subheader("3. 매장별 주차 점유율 히트맵")
-
-heatmap_df = (
-    top_store_df.pivot_table(
-        index="similar_store_name",
-        columns="similar_week",
-        values="store_share",
-        aggfunc="sum",
-        fill_value=0
+    st.markdown(
+        f'<div class="km-style-row"><div class="km-style-code">{selected_style}</div><div class="km-style-name">{style_name}</div></div>',
+        unsafe_allow_html=True,
     )
-    .sort_index()
+else:
+    st.markdown(f'<div class="km-style-code">{selected_style}</div>', unsafe_allow_html=True)
+
+
+# =========================
+# 8) 최상단: 전체 vs 선택 매장 매출 추세 (오버레이)
+# =========================
+st.subheader("매출 추세")
+
+sales_total_week_df = (
+    df_filtered.groupby(["similar_week", "week_sort", "week_label"], as_index=False)
+    .agg(
+        sales_qty=("similar_forecast_qty", "sum") if "similar_forecast_qty" in df_filtered.columns else ("similar_gross_sales", "size"),
+        avg_discount_rate=("similar_discount_rate", "mean") if "similar_discount_rate" in df_filtered.columns else ("similar_gross_sales", "size"),
+    )
+    .sort_values("week_sort")
 )
 
-if not heatmap_df.empty:
-    fig_heatmap = go.Figure(
-        data=go.Heatmap(
-            z=heatmap_df.values,
-            x=heatmap_df.columns,
-            y=heatmap_df.index,
-            text=[[f"{v:.1%}" for v in row] for row in heatmap_df.values],
-            texttemplate="%{text}",
-            hovertemplate="주차=%{x}<br>매장=%{y}<br>점유율=%{z:.2%}<extra></extra>",
+week_order = sales_total_week_df.sort_values("week_sort")["week_label"].tolist()
+
+fig_sales = go.Figure()
+fig_sales.add_trace(
+    go.Scatter(
+        x=sales_total_week_df["week_label"],
+        y=sales_total_week_df["sales_qty"],
+        name="작년 전체 판매량(유사)",
+        mode="lines",
+        line=dict(color="rgba(120,120,120,0.55)", width=2),
+        fill="tozeroy",
+        fillcolor="rgba(120,120,120,0.22)",
+        customdata=(
+            sales_total_week_df[["sales_qty", "avg_discount_rate"]].to_numpy()
+            if ("similar_forecast_qty" in df_filtered.columns and "similar_discount_rate" in df_filtered.columns)
+            else (
+                sales_total_week_df[["sales_qty"]].to_numpy()
+                if "similar_forecast_qty" in df_filtered.columns
+                else (
+                    sales_total_week_df[["avg_discount_rate"]].to_numpy()
+                    if "similar_discount_rate" in df_filtered.columns
+                    else [[None]] * len(sales_total_week_df)
+                )
+            )
+        ),
+        hovertemplate=(
+            "%{x}<br>"
+            "판매수량=%{customdata[0]:,.0f}<br>"
+            "전체 판매수량=%{y:,.0f}<br>"
+            "평균 할인율=%{customdata[1]:.1%}"
+            "<extra></extra>"
+        )
+        if ("similar_forecast_qty" in df_filtered.columns and "similar_discount_rate" in df_filtered.columns)
+        else (
+            "%{x}<br>"
+            "판매수량=%{customdata[0]:,.0f}<br>"
+            "전체 판매수량=%{y:,.0f}<br>"
+            "평균 할인율=-"
+            "<extra></extra>"
+        )
+        if "similar_forecast_qty" in df_filtered.columns
+        else (
+            "판매수량=-<br>"
+            "%{x}<br>"
+            "전체 판매수량=%{y:,.0f}<br>"
+            "평균 할인율=%{customdata[0]:.1%}"
+            "<extra></extra>"
+        )
+        if "similar_discount_rate" in df_filtered.columns
+        else (
+            "판매수량=-<br>"
+            "%{x}<br>"
+            "전체 판매수량=%{y:,.0f}<br>"
+            "평균 할인율=-"
+            "<extra></extra>"
+        ),
+    )
+)
+
+if selected_store != "전체":
+    df_store_filtered = df_filtered[df_filtered["similar_store_name"] == selected_store].copy()
+    sales_store_week_df = (
+        df_store_filtered.groupby(["similar_week", "week_sort", "week_label"], as_index=False)
+        .agg(
+            sales_qty=("similar_forecast_qty", "sum") if "similar_forecast_qty" in df_store_filtered.columns else ("similar_gross_sales", "size"),
+            avg_discount_rate=("similar_discount_rate", "mean") if "similar_discount_rate" in df_store_filtered.columns else ("similar_gross_sales", "size"),
+        )
+        .sort_values("week_sort")
+    )
+    fig_sales.add_trace(
+        go.Scatter(
+            x=sales_store_week_df["week_label"],
+            y=sales_store_week_df["sales_qty"],
+            name="예측 판매량",
+            mode="lines",
+            line=dict(color="rgba(220,50,50,0.70)", width=2),
+            fill="tozeroy",
+            fillcolor="rgba(220,50,50,0.25)",
+            customdata=(
+                sales_store_week_df[["sales_qty", "avg_discount_rate"]].to_numpy()
+                if ("similar_forecast_qty" in df_store_filtered.columns and "similar_discount_rate" in df_store_filtered.columns)
+                else (
+                    sales_store_week_df[["sales_qty"]].to_numpy()
+                    if "similar_forecast_qty" in df_store_filtered.columns
+                    else (
+                        sales_store_week_df[["avg_discount_rate"]].to_numpy()
+                        if "similar_discount_rate" in df_store_filtered.columns
+                        else [[None]] * len(sales_store_week_df)
+                    )
+                )
+            ),
+            hovertemplate=(
+                "%{x}<br>"
+                "판매수량=%{customdata[0]:,.0f}<br>"
+                "선택 매장 판매수량=%{y:,.0f}<br>"
+                "평균 할인율=%{customdata[1]:.1%}"
+                "<extra></extra>"
+            )
+            if ("similar_forecast_qty" in df_store_filtered.columns and "similar_discount_rate" in df_store_filtered.columns)
+            else (
+                "%{x}<br>"
+                "판매수량=%{customdata[0]:,.0f}<br>"
+                "선택 매장 판매수량=%{y:,.0f}<br>"
+                "평균 할인율=-"
+                "<extra></extra>"
+            )
+            if "similar_forecast_qty" in df_store_filtered.columns
+            else (
+                "판매수량=-<br>"
+                "%{x}<br>"
+                "선택 매장 판매수량=%{y:,.0f}<br>"
+                "평균 할인율=%{customdata[0]:.1%}"
+                "<extra></extra>"
+            )
+            if "similar_discount_rate" in df_store_filtered.columns
+            else (
+                "판매수량=-<br>"
+                "%{x}<br>"
+                "선택 매장 판매수량=%{y:,.0f}<br>"
+                "평균 할인율=-"
+                "<extra></extra>"
+            ),
         )
     )
-    fig_heatmap.update_layout(
-        title="주차별 매장 점유율",
-        xaxis_title="주차",
-        yaxis_title="매장명",
-        height=500
-    )
-    st.plotly_chart(fig_heatmap, use_container_width=True)
 
+# 올해(bi_item_plc) 라인 추가: 파란색 굵은 선, 채움 없음 — item·컬러·사이즈·매장 동일 필터
+try:
+    sa = bi_item_plc_df.copy()
+    sa.columns = [str(c).strip() for c in sa.columns]
 
-# =========================
-# 11) 매장 요약표
-# =========================
-st.subheader("4. 매장별 요약")
-display_summary = store_summary_df.copy()
-display_summary = display_summary.rename(columns={
-    "similar_store_code": "매장코드",
-    "similar_store_name": "매장명",
-    "total_sales": "총매출",
-    "avg_store_share_pct": "평균 점유율(%)",
-    "peak_sales": "피크매출",
-    "weeks": "주차수"
-})
-st.dataframe(display_summary, use_container_width=True, hide_index=True)
+    if "item" in sa.columns:
+        sa["item"] = sa["item"].astype(str).str.strip()
+        sa = sa[sa["item"] == selected_item_code]
 
+    week_col = "week" if "week" in sa.columns else ("similar_week" if "similar_week" in sa.columns else None)
+    if week_col:
+        sa["_merge_week"] = sa[week_col].astype(str).str.strip()
 
-# =========================
-# 12) 원본 집계표
-# =========================
-st.subheader("5. 주차별 매장 매출 상세")
-detail_df = store_week_df.copy().rename(columns={
-    "similar_store_code": "매장코드",
-    "similar_store_name": "매장명",
-    "similar_week": "주차",
-    "similar_gross_sales": "매출",
-    "total_week_sales": "전체주차매출",
-    "store_share": "주차점유율",
-    "store_plc_index": "매장PLC"
-})
-detail_df["주차점유율"] = (detail_df["주차점유율"] * 100).round(2)
-detail_df["매장PLC"] = detail_df["매장PLC"].round(4)
+        week_map_df = (
+            df_filtered[["similar_week", "week_sort", "week_label"]]
+            .drop_duplicates()
+            .rename(columns={"similar_week": "_merge_week"})
+        )
+        sa_mapped = sa.merge(week_map_df, on="_merge_week", how="inner")
 
-st.dataframe(
-    detail_df[
-        ["매장코드", "매장명", "주차", "매출", "전체주차매출", "주차점유율", "매장PLC"]
-    ],
-    use_container_width=True,
-    hide_index=True
+        if sa_mapped.empty:
+            sa_mapped = sa.copy()
+            sa_mapped["week_sort"] = (
+                sa_mapped["_merge_week"]
+                .astype(str)
+                .str.replace("-", "", regex=False)
+                .str.replace(" ", "", regex=False)
+            )
+            sa_mapped["week_sort"] = pd.to_numeric(sa_mapped["week_sort"], errors="coerce")
+            sa_mapped["week_label"] = sa_mapped["_merge_week"].apply(_week_to_month_week_label)
+
+        if "_merge_week" in sa_mapped.columns:
+            sa_mapped = sa_mapped.drop(columns=["_merge_week"], errors="ignore")
+
+        if selected_store != "전체" and "similar_store_name" in sa_mapped.columns:
+            sa_mapped["similar_store_name"] = sa_mapped["similar_store_name"].astype(str).str.strip()
+            sa_mapped = sa_mapped[sa_mapped["similar_store_name"] == selected_store]
+
+        if selected_colors is not None and "color" in sa_mapped.columns:
+            sa_mapped["color"] = sa_mapped["color"].astype(str).str.strip()
+            sa_mapped = sa_mapped[sa_mapped["color"].isin(selected_colors)]
+
+        if selected_sizes is not None:
+            if "size" in sa_mapped.columns:
+                sa_mapped["size"] = sa_mapped["size"].astype(str).str.strip()
+                sa_mapped = sa_mapped[sa_mapped["size"].isin(selected_sizes)]
+            elif "similar_size" in sa_mapped.columns:
+                sa_mapped["similar_size"] = sa_mapped["similar_size"].astype(str).str.strip()
+                sa_mapped = sa_mapped[sa_mapped["similar_size"].isin(selected_sizes)]
+
+        # 올해 선: sales_amount 우선 (없으면 후보 탐색)
+        sales_col = "sales_amount" if "sales_amount" in sa_mapped.columns else resolve_bi_item_plc_sales_column(sa_mapped)
+        if sales_col:
+            sa_mapped[sales_col] = (
+                sa_mapped[sales_col]
+                .astype(str)
+                .str.replace(",", "", regex=False)
+                .str.replace("₩", "", regex=False)
+                .str.strip()
+            )
+            sa_mapped[sales_col] = pd.to_numeric(sa_mapped[sales_col], errors="coerce").fillna(0)
+
+            sa_week = (
+                sa_mapped.groupby(["week_label", "week_sort"], as_index=False)[sales_col]
+                .sum()
+                .sort_values("week_sort")
+            )
+
+            line_name = "올해 판매량" if sales_col in ["sales_amount", "sales_qty"] else "올해 매출"
+            fig_sales.add_trace(
+                go.Scatter(
+                    x=sa_week["week_label"],
+                    y=sa_week[sales_col],
+                    name=line_name,
+                    mode="lines",
+                    line=dict(color="rgba(30,90,220,0.95)", width=4),
+                    hovertemplate=f"%{{x}}<br>{line_name}=%{{y:,.0f}}<extra></extra>",
+                )
+            )
+except Exception:
+    pass
+
+fig_sales.update_layout(
+    title=f"{selected_style} 판매수량 추세 (필터 적용됨)",
+    xaxis_title="주차",
+    yaxis_title="판매수량",
+    height=420,
+    legend_title="추세선",
+    xaxis=dict(categoryorder="array", categoryarray=week_order),
 )
+st.plotly_chart(fig_sales, use_container_width=True)
