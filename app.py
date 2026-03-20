@@ -352,6 +352,14 @@ if "sales_qty" not in sales_base_df.columns:
     st.error("sales_actual 시트에 sales_qty 컬럼이 없습니다.")
     st.stop()
 
+# week 체크 후 month_week_label 생성 (groupby 이전 필수)
+if "week" not in sales_base_df.columns:
+    st.error("sales_actual 시트에 week 컬럼이 없습니다.")
+    st.write("현재 컬럼 목록:", sales_base_df.columns.tolist())
+    st.stop()
+
+sales_base_df["month_week_label"] = sales_base_df["week"].apply(week_to_month_week_label)
+
 sales_base_df["sales_qty_num"] = to_numeric_safe(
     sales_base_df["sales_qty"]
 ).fillna(0)
@@ -402,6 +410,7 @@ blue_df["ratio_pct"] = (blue_df["qty"] / blue_total * 100) if blue_total > 0 els
 st.markdown("### 스타일코드")
 st.markdown(f"## {selected_style}")
 
+chart_title = "작년/올해 월별 주차 판매 비중 비교"
 st.markdown(f"### {chart_title}")
 
 sub_title = f"{selected_style} 작년/올해 월별 주차 판매 비중 비교"
@@ -455,6 +464,14 @@ else:
         "<br>올해 판매량=%{customdata}"
         "<extra></extra>"
     )
+
+# 그래프 y값/축 라벨 선택
+if view_mode:
+    y_col = "qty"
+    y_axis_title = "판매수량"
+else:
+    y_col = "ratio_pct"
+    y_axis_title = "판매 비중(%)"
 
 fig = go.Figure()
 
