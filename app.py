@@ -346,7 +346,7 @@ fig.add_trace(
         line=dict(color="rgba(150,150,150,1)", width=2),
         fill="tozeroy",
         fillcolor="rgba(180,180,180,0.35)",
-        hovertemplate="%{x}주차<br>판매량:%{customdata}장 <br>전체 비중=%{y:.2f}%<extra></extra>",
+        hovertemplate="판매량:%{customdata}장 <br>전체 비중=%{y:.2f}%<extra></extra>",
     )
 )
 
@@ -361,7 +361,7 @@ fig.add_trace(
         line=dict(color="rgba(220,70,70,1)", width=2),
         fill="tozeroy",
         fillcolor="rgba(220,70,70,0.25)",
-        hovertemplate="%{x}주차<br>판매량:%{customdata}장 <br>전체 비중=%{y:.2f}%<extra></extra>",
+        hovertemplate="판매량:%{customdata}장 <br>전체 비중=%{y:.2f}%<extra></extra>",
     )
 )
 fig.update_layout(
