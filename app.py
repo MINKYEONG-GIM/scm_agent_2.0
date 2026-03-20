@@ -1,13 +1,15 @@
 import os
 import json
 from typing import Tuple
-from datetime import date
-
+from datetime import date, datetime
+import re
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
+
+
 
 
 # =========================
@@ -89,6 +91,48 @@ def to_numeric_safe(series: pd.Series) -> pd.Series:
         series.astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False),
         errors="coerce"
     )
+
+
+def week_to_month_week_label(week_str: str) -> str:
+    """
+    '2025-23' -> '5월 3주차'
+    ISO week 기준으로 해당 주의 월요일 날짜를 사용
+    """
+    s = str(week_str).strip()
+    if "-" not in s:
+        return s
+
+    parts = s.split("-")
+    if len(parts) != 2:
+        return s
+
+    try:
+        year = int(parts[0])
+        week = int(parts[1])
+
+        # 해당 ISO 주의 월요일
+        dt = datetime.fromisocalendar(year, week, 1)
+
+        month = dt.month
+        week_of_month = ((dt.day - 1) // 7) + 1
+
+        return f"{month}월 {week_of_month}주차"
+    except:
+        return s
+
+
+def month_week_sort_key(label: str):
+    """
+    '5월 3주차' -> (5, 3)
+    """
+    m = re.match(r"(\d+)월 (\d+)주차", str(label))
+    if not m:
+        return (99, 99)
+
+    month = int(m.group(1))
+    week_of_month = int(m.group(2))
+    return (month, week_of_month)
+    
 
 
 def extract_item_from_style(style_code: str) -> str:
