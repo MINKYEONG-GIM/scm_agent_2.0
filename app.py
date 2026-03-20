@@ -348,21 +348,23 @@ if selected_color != "전체":
 if selected_size != "전체":
     sales_base_df = sales_base_df[sales_base_df["size"] == selected_size].copy()
 
-if "sales_amount" not in sales_base_df.columns:
-    st.error("sales_actual 시트에 sales_amount 컬럼이 없습니다.")
+if "sales_qty" not in sales_base_df.columns:
+    st.error("sales_actual 시트에 sales_qty 컬럼이 없습니다.")
     st.stop()
 
-sales_base_df["sales_amount_num"] = to_numeric_safe(sales_base_df["sales_amount"]).fillna(0)
-if "week" not in sales_base_df.columns:
-    st.error("sales_actual 시트에 week 컬럼이 없습니다.")
-    st.stop()
-sales_base_df["month_week_label"] = sales_base_df["week"].apply(week_to_month_week_label)
+sales_base_df["sales_qty_num"] = to_numeric_safe(
+    sales_base_df["sales_qty"]
+).fillna(0)
 
 blue_df = (
-    sales_base_df.groupby("month_week_label", as_index=False)["sales_amount_num"]
+    sales_base_df.groupby("month_week_label", as_index=False)["sales_qty_num"]
     .sum()
-    .rename(columns={"sales_amount_num": "qty"})
+    .rename(columns={"sales_qty_num": "qty"})
 )
+
+
+
+
 
 # -------------------------
 # 7-3) 월-주차 전체 축 통합
