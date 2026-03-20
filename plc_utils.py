@@ -251,7 +251,3 @@ def run_plc_pipeline(
     return df
 
 
-plc_df = run_plc_pipeline(
-    base_df,
-    discount_series=discount_series
-)
