@@ -150,7 +150,7 @@ plc_df.columns = [str(c).strip() for c in plc_df.columns]
 
 # sales_actual 필수 컬럼 체크
 sales_required_cols = [
-    "style_code", "color", "size", "store_name"
+    "style_code", "color", "size", "store_name", "store_code"
 ]
 missing_sales = [c for c in sales_required_cols if c not in sales_df.columns]
 if missing_sales:
@@ -159,8 +159,9 @@ if missing_sales:
 
 # bi_item_plc 필수 컬럼 체크
 plc_required_cols = [
-    "similar_color",   # 실제 시트 기준 오타 포함
+    "similar_color",
     "item",
+    "similar_store_code",
     "similar_store_name",
     "similar_week",
     "similar_forecast_qty",
@@ -171,10 +172,10 @@ if missing_plc:
     st.stop()
 
 # 문자열 컬럼 정리
-for col in ["style_code", "color", "size", "store_name"]:
+for col in ["style_code", "color", "size", "store_name", "store_code"]:
     sales_df[col] = clean_text(sales_df[col])
 
-for col in ["similar_color", "item", "similar_store_name", "similar_week"]:
+for col in ["similar_color", "item", "similar_store_code", "similar_store_name", "similar_week"]:
     plc_df[col] = clean_text(plc_df[col])
 
 plc_df["similar_forecast_qty_num"] = to_numeric_safe(plc_df["similar_forecast_qty"]).fillna(0)
@@ -198,10 +199,14 @@ with col1:
 # 선택 스타일 기준으로 필터 후보 좁히기
 sales_style_df = sales_df[sales_df["style_code"] == selected_style].copy()
 
-store_options = ["전체"] + sorted([
-    x for x in sales_style_df["store_name"].dropna().unique().tolist()
-    if x and x != "nan"
-])
+store_map_df = (
+    sales_style_df[["store_name", "store_code"]]
+    .dropna()
+    .drop_duplicates()
+    .sort_values(["store_name", "store_code"])
+)
+
+store_options = ["전체"] + store_map_df["store_name"].tolist()
 
 color_options = ["전체"] + sorted([
     x for x in sales_style_df["color"].dropna().unique().tolist()
@@ -224,6 +229,21 @@ with col4:
 
 st.info("사이즈 필터는 sales_actual 기준으로만 선택되며, 현재 bi_item_plc 시트에 사이즈 컬럼이 없어 그래프 계산에는 반영되지 않습니다.")
 
+
+selected_store_code = None
+
+if selected_store != "전체":
+    matched_codes = (
+        store_map_df.loc[store_map_df["store_name"] == selected_store, "store_code"]
+        .dropna()
+        .unique()
+        .tolist()
+    )
+
+    if len(matched_codes) == 0:
+        st.warning(f"선택한 매장 '{selected_store}'에 대응되는 store_code를 찾지 못했습니다.")
+    else:
+        selected_store_code = matched_codes[0]
 
 # =========================
 # 7) 그래프용 데이터 필터링
@@ -249,8 +269,10 @@ grey_df = (
 )
 
 # 빨간 그래프: item(+ color) + selected_store 기준
-if selected_store != "전체":
-    red_source_df = base_df[base_df["similar_store_name"] == selected_store].copy()
+if selected_store != "전체" and selected_store_code is not None:
+    red_source_df = base_df[base_df["similar_store_code"] == selected_store_code].copy()
+elif selected_store != "전체" and selected_store_code is None:
+    red_source_df = base_df.iloc[0:0].copy()
 else:
     red_source_df = base_df.copy()
 
@@ -340,6 +362,7 @@ with st.expander("디버깅용 데이터 확인"):
     st.write("선택 컬러:", selected_color)
     st.write("선택 사이즈:", selected_size)
     st.write("그래프 원천 행 수:", len(base_df))
+    st.write("선택 매장코드:", selected_store_code)
 
     st.markdown("#### 회색 그래프 데이터")
     st.dataframe(grey_df, use_container_width=True)
