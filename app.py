@@ -159,7 +159,7 @@ if missing_sales:
 
 # bi_item_plc 필수 컬럼 체크
 plc_required_cols = [
-    "smiliar_color",   # 실제 시트 기준 오타 포함
+    "similar_color",   # 실제 시트 기준 오타 포함
     "item",
     "similar_store_name",
     "similar_week",
@@ -174,7 +174,7 @@ if missing_plc:
 for col in ["style_code", "color", "size", "store_name"]:
     sales_df[col] = clean_text(sales_df[col])
 
-for col in ["smiliar_color", "item", "similar_store_name", "similar_week"]:
+for col in ["similar_color", "item", "similar_store_name", "similar_week"]:
     plc_df[col] = clean_text(plc_df[col])
 
 plc_df["similar_forecast_qty_num"] = to_numeric_safe(plc_df["similar_forecast_qty"]).fillna(0)
@@ -237,9 +237,9 @@ if not style_item:
 base_df = plc_df[plc_df["item"] == style_item].copy()
 
 # 컬러 필터 적용
-# sales_actual.color 값과 bi_item_plc.smiliar_color 값이 같은 구조라고 가정
+# sales_actual.color 값과 bi_item_plc.similar_color 값이 같은 구조라고 가정
 if selected_color != "전체":
-    base_df = base_df[base_df["smiliar_color"] == selected_color].copy()
+    base_df = base_df[base_df["similar_color"] == selected_color].copy()
 
 # 회색 그래프: item(+ color) 기준 전체 매장 합
 grey_df = (
