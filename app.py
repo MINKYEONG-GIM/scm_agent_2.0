@@ -245,6 +245,7 @@ if selected_store != "전체":
     else:
         selected_store_code = matched_codes[0]
 
+
 # =========================
 # 7) 그래프용 데이터 필터링
 # =========================
@@ -257,18 +258,17 @@ if not style_item:
 base_df = plc_df[plc_df["item"] == style_item].copy()
 
 # 컬러 필터 적용
-# sales_actual.color 값과 bi_item_plc.similar_color 값이 같은 구조라고 가정
 if selected_color != "전체":
     base_df = base_df[base_df["similar_color"] == selected_color].copy()
 
-# 회색 그래프: item(+ color) 기준 전체 매장 합
+# 회색 그래프용: 전체 매장
 grey_df = (
     base_df.groupby("similar_week", as_index=False)["similar_forecast_qty_num"]
     .sum()
     .rename(columns={"similar_forecast_qty_num": "qty"})
 )
 
-# 빨간 그래프: item(+ color) + selected_store 기준
+# 빨간 그래프용: 선택 매장
 if selected_store != "전체" and selected_store_code is not None:
     red_source_df = base_df[base_df["similar_store_code"] == selected_store_code].copy()
 elif selected_store != "전체" and selected_store_code is None:
@@ -291,6 +291,28 @@ red_df = red_df.set_index("similar_week").reindex(all_weeks, fill_value=0).reset
 grey_df.columns = ["similar_week", "qty"]
 red_df.columns = ["similar_week", "qty"]
 
+# -------------------------
+# 비중(%) 계산
+# -------------------------
+grey_total = grey_df["qty"].sum()
+red_total = red_df["qty"].sum()
+
+if grey_total > 0:
+    grey_df["ratio"] = grey_df["qty"] / grey_total
+else:
+    grey_df["ratio"] = 0
+
+if red_total > 0:
+    red_df["ratio"] = red_df["qty"] / red_total
+else:
+    red_df["ratio"] = 0
+
+# 퍼센트 표시용 컬럼
+grey_df["ratio_pct"] = grey_df["ratio"] * 100
+red_df["ratio_pct"] = red_df["ratio"] * 100
+
+
+
 
 # =========================
 # 8) 화면 표시
@@ -300,7 +322,7 @@ st.markdown(f"## {selected_style}")
 
 st.markdown("### 매출 추세")
 
-sub_title = f"{selected_style} 판매수량 추세"
+sub_title = f"{selected_style} 주차별 판매 비중 추세"
 if selected_store != "전체":
     sub_title += f" / 매장: {selected_store}"
 if selected_color != "전체":
@@ -316,12 +338,13 @@ fig = go.Figure()
 fig.add_trace(
     go.Scatter(
         x=grey_df["similar_week"],
-        y=grey_df["qty"],
+        y=grey_df["ratio_pct"],
         mode="lines",
         name="유사상품 전체 추세",
         line=dict(color="rgba(150,150,150,1)", width=2),
         fill="tozeroy",
         fillcolor="rgba(180,180,180,0.35)",
+        hovertemplate="주차=%{x}<br>전체 비중=%{y:.2f}%<extra></extra>",
     )
 )
 
@@ -329,25 +352,27 @@ fig.add_trace(
 fig.add_trace(
     go.Scatter(
         x=red_df["similar_week"],
-        y=red_df["qty"],
+        y=red_df["ratio_pct"],
         mode="lines",
         name="선택 매장 추세",
         line=dict(color="rgba(220,70,70,1)", width=2),
         fill="tozeroy",
         fillcolor="rgba(220,70,70,0.25)",
+        hovertemplate="주차=%{x}<br>매장 비중=%{y:.2f}%<extra></extra>",
     )
 )
-
 fig.update_layout(
     height=520,
     xaxis_title="주차",
-    yaxis_title="판매수량",
+    yaxis_title="판매 비중(%)",
     hovermode="x unified",
     legend_title="구분",
     margin=dict(l=20, r=20, t=30, b=20),
 )
 
 fig.update_xaxes(type="category", tickangle=90)
+
+fig.update_yaxes(ticksuffix="%")  
 
 st.plotly_chart(fig, use_container_width=True)
 
