@@ -104,21 +104,24 @@ def get_forecast_base_sheet_name() -> str:
     )
 
 
+
+
+
 # =========================
-# 2-1) 보조 시트: sales_actual
+# 2-1) 보조 시트: bi_item_plc
 # =========================
 @st.cache_data(ttl=300)
-def load_sales_actual_df() -> pd.DataFrame:
+def load_bi_item_plc_df() -> pd.DataFrame:
     """
-    sales_actual 워크시트를 DataFrame으로 읽습니다.
+    bi_item_plc 워크시트를 DataFrame으로 읽습니다.
     컬러 필터 옵션을 얻기 위해 사용합니다.
     """
-    return load_sheet_as_df("sales_actual")
+    return load_sheet_as_df("bi_item_plc")
 
 
-def resolve_sales_actual_sales_column(sales_actual_df: pd.DataFrame):
+def resolve_bi_item_plc_sales_column(bi_item_plc_df: pd.DataFrame):
     """
-    sales_actual 워크시트에서 '올해 매출'로 사용할 컬럼명을 추정합니다.
+    bi_item_plc 워크시트에서 '판매량'으로 사용할 컬럼명을 추정합니다.
     (실제 컬럼명은 시트마다 다를 수 있어, 후보를 순서대로 탐색합니다.)
     """
     candidates = [
@@ -132,7 +135,7 @@ def resolve_sales_actual_sales_column(sales_actual_df: pd.DataFrame):
         "amount",
         "revenue",
     ]
-    normalized = {str(c).strip(): c for c in sales_actual_df.columns}
+    normalized = {str(c).strip(): c for c in bi_item_plc_df.columns}
     for name in candidates:
         if name in normalized:
             return normalized[name]  # 원본 컬럼명 반환
@@ -237,6 +240,18 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     df["week_label"] = df["similar_week"].apply(_week_to_month_week_label)
 
     return df
+
+
+def extract_item_code(style_code: str) -> str:
+    style_code = str(style_code).strip()
+    if len(style_code) >= 4:
+        return style_code[2:4]
+
+    return ""
+
+
+
+
 
 
 # =========================
@@ -369,11 +384,11 @@ with col2:
 
 with col3:
     try:
-        sales_actual_df = load_sales_actual_df()
-        sales_actual_df.columns = [str(c).strip() for c in sales_actual_df.columns]
+        bi_item_plc_df = load_bi_item_plc_df()
+        bi_item_plc_df.columns = [str(c).strip() for c in bi_item_plc_df.columns]
 
-        color_source = sales_actual_df.copy()
-        # sales_actual에 style_code가 있으면 선택 스타일 기준으로 컬러 후보를 좁힘
+        color_source = bi_item_plc_df.copy()
+        # bi_item_plc에 style_code가 있으면 선택 스타일 기준으로 컬러 후보를 좁힘
         if "style_code" in color_source.columns:
             color_source["style_code"] = color_source["style_code"].astype(str).str.strip()
             color_source = color_source[color_source["style_code"] == selected_style]
@@ -384,10 +399,10 @@ with col3:
             selected_colors = st.multiselect("컬러", color_options, default=color_options)
         else:
             selected_colors = None
-            st.caption("sales_actual 워크시트에 color 컬럼이 없어 컬러 필터를 생략합니다.")
+            st.caption("bi_item_plc 워크시트에 color 컬럼이 없어 컬러 필터를 생략합니다.")
     except Exception:
         selected_colors = None
-        st.caption("sales_actual 워크시트 로드에 실패해 컬러 필터를 생략합니다.")
+        st.caption("bi_item_plc 워크시트 로드에 실패해 컬러 필터를 생략합니다.")
 
 with col4:
     if "similar_size" in style_df_for_filter.columns:
@@ -421,17 +436,17 @@ if total_week_df.empty:
     st.stop()
 
 
-# 스타일명: sales_actual 워크시트의 style_name에서 가져오기
+# 스타일명: bi_item_plc 워크시트의 style_name에서 가져오기
 style_name = ""
 try:
-    _sales_actual_df = load_sales_actual_df()
-    _sales_actual_df.columns = [str(c).strip() for c in _sales_actual_df.columns]
-    if "style_code" in _sales_actual_df.columns:
-        _sales_actual_df["style_code"] = _sales_actual_df["style_code"].astype(str).str.strip()
-        _sales_actual_df = _sales_actual_df[_sales_actual_df["style_code"] == selected_style]
-    if "style_name" in _sales_actual_df.columns and not _sales_actual_df.empty:
-        _sales_actual_df["style_name"] = _sales_actual_df["style_name"].astype(str).str.strip()
-        _names = [n for n in _sales_actual_df["style_name"].dropna().unique().tolist() if n and n != "nan"]
+    _bi_item_plc_df = load_bi_item_plc_df()
+    _bi_item_plc_df.columns = [str(c).strip() for c in _bi_item_plc_df.columns]
+    if "style_code" in _bi_item_plc_df.columns:
+        _bi_item_plc_df["style_code"] = _bi_item_plc_df["style_code"].astype(str).str.strip()
+        _bi_item_plc_df = _bi_item_plc_df[_bi_item_plc_df["style_code"] == selected_style]
+    if "style_name" in _bi_item_plc_df.columns and not _bi_item_plc_df.empty:
+        _bi_item_plc_df["style_name"] = _bi_item_plc_df["style_name"].astype(str).str.strip()
+        _names = [n for n in _bi_item_plc_df["style_name"].dropna().unique().tolist() if n and n != "nan"]
         if _names:
             style_name = _names[0]
 except Exception:
@@ -598,15 +613,15 @@ if selected_store != "전체" and not store_week_df.empty:
         )
     )
 
-# 올해(sales_actual) 라인 추가: 파란색 굵은 선, 채움 없음
+# 올해(bi_item_plc) 라인 추가: 파란색 굵은 선, 채움 없음
 try:
-    sa = load_sales_actual_df().copy()
+    sa = load_bi_item_plc_df().copy()
     sa.columns = [str(c).strip() for c in sa.columns]
 
     if "week" in sa.columns:
         sa["week"] = sa["week"].astype(str).str.strip()
 
-        # forecast_base.similar_week ↔ sales_actual.week 매핑(표시용 week_label/week_sort 부여)
+        # forecast_base.similar_week ↔ bi_item_plc.week 매핑(표시용 week_label/week_sort 부여)
         week_map_df = (
             df_filtered[["similar_week", "week_sort", "week_label"]]
             .drop_duplicates()
@@ -614,7 +629,7 @@ try:
         )
         sa_mapped = sa.merge(week_map_df, on="week", how="inner")
 
-        # 주차가 서로 안 겹치면(예: 작년 2025-xx vs 올해 2026-xx) sales_actual 자체로 라벨/정렬 생성
+        # 주차가 서로 안 겹치면(예: 작년 2025-xx vs 올해 2026-xx) bi_item_plc 자체로 라벨/정렬 생성
         if sa_mapped.empty:
             sa_mapped = sa.copy()
             sa_mapped["week_sort"] = (
@@ -633,7 +648,7 @@ try:
                 "similar_gross_sales": [0],
             }))["week_label"].iloc[0])
 
-        # 가능한 경우, 필터를 sales_actual에도 적용
+        # 가능한 경우, 필터를 bi_item_plc에도 적용
         if "style_code" in sa_mapped.columns:
             sa_mapped["style_code"] = sa_mapped["style_code"].astype(str).str.strip()
             sa_mapped = sa_mapped[sa_mapped["style_code"] == selected_style]
@@ -657,8 +672,8 @@ try:
                 sa_mapped["similar_size"] = sa_mapped["similar_size"].astype(str).str.strip()
                 sa_mapped = sa_mapped[sa_mapped["similar_size"].isin(selected_sizes)]
 
-        # sales_actual에서 올해 "판매량"은 sales_amount를 최우선 사용
-        sales_col = "sales_amount" if "sales_amount" in sa_mapped.columns else resolve_sales_actual_sales_column(sa_mapped)
+        # bi_item_plc에서 올해 "판매량"은 sales_amount를 최우선 사용
+        sales_col = "sales_amount" if "sales_amount" in sa_mapped.columns else resolve_bi_item_plc_sales_column(sa_mapped)
         if sales_col:
             sa_mapped[sales_col] = (
                 sa_mapped[sales_col]
