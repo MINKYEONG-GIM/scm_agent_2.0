@@ -400,7 +400,7 @@ blue_df["ratio_pct"] = (blue_df["qty"] / blue_total * 100) if blue_total > 0 els
 st.markdown("### 스타일코드")
 st.markdown(f"## {selected_style}")
 
-st.markdown("### 월별 주차 판매 비중 비교")
+st.markdown(f"### {chart_title}")
 
 sub_title = f"{selected_style} 작년/올해 월별 주차 판매 비중 비교"
 if selected_store != "전체":
@@ -412,24 +412,62 @@ if selected_size != "전체":
 
 st.markdown(f"**{sub_title}**")
 
+view_mode = st.toggle(
+    "판매수량으로 보기",
+    value=False,
+    help=False면 판매 비중(%), True면 실제 판매수량으로 표시합니다.
+)
+
+if view_mode:
+    grey_hover = (
+        "월주차=%{x}"
+        "<br>작년 전체 판매수량=%{y}"
+        "<extra></extra>"
+    )
+    red_hover = (
+        "월주차=%{x}"
+        "<br>작년 매장 판매수량=%{y}"
+        "<extra></extra>"
+    )
+    blue_hover = (
+        "월주차=%{x}"
+        "<br>올해 판매수량=%{y}"
+        "<extra></extra>"
+    )
+else:
+    grey_hover = (
+        "월주차=%{x}"
+        "<br>작년 전체 비중=%{y:.2f}%"
+        "<br>작년 전체 판매량=%{customdata}"
+        "<extra></extra>"
+    )
+    red_hover = (
+        "월주차=%{x}"
+        "<br>작년 매장 비중=%{y:.2f}%"
+        "<br>작년 매장 판매량=%{customdata}"
+        "<extra></extra>"
+    )
+    blue_hover = (
+        "월주차=%{x}"
+        "<br>올해 비중=%{y:.2f}%"
+        "<br>올해 판매량=%{customdata}"
+        "<extra></extra>"
+    )
+
 fig = go.Figure()
 
 # 회색 그래프
 fig.add_trace(
     go.Scatter(
         x=grey_df["month_week_label"],
-        y=grey_df["ratio_pct"],
+        y=grey_df[y_col],
         customdata=grey_df["qty"],
         mode="lines",
         name="작년 유사상품 전체 추세",
         line=dict(color="rgba(150,150,150,1)", width=2),
         fill="tozeroy",
         fillcolor="rgba(180,180,180,0.35)",
-        hovertemplate=
-            "월주차=%{x}"
-            "<br>작년 전체 비중=%{y:.2f}%"
-            "<br>작년 전체 판매량=%{customdata}"
-            "<extra></extra>",
+        hovertemplate=grey_hover
     )
 )
 
@@ -437,18 +475,14 @@ fig.add_trace(
 fig.add_trace(
     go.Scatter(
         x=red_df["month_week_label"],
-        y=red_df["ratio_pct"],
+        y=red_df[y_col],
         customdata=red_df["qty"],
         mode="lines",
         name="작년 선택 매장 추세",
         line=dict(color="rgba(220,70,70,1)", width=2),
         fill="tozeroy",
         fillcolor="rgba(220,70,70,0.25)",
-        hovertemplate=
-            "월주차=%{x}"
-            "<br>작년 매장 비중=%{y:.2f}%"
-            "<br>작년 매장 판매량=%{customdata}"
-            "<extra></extra>",
+        hovertemplate=red_hover
     )
 )
 
@@ -456,24 +490,20 @@ fig.add_trace(
 fig.add_trace(
     go.Scatter(
         x=blue_df["month_week_label"],
-        y=blue_df["ratio_pct"],
+        y=blue_df[y_col],
         customdata=blue_df["qty"],
         mode="lines",
         name="올해 실제 추세",
         line=dict(color="rgba(60,120,220,1)", width=2),
         fill="tozeroy",
         fillcolor="rgba(60,120,220,0.18)",
-        hovertemplate=
-            "월주차=%{x}"
-            "<br>올해 비중=%{y:.2f}%"
-            "<br>올해 판매량=%{customdata}"
-            "<extra></extra>",
+        hovertemplate=blue_hover
     )
 )
 fig.update_layout(
     height=520,
     xaxis_title="월주차",
-    yaxis_title="판매 비중(%)",
+    yaxis_title=y_axis_title,
     hovermode="x unified",
     legend_title="구분",
     margin=dict(l=20, r=20, t=30, b=20),
@@ -481,7 +511,10 @@ fig.update_layout(
 
 fig.update_xaxes(type="category", tickangle=90)
 
-fig.update_yaxes(ticksuffix="%")  
+if view_mode:
+    fig.update_yaxes(ticksuffix="")
+else:
+    fig.update_yaxes(ticksuffix="%")
 
 st.plotly_chart(fig, use_container_width=True)
 
