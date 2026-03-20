@@ -417,7 +417,7 @@ st.markdown(f"**{sub_title}**")
 view_mode = st.toggle(
     "판매수량으로 보기",
     value=False,
-    help=False면 판매 비중(%), True면 실제 판매수량으로 표시합니다.
+    help="False면 판매 비중(%), True면 실제 판매수량으로 표시합니다."
 )
 
 if view_mode:
