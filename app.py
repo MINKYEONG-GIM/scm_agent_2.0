@@ -114,7 +114,6 @@ def get_forecast_base_sheet_name() -> str:
 def load_bi_item_plc_df() -> pd.DataFrame:
     """
     bi_item_plc 워크시트를 DataFrame으로 읽습니다.
-    컬러 필터 옵션을 얻기 위해 사용합니다.
     """
     return load_sheet_as_df("bi_item_plc")
 
@@ -131,7 +130,6 @@ def resolve_bi_item_plc_sales_column(bi_item_plc_df: pd.DataFrame):
         "sales",
         "actual_sales",
         "net_sales",
-        "sales_amount",
         "amount",
         "revenue",
     ]
@@ -140,6 +138,114 @@ def resolve_bi_item_plc_sales_column(bi_item_plc_df: pd.DataFrame):
         if name in normalized:
             return normalized[name]  # 원본 컬럼명 반환
     return None
+
+
+def _week_to_month_week_label(v: str) -> str:
+    """
+    'YYYY-WW' 형태를 'M월 N주차'로 변환.
+    ISO week 기준(해당 주의 월요일)으로 월/월내주차 계산.
+    변환 실패 시 원본 반환.
+    """
+    s = str(v).strip()
+    if not s or s.lower() == "nan" or "-" not in s:
+        return s
+    y, w = s.split("-", 1)
+    try:
+        year = int(y)
+        week = int(w)
+        d = date.fromisocalendar(year, week, 1)  # Monday of ISO week
+        week_in_month = (d.day - 1) // 7 + 1
+        return f"{d.month}월 {week_in_month}주차"
+    except Exception:
+        return s
+
+
+def add_week_sort_and_label_from_similar_week(df: pd.DataFrame) -> pd.DataFrame:
+    """similar_week 기준으로 week_sort, week_label 생성."""
+    out = df.copy()
+    if "similar_week" not in out.columns:
+        return out
+    out["similar_week"] = out["similar_week"].astype(str).str.strip()
+    out["week_sort"] = (
+        out["similar_week"]
+        .str.replace("-", "", regex=False)
+        .str.replace(" ", "", regex=False)
+    )
+    out["week_sort"] = pd.to_numeric(out["week_sort"], errors="coerce")
+    out["week_label"] = out["similar_week"].apply(_week_to_month_week_label)
+    return out
+
+
+def normalize_bi_item_plc_for_pipeline(plc_df: pd.DataFrame, selected_style: str) -> pd.DataFrame:
+    """
+    build_style_summary / 그래프 집계에 맞게 bi_item_plc 행을 정규화합니다.
+    - similar_forecast_qty → similar_gross_sales 가 없으면 복사 (PLC 파이프라인용)
+    - 주차: week 또는 similar_week 통일
+    - style_code: 선택 스타일로 통일
+    """
+    out = plc_df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+
+    out["style_code"] = str(selected_style).strip()
+
+    if "similar_week" not in out.columns and "week" in out.columns:
+        out = out.rename(columns={"week": "similar_week"})
+
+    if "similar_week" in out.columns:
+        out = add_week_sort_and_label_from_similar_week(out)
+    else:
+        out["week_sort"] = pd.NA
+        out["week_label"] = ""
+
+    if "similar_gross_sales" not in out.columns and "similar_forecast_qty" in out.columns:
+        s = (
+            out["similar_forecast_qty"]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("₩", "", regex=False)
+            .str.strip()
+        )
+        out["similar_gross_sales"] = pd.to_numeric(s, errors="coerce").fillna(0)
+    elif "similar_gross_sales" in out.columns:
+        out["similar_gross_sales"] = (
+            out["similar_gross_sales"]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("₩", "", regex=False)
+            .str.strip()
+        )
+        out["similar_gross_sales"] = pd.to_numeric(out["similar_gross_sales"], errors="coerce").fillna(0)
+
+    if "similar_forecast_qty" in out.columns:
+        out["similar_forecast_qty"] = (
+            out["similar_forecast_qty"]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("₩", "", regex=False)
+            .str.strip()
+        )
+        out["similar_forecast_qty"] = pd.to_numeric(out["similar_forecast_qty"], errors="coerce").fillna(0)
+
+    if "similar_store_name" in out.columns:
+        out["similar_store_name"] = out["similar_store_name"].astype(str).str.strip()
+
+    if "similar_store_code" not in out.columns and "similar_store_name" in out.columns:
+        out["similar_store_code"] = out["similar_store_name"]
+
+    if "similar_discount_rate" in out.columns:
+        dr = (
+            out["similar_discount_rate"]
+            .astype(str)
+            .str.replace("%", "", regex=False)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+        )
+        dr = pd.to_numeric(dr, errors="coerce")
+        if dr.notna().any() and dr.max(skipna=True) > 1:
+            dr = dr / 100.0
+        out["similar_discount_rate"] = dr
+
+    return out
 
 
 # =========================
@@ -217,25 +323,6 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
         .str.replace(" ", "", regex=False)
     )
     df["week_sort"] = pd.to_numeric(df["week_sort"], errors="coerce")
-
-    def _week_to_month_week_label(v: str) -> str:
-        """
-        'YYYY-WW' 형태를 'M월 N주차'로 변환.
-        ISO week 기준(해당 주의 월요일)으로 월/월내주차 계산.
-        변환 실패 시 원본 반환.
-        """
-        s = str(v).strip()
-        if not s or s.lower() == "nan" or "-" not in s:
-            return s
-        y, w = s.split("-", 1)
-        try:
-            year = int(y)
-            week = int(w)
-            d = date.fromisocalendar(year, week, 1)  # Monday of ISO week
-            week_in_month = (d.day - 1) // 7 + 1
-            return f"{d.month}월 {week_in_month}주차"
-        except Exception:
-            return s
 
     df["week_label"] = df["similar_week"].apply(_week_to_month_week_label)
 
@@ -354,6 +441,9 @@ try:
     sheet_id = sheets_cfg.get("sheet_id", "")
     raw_df = load_sheet_as_df(forecast_base_sheet)
     df = clean_data(raw_df)
+
+    bi_item_plc_df = load_bi_item_plc_df()
+    bi_item_plc_df.columns = [str(c).strip() for c in bi_item_plc_df.columns]
 except Exception as e:
     st.error("데이터 로드 중 오류가 발생했습니다.")
     st.exception(e)
@@ -361,11 +451,11 @@ except Exception as e:
 
 
 if df.empty:
-    st.warning("시트에 데이터가 없습니다.")
+    st.warning("기준 시트에 데이터가 없습니다.")
     st.stop()
 
 
-style_list = sorted(df["style_code"].dropna().unique().tolist())
+style_list = sorted(df["style_code"].dropna().astype(str).str.strip().unique().tolist())
 
 col1, col2, col3, col4 = st.columns(4)
 
@@ -374,25 +464,30 @@ with col1:
     style_idx = style_list.index(default_style) if default_style in style_list else 0
     selected_style = st.selectbox("스타일", style_list, index=style_idx)
 
-style_df_for_filter = df[df["style_code"] == selected_style].copy()
-store_list = sorted(style_df_for_filter["similar_store_name"].dropna().unique().tolist())
+# 스타일코드 3·4번째 2자리 → bi_item_plc.item 과 매칭
+selected_item_code = extract_item_code(selected_style)
+
+plc_filter_df = bi_item_plc_df.copy()
+if "item" in plc_filter_df.columns:
+    plc_filter_df["item"] = plc_filter_df["item"].astype(str).str.strip()
+    plc_filter_df = plc_filter_df[plc_filter_df["item"] == selected_item_code]
+else:
+    plc_filter_df = pd.DataFrame()
+
+if "similar_store_name" in plc_filter_df.columns:
+    plc_filter_df["similar_store_name"] = plc_filter_df["similar_store_name"].astype(str).str.strip()
+    store_list = sorted([s for s in plc_filter_df["similar_store_name"].dropna().unique().tolist() if s and s != "nan"])
+else:
+    store_list = []
 
 with col2:
-    # 기본값은 항상 "코엑스몰" (옵션에 없으면 강제로 포함)
-    store_options = ["코엑스몰", "전체"] + [s for s in store_list if s not in ["코엑스몰", "전체"]]
-    selected_store = st.selectbox("매장", store_options, index=0)
+    store_options = ["전체"] + store_list
+    default_store_idx = store_options.index("코엑스몰") if "코엑스몰" in store_options else 0
+    selected_store = st.selectbox("매장", store_options, index=default_store_idx)
 
 with col3:
     try:
-        bi_item_plc_df = load_bi_item_plc_df()
-        bi_item_plc_df.columns = [str(c).strip() for c in bi_item_plc_df.columns]
-
-        color_source = bi_item_plc_df.copy()
-        # bi_item_plc에 style_code가 있으면 선택 스타일 기준으로 컬러 후보를 좁힘
-        if "style_code" in color_source.columns:
-            color_source["style_code"] = color_source["style_code"].astype(str).str.strip()
-            color_source = color_source[color_source["style_code"] == selected_style]
-
+        color_source = plc_filter_df.copy()
         if "color" in color_source.columns:
             color_source["color"] = color_source["color"].astype(str).str.strip()
             color_options = sorted([c for c in color_source["color"].dropna().unique().tolist() if c and c != "nan"])
@@ -405,24 +500,28 @@ with col3:
         st.caption("bi_item_plc 워크시트 로드에 실패해 컬러 필터를 생략합니다.")
 
 with col4:
-    if "similar_size" in style_df_for_filter.columns:
-        size_options = sorted(style_df_for_filter["similar_size"].dropna().unique().tolist())
+    if "similar_size" in plc_filter_df.columns:
+        size_options = sorted(plc_filter_df["similar_size"].dropna().unique().tolist())
         selected_sizes = st.multiselect("사이즈", size_options, default=size_options)
     else:
         selected_sizes = None
-        st.caption("사이즈 컬럼이 없어 사이즈 필터를 생략합니다.")
+        st.caption("similar_size 컬럼이 없어 사이즈 필터를 생략합니다.")
 
 
 # =========================
-# 7) 스타일별 집계
+# 7) item 기준 집계 (회색=전체 매장, 빨강=선택 매장은 그래프에서 분리)
 # =========================
-df_filtered = df.copy()
-df_filtered = df_filtered[df_filtered["style_code"] == selected_style]
-if selected_colors is not None:
-    if "color" in df_filtered.columns:
-        df_filtered = df_filtered[df_filtered["color"].isin(selected_colors)]
-if selected_sizes is not None:
+df_filtered = plc_filter_df.copy()
+
+if selected_colors is not None and "color" in df_filtered.columns:
+    df_filtered = df_filtered[df_filtered["color"].isin(selected_colors)]
+
+if selected_sizes is not None and "similar_size" in df_filtered.columns:
     df_filtered = df_filtered[df_filtered["similar_size"].isin(selected_sizes)]
+
+# 매장은 그래프 전체(회색)에 적용하지 않음 — 선택 매장은 빨간 선만 필터
+
+df_filtered = normalize_bi_item_plc_for_pipeline(df_filtered, selected_style)
 
 total_week_df, store_week_df_all = build_style_summary(df_filtered, selected_style)
 store_week_df = store_week_df_all.copy()
@@ -432,21 +531,23 @@ if selected_store != "전체":
 store_summary_df = build_store_rank_table(store_week_df)
 
 if total_week_df.empty:
-    st.warning("선택한 스타일의 데이터가 없습니다.")
+    st.warning("선택한 item 코드 기준 데이터가 없습니다.")
     st.stop()
 
 
-# 스타일명: bi_item_plc 워크시트의 style_name에서 가져오기
+# 스타일명: bi_item_plc의 style_name에서 가져오기 (item 코드 기준)
 style_name = ""
 try:
-    _bi_item_plc_df = load_bi_item_plc_df()
-    _bi_item_plc_df.columns = [str(c).strip() for c in _bi_item_plc_df.columns]
-    if "style_code" in _bi_item_plc_df.columns:
-        _bi_item_plc_df["style_code"] = _bi_item_plc_df["style_code"].astype(str).str.strip()
-        _bi_item_plc_df = _bi_item_plc_df[_bi_item_plc_df["style_code"] == selected_style]
-    if "style_name" in _bi_item_plc_df.columns and not _bi_item_plc_df.empty:
-        _bi_item_plc_df["style_name"] = _bi_item_plc_df["style_name"].astype(str).str.strip()
-        _names = [n for n in _bi_item_plc_df["style_name"].dropna().unique().tolist() if n and n != "nan"]
+    _plc_name_df = bi_item_plc_df.copy()
+    _plc_name_df.columns = [str(c).strip() for c in _plc_name_df.columns]
+
+    if "item" in _plc_name_df.columns:
+        _plc_name_df["item"] = _plc_name_df["item"].astype(str).str.strip()
+        _plc_name_df = _plc_name_df[_plc_name_df["item"] == selected_item_code]
+
+    if "style_name" in _plc_name_df.columns and not _plc_name_df.empty:
+        _plc_name_df["style_name"] = _plc_name_df["style_name"].astype(str).str.strip()
+        _names = [n for n in _plc_name_df["style_name"].dropna().unique().tolist() if n and n != "nan"]
         if _names:
             style_name = _names[0]
 except Exception:
@@ -547,7 +648,7 @@ fig_sales.add_trace(
     )
 )
 
-if selected_store != "전체" and not store_week_df.empty:
+if selected_store != "전체":
     df_store_filtered = df_filtered[df_filtered["similar_store_name"] == selected_store].copy()
     sales_store_week_df = (
         df_store_filtered.groupby(["similar_week", "week_sort", "week_label"], as_index=False)
@@ -613,52 +714,43 @@ if selected_store != "전체" and not store_week_df.empty:
         )
     )
 
-# 올해(bi_item_plc) 라인 추가: 파란색 굵은 선, 채움 없음
+# 올해(bi_item_plc) 라인 추가: 파란색 굵은 선, 채움 없음 — item·컬러·사이즈·매장 동일 필터
 try:
-    sa = load_bi_item_plc_df().copy()
+    sa = bi_item_plc_df.copy()
     sa.columns = [str(c).strip() for c in sa.columns]
 
-    if "week" in sa.columns:
-        sa["week"] = sa["week"].astype(str).str.strip()
+    if "item" in sa.columns:
+        sa["item"] = sa["item"].astype(str).str.strip()
+        sa = sa[sa["item"] == selected_item_code]
 
-        # forecast_base.similar_week ↔ bi_item_plc.week 매핑(표시용 week_label/week_sort 부여)
+    week_col = "week" if "week" in sa.columns else ("similar_week" if "similar_week" in sa.columns else None)
+    if week_col:
+        sa["_merge_week"] = sa[week_col].astype(str).str.strip()
+
         week_map_df = (
             df_filtered[["similar_week", "week_sort", "week_label"]]
             .drop_duplicates()
-            .rename(columns={"similar_week": "week"})
+            .rename(columns={"similar_week": "_merge_week"})
         )
-        sa_mapped = sa.merge(week_map_df, on="week", how="inner")
+        sa_mapped = sa.merge(week_map_df, on="_merge_week", how="inner")
 
-        # 주차가 서로 안 겹치면(예: 작년 2025-xx vs 올해 2026-xx) bi_item_plc 자체로 라벨/정렬 생성
         if sa_mapped.empty:
             sa_mapped = sa.copy()
             sa_mapped["week_sort"] = (
-                sa_mapped["week"]
+                sa_mapped["_merge_week"]
                 .astype(str)
                 .str.replace("-", "", regex=False)
                 .str.replace(" ", "", regex=False)
             )
             sa_mapped["week_sort"] = pd.to_numeric(sa_mapped["week_sort"], errors="coerce")
-            sa_mapped["week_label"] = sa_mapped["week"].apply(lambda v: clean_data(pd.DataFrame({
-                "style_code": [selected_style],
-                "similar_style_code": [""],
-                "similar_store_code": [""],
-                "similar_store_name": [""],
-                "similar_week": [str(v)],
-                "similar_gross_sales": [0],
-            }))["week_label"].iloc[0])
+            sa_mapped["week_label"] = sa_mapped["_merge_week"].apply(_week_to_month_week_label)
 
-        # 가능한 경우, 필터를 bi_item_plc에도 적용
-        if "style_code" in sa_mapped.columns:
-            sa_mapped["style_code"] = sa_mapped["style_code"].astype(str).str.strip()
-            sa_mapped = sa_mapped[sa_mapped["style_code"] == selected_style]
+        if "_merge_week" in sa_mapped.columns:
+            sa_mapped = sa_mapped.drop(columns=["_merge_week"], errors="ignore")
 
-        if selected_store != "전체":
-            for store_col in ["store_name", "store", "store_nm", "similar_store_name", "similar_store"]:
-                if store_col in sa_mapped.columns:
-                    sa_mapped[store_col] = sa_mapped[store_col].astype(str).str.strip()
-                    sa_mapped = sa_mapped[sa_mapped[store_col] == selected_store]
-                    break
+        if selected_store != "전체" and "similar_store_name" in sa_mapped.columns:
+            sa_mapped["similar_store_name"] = sa_mapped["similar_store_name"].astype(str).str.strip()
+            sa_mapped = sa_mapped[sa_mapped["similar_store_name"] == selected_store]
 
         if selected_colors is not None and "color" in sa_mapped.columns:
             sa_mapped["color"] = sa_mapped["color"].astype(str).str.strip()
@@ -672,7 +764,7 @@ try:
                 sa_mapped["similar_size"] = sa_mapped["similar_size"].astype(str).str.strip()
                 sa_mapped = sa_mapped[sa_mapped["similar_size"].isin(selected_sizes)]
 
-        # bi_item_plc에서 올해 "판매량"은 sales_amount를 최우선 사용
+        # 올해 선: sales_amount 우선 (없으면 후보 탐색)
         sales_col = "sales_amount" if "sales_amount" in sa_mapped.columns else resolve_bi_item_plc_sales_column(sa_mapped)
         if sales_col:
             sa_mapped[sales_col] = (
