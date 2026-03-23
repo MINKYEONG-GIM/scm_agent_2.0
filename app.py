@@ -1,21 +1,108 @@
+import os
+import json
+from typing import Tuple
+from datetime import date
+
 import pandas as pd
-import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
-from streamlit_gsheets import GSheetsConnection
+import gspread
+from google.oauth2.service_account import Credentials
 
 
-SHEET_ID = "1IlJxe4ocFeNODRxMxpgtHA1xKC-Xn5-YvRsaHciUfLw"
-WORKSHEET_NAME = "plc db"
-
-conn = st.connection("gsheets", type=GSheetsConnection)
-
-df = conn.read(
-    spreadsheet=SHEET_ID,
-    worksheet=WORKSHEET_NAME,
-    ttl=0
+# =========================
+# 1) 기본 설정
+# =========================
+st.set_page_config(
+    page_title="agent_test",
+    layout="wide",
 )
 
-st.dataframe(df, use_container_width=True)
+st.title("agent_test")
+st.caption("agent_test")
+
+
+# =========================
+# 2) 구글시트 연결
+# =========================
+def get_gspread_client():
+    """
+    Streamlit secrets 또는 환경변수에서 구글 서비스계정 정보를 읽어
+    gspread client를 생성합니다.
+
+    방법 1) .streamlit/secrets.toml 사용
+    방법 2) 환경변수 GOOGLE_SERVICE_ACCOUNT_JSON 사용
+    """
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+
+    if "gcp_service_account" in st.secrets:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        return gspread.authorize(credentials)
+
+    service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if service_account_json:
+        creds_dict = json.loads(service_account_json)
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        return gspread.authorize(credentials)
+
+    raise ValueError(
+        "구글 서비스 계정 정보가 없습니다. "
+        "st.secrets['gcp_service_account'] 또는 GOOGLE_SERVICE_ACCOUNT_JSON을 설정하세요."
+    )
+
+
+@st.cache_data(ttl=300)
+def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
+    """
+    구글시트의 특정 워크시트를 DataFrame으로 읽습니다.
+    """
+    client = get_gspread_client()
+    sheets_cfg = get_sheets_config()
+    sheet_id = sheets_cfg.get("sheet_id")
+    if not sheet_id:
+        raise ValueError("secrets.toml의 [sheets].sheet_id 가 비어있습니다.")
+
+    sh = client.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet(worksheet_name)
+    except Exception as e:
+        available = [w.title for w in sh.worksheets()]
+        raise ValueError(
+            f"워크시트 '{worksheet_name}'를 찾지 못했습니다. 사용 가능한 워크시트: {available}"
+        ) from e
+    values = ws.get_all_records()
+    df = pd.DataFrame(values)
+    return df
+
+
+def get_sheets_config() -> dict:
+    """
+    secrets.toml의 [sheets] 섹션을 dict로 반환합니다.
+    """
+    if "sheets" not in st.secrets:
+        raise ValueError("st.secrets['sheets'] 설정이 없습니다. secrets.toml에 [sheets] 섹션을 추가하세요.")
+    return dict(st.secrets["sheets"])
+
+
+def get_forecast_base_sheet_name() -> str:
+    """
+    기본으로 사용할 워크시트명(=forecast_base)을 반환합니다.
+    - 권장 키: sheets.forecast_base_sheet
+    - 하위 호환: sheets.worksheet
+    """
+    sheets_cfg = get_sheets_config()
+    return (
+        sheets_cfg.get("forecast_base_sheet")
+        or sheets_cfg.get("worksheet")
+        or "forecast_base"
+    )
+
+
 
 
 st.set_page_config(page_title="PLC 분석기", layout="wide")
