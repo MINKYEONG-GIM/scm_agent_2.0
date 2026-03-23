@@ -72,10 +72,10 @@ def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
     values = ws.get_all_records()
     return pd.DataFrame(values)
 
+
+# 비시즌 판별 함수
 def mark_off_season_stage(df: pd.DataFrame) -> pd.DataFrame:
     """
-    성장 중간의 낮은 판매 구간을 비시즌으로 표시한다.
-
     조건:
     - peak 이전 구간
     - 최고점 대비 OFF_SEASON_RATIO 이하
