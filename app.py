@@ -108,7 +108,7 @@ def mark_off_season_stage(df: pd.DataFrame) -> pd.DataFrame:
         if i <= INTRO_WEEKS:
             continue
 
-        if qty <= max(평균의 50%, 중간값의 50%):
+        if if qty <= off_threshold:
             candidate_idx.append(i)
 
     if not candidate_idx:
