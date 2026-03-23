@@ -108,7 +108,7 @@ def mark_off_season_stage(df: pd.DataFrame) -> pd.DataFrame:
         if i <= INTRO_WEEKS:
             continue
 
-        if ratio <= OFF_SEASON_RATIO:
+        if qty <= max(평균의 50%, 중간값의 50%):
             candidate_idx.append(i)
 
     if not candidate_idx:
@@ -151,6 +151,124 @@ def mark_off_season_stage(df: pd.DataFrame) -> pd.DataFrame:
 
     return out
 
+def get_off_season_threshold(df: pd.DataFrame, intro_end: int, peak_idx: int) -> float:
+    """
+    비시즌 판정 기준값:
+    평균의 50%, 중간값의 50% 중 더 큰 값을 사용
+    """
+    base_series = df.loc[intro_end + 1:peak_idx - 1, "qty"].dropna()
+
+    if base_series.empty:
+        return 0.0
+
+    avg_val = float(base_series.mean())
+    median_val = float(base_series.median())
+
+    threshold_avg = avg_val * OFF_SEASON_BASE_RATIO
+    threshold_median = median_val * OFF_SEASON_BASE_RATIO
+
+    return max(threshold_avg, threshold_median)
+
+def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int):
+    """
+    비시즌 구간 여러 개를 찾는다.
+
+    조건
+    - peak 이전만 가능
+    - INTRO_WEEKS 이후만 가능
+    - 평균/중간값 대비 50% 이하
+    - 최소 3주 이상 연속
+    - peak 직전 1~2주는 비시즌 금지
+    - 이후 확실한 회복이 있어야 함
+    """
+    if df.empty:
+        return []
+
+    search_start = max(intro_end + 1, INTRO_WEEKS)
+    search_end = peak_idx - OFF_SEASON_PEAK_BUFFER - 1
+
+    if search_start > search_end:
+        return []
+
+    # 비시즌 기준값 계산
+    off_threshold = get_off_season_threshold(df, intro_end, peak_idx)
+
+    if off_threshold <= 0:
+        return []
+
+    candidate_idx = []
+
+    for i in range(search_start, search_end + 1):
+        qty = df.loc[i, "qty"]
+
+        if pd.isna(qty):
+            continue
+
+        # 평균/중간값 대비 50% 이하
+        if qty <= off_threshold:
+            candidate_idx.append(i)
+
+    if not candidate_idx:
+        return []
+
+    # 연속 구간 묶기
+    groups = []
+    current_group = [candidate_idx[0]]
+
+    for idx in candidate_idx[1:]:
+        if idx == current_group[-1] + 1:
+            current_group.append(idx)
+        else:
+            groups.append(current_group)
+            current_group = [idx]
+    groups.append(current_group)
+
+    valid_groups = []
+
+    # 회복 기준은 peak 대비로 두는 게 자연스러움
+    peak_qty = float(df["qty"].max()) if pd.notna(df["qty"].max()) else 0.0
+    recovery_threshold = peak_qty * OFF_SEASON_RECOVERY_RATIO
+
+    for g in groups:
+        if len(g) < OFF_SEASON_MIN_WEEKS:
+            continue
+
+        after_idx = g[-1] + 1
+        if after_idx >= peak_idx:
+            continue
+
+        future_qty = df.loc[after_idx:peak_idx, "qty"].dropna()
+
+        # 이후 확실한 회복 필요
+        if future_qty.empty:
+            continue
+
+        if not (future_qty >= recovery_threshold).any():
+            continue
+
+        avg_qty = float(df.loc[g, "qty"].mean())
+
+        valid_groups.append({
+            "start": g[0],
+            "end": g[-1],
+            "length": len(g),
+            "avg_qty": avg_qty
+        })
+
+    if not valid_groups:
+        return []
+
+    # 우선순위:
+    # 1. 더 긴 구간
+    # 2. 평균 판매수량이 더 낮은 구간
+    # 3. 더 이른 구간
+    valid_groups = sorted(
+        valid_groups,
+        key=lambda x: (-x["length"], x["avg_qty"], x["start"])
+    )
+
+    return [(g["start"], g["end"]) for g in valid_groups]
+
 
 
 
@@ -176,9 +294,10 @@ MATURE_RATIO = 0.85
 DECLINE_RATIO = 0.70
 HIGH_DISCOUNT_RATIO = 0.30
 #비시즌 관련 수치
-OFF_SEASON_RATIO = 0.45          # 최고점 대비 45% 이하
-OFF_SEASON_MIN_WEEKS = 3         # 최소 3주 이상 지속
-OFF_SEASON_RECOVERY_RATIO = 0.60 # 이후 다시 60% 이상 회복되면 비시즌으로 인정
+OFF_SEASON_BASE_RATIO = 0.50 #평균/중간값의 50% 이하
+OFF_SEASON_MIN_WEEKS = 3 #최소 3주 연속
+OFF_SEASON_RECOVERY_RATIO = 0.60 #이후 회복 판정용
+OFF_SEASON_PEAK_BUFFER = 2 #peak 직전 2주 제외
 
 ROLLING_WINDOW = 3  # 최근 흐름 판단용
 LOCAL_PEAK_WINDOW = 1  # 앞/뒤 1주 비교
