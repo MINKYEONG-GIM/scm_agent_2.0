@@ -571,37 +571,21 @@ def draw_item_chart(item_df: pd.DataFrame, item_name: str) -> go.Figure:
 # =========================
 @st.cache_data(ttl=300)
 def load_sheet_data() -> pd.DataFrame:
-    """
-    secrets 예시
-    [sheets]
-    SHEET_URL = "https://docs.google.com/spreadsheets/d/1IlJxe4ocFeNODRxMxpgtHA1xKC-Xn5-YvRsaHciUfLw"
-    WORKSHEET_NAME = "plc db"
-    """
-    if "sheets" not in st.secrets:
-        raise ValueError("Streamlit secrets에 [sheets] 설정이 없습니다.")
+    sheets_cfg = get_sheets_config()
 
-    sheet_url = st.secrets["sheets"]["SHEET_URL"]
-    worksheet_name = st.secrets["sheets"]["WORKSHEET_NAME"]
-
-    if GSheetsConnection is None:
-        raise ImportError(
-            "streamlit_gsheets 패키지가 없습니다. "
-            "requirements.txt에 streamlit-gsheets 를 추가하세요."
-        )
-
-    conn = st.connection("gsheets", type=GSheetsConnection)
-
-    df = conn.read(
-        spreadsheet=sheet_url,
-        worksheet=worksheet_name,
-        usecols=None,
-        ttl=300
+    sheet_id = sheets_cfg.get("sheet_id")
+    worksheet_name = (
+        sheets_cfg.get("WORKSHEET_NAME")
+        or sheets_cfg.get("worksheet")
+        or sheets_cfg.get("forecast_base_sheet")
+        or "plc db"
     )
 
-    if df is None or df.empty:
-        raise ValueError("구글시트에서 데이터를 읽어오지 못했습니다.")
+    if not sheet_id:
+        raise ValueError("secrets.toml의 [sheets].sheet_id 가 비어있습니다.")
 
-    return pd.DataFrame(df)
+    return load_sheet_as_df(worksheet_name)
+
 
 
 # =========================
