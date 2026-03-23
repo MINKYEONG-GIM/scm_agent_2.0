@@ -10,7 +10,8 @@
 
 
 
-핵심시즌 분석
+핵심시즌 분석(classify sesason.py)
+
 - SUMMER_PEAK: 여름 비중 40% 이상
 - WINTER_PEAK: 겨울 비중 40% 이상
 - SPRING_FALL_PEAK: 봄+가을 비중 60% 이상
