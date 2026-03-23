@@ -10,13 +10,6 @@ from google.oauth2.service_account import Credentials
 from streamlit_gsheets import GSheetsConnection
 
 # =========================
-# 1) 기본 설정
-# =========================
-
-st.title("아이템별 PLC 분석 화면")
-st.caption("주차별 전체 매출 추이와 PLC 단계(도입/성장/성숙/변곡점/쇠퇴)를 함께 보여줍니다.")
-
-# =========================
 # 1-1) 구글시트 연결
 # =========================
 def get_gspread_client():
