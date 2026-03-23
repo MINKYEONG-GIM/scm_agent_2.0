@@ -1,7 +1,11 @@
+import os
+import json
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
 
 # =========================
 # 1) 기본 설정
@@ -13,6 +17,71 @@ st.set_page_config(
 
 st.title("아이템별 PLC 분석 화면")
 st.caption("주차별 전체 매출 추이와 PLC 단계(도입/성장/성숙/변곡점/쇠퇴)를 함께 보여줍니다.")
+
+# =========================
+# 1-1) 구글시트 연결
+# =========================
+def get_gspread_client():
+    """
+    Streamlit secrets 또는 환경변수에서 구글 서비스계정 정보를 읽어
+    gspread client를 생성합니다.
+    """
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+
+    if "gcp_service_account" in st.secrets:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        return gspread.authorize(credentials)
+
+    service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if service_account_json:
+        creds_dict = json.loads(service_account_json)
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        return gspread.authorize(credentials)
+
+    raise ValueError(
+        "구글 서비스 계정 정보가 없습니다. "
+        "st.secrets['gcp_service_account'] 또는 GOOGLE_SERVICE_ACCOUNT_JSON을 설정하세요."
+    )
+
+
+def get_sheets_config() -> dict:
+    """
+    secrets.toml의 [sheets] 섹션을 dict로 반환합니다.
+    필수 키: sheet_id
+    선택 키: worksheet(기본값 forecast_base)
+    """
+    if "sheets" not in st.secrets:
+        raise ValueError("st.secrets['sheets'] 설정이 없습니다. secrets.toml에 [sheets] 섹션을 추가하세요.")
+    return dict(st.secrets["sheets"])
+
+
+@st.cache_data(ttl=300)
+def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
+    """
+    구글시트의 특정 워크시트를 DataFrame으로 읽습니다.
+    """
+    client = get_gspread_client()
+    sheets_cfg = get_sheets_config()
+    sheet_id = sheets_cfg.get("sheet_id")
+    if not sheet_id:
+        raise ValueError("secrets.toml의 [sheets].sheet_id 가 비어있습니다.")
+
+    sh = client.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet(worksheet_name)
+    except Exception as e:
+        available = [w.title for w in sh.worksheets()]
+        raise ValueError(
+            f"워크시트 '{worksheet_name}'를 찾지 못했습니다. 사용 가능한 워크시트: {available}"
+        ) from e
+
+    values = ws.get_all_records()
+    return pd.DataFrame(values)
+
 
 # =========================
 # 2) PLC 분류 함수
@@ -269,21 +338,15 @@ def make_plc_chart(plot_df: pd.DataFrame, selected_item: str) -> go.Figure:
 # =========================
 # 4) 데이터 불러오기
 # =========================
-st.subheader("데이터 업로드")
-
-uploaded_file = st.file_uploader(
-    "CSV 파일을 업로드하세요. 필수 컬럼: 아이템, 연도/주, 외형매출, 정상가, 판매수량",
-    type=["csv"]
-)
-
-if uploaded_file is None:
-    st.info("CSV 파일을 업로드하면 아이템별 PLC 그래프를 볼 수 있습니다.")
-    st.stop()
-
 try:
-    raw_df = pd.read_csv(uploaded_file, encoding="utf-8-sig")
-except UnicodeDecodeError:
-    raw_df = pd.read_csv(uploaded_file, encoding="cp949")
+    sheets_cfg = get_sheets_config()
+    worksheet_name = sheets_cfg.get("worksheet") or "forecast_base"
+    raw_df = load_sheet_as_df(worksheet_name)
+    st.caption(f"데이터 소스: Google Sheets / 워크시트 `{worksheet_name}`")
+except Exception as e:
+    st.error("구글시트 데이터 로드 중 오류가 발생했습니다.")
+    st.exception(e)
+    st.stop()
 
 # =========================
 # 5) PLC 계산
