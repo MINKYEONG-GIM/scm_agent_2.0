@@ -108,7 +108,7 @@ def mark_off_season_stage(df: pd.DataFrame) -> pd.DataFrame:
         if i <= INTRO_WEEKS:
             continue
 
-        if if qty <= off_threshold:
+        if qty <= off_threshold:
             candidate_idx.append(i)
 
     if not candidate_idx:
