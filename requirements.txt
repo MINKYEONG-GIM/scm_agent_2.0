@@ -8,3 +8,6 @@ google-auth-httplib2
 requests
 datetime
 scipy
+sqlalchemy
+psycopg2-binary
+pyodbc
