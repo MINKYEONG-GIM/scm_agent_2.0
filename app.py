@@ -95,7 +95,7 @@ def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int, decl
     비시즌 구간 여러 개를 찾는다.
 
     조건
-    - peak 이전만 가능
+    - 도입 이후 ~ 쇠퇴 이전 구간에서 판정
     - INTRO_WEEKS 이후만 가능
     - 평균/중간값 대비 50% 이하
     - 최소 3주 이상 연속
@@ -107,7 +107,7 @@ def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int, decl
         return []
 
     search_start = max(intro_end + 1, INTRO_WEEKS)
-    search_end = peak_idx - OFF_SEASON_PEAK_BUFFER - 1
+    search_end = decline_start - 1
 
     if search_start > search_end:
         return []
@@ -172,7 +172,7 @@ def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int, decl
             continue
 
         after_idx = g[-1] + 1
-        if after_idx >= peak_idx:
+        if after_idx >= decline_start:
             continue
 
         future_qty = df.loc[after_idx:peak_idx, "qty"].dropna()
