@@ -72,6 +72,87 @@ def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
     values = ws.get_all_records()
     return pd.DataFrame(values)
 
+def mark_off_season_stage(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    성장 중간의 낮은 판매 구간을 비시즌으로 표시한다.
+
+    조건:
+    - peak 이전 구간
+    - 최고점 대비 OFF_SEASON_RATIO 이하
+    - 최소 OFF_SEASON_MIN_WEEKS주 이상 연속
+    - 이후 다시 OFF_SEASON_RECOVERY_RATIO 이상으로 회복
+    """
+    out = df.copy().reset_index(drop=True)
+
+    if out.empty:
+        return out
+
+    peak_idx = int(out["qty"].fillna(0).values.argmax())
+    n = len(out)
+
+    if "plc_stage_final" not in out.columns:
+        out["plc_stage_final"] = out["plc_stage_raw"]
+
+    candidate_idx = []
+    for i in range(n):
+        ratio = out.loc[i, "ratio_to_peak"]
+
+        if pd.isna(ratio):
+            continue
+
+        # peak 이전만 비시즌 후보
+        if i >= peak_idx:
+            continue
+
+        # 도입 직후 너무 초반 구간 제외
+        if i <= INTRO_WEEKS:
+            continue
+
+        if ratio <= OFF_SEASON_RATIO:
+            candidate_idx.append(i)
+
+    if not candidate_idx:
+        return out
+
+    # 연속 구간 묶기
+    groups = []
+    current = [candidate_idx[0]]
+
+    for idx in candidate_idx[1:]:
+        if idx == current[-1] + 1:
+            current.append(idx)
+        else:
+            groups.append(current)
+            current = [idx]
+    groups.append(current)
+
+    valid_groups = []
+    for g in groups:
+        if len(g) < OFF_SEASON_MIN_WEEKS:
+            continue
+
+        # 이후에 다시 회복되는지 확인
+        after_end = g[-1] + 1
+        if after_end >= n:
+            continue
+
+        future_ratios = out.loc[after_end:peak_idx, "ratio_to_peak"]
+        if (future_ratios >= OFF_SEASON_RECOVERY_RATIO).any():
+            valid_groups.append(g)
+
+    if not valid_groups:
+        return out
+
+    # peak에 가장 가까운 비시즌 구간 1개 선택
+    best_group = min(valid_groups, key=lambda g: abs(peak_idx - g[-1]))
+
+    for i in best_group:
+        out.loc[i, "plc_stage_final"] = "비시즌"
+
+    return out
+
+
+
 
 # =========================
 # 1) 기본 설정
@@ -94,6 +175,10 @@ GROWTH_MAX_RATIO = 0.85
 MATURE_RATIO = 0.85
 DECLINE_RATIO = 0.70
 HIGH_DISCOUNT_RATIO = 0.30
+#비시즌 관련 수치
+OFF_SEASON_RATIO = 0.45          # 최고점 대비 45% 이하
+OFF_SEASON_MIN_WEEKS = 3         # 최소 3주 이상 지속
+OFF_SEASON_RECOVERY_RATIO = 0.60 # 이후 다시 60% 이상 회복되면 비시즌으로 인정
 
 ROLLING_WINDOW = 3  # 최근 흐름 판단용
 LOCAL_PEAK_WINDOW = 1  # 앞/뒤 1주 비교
@@ -422,17 +507,17 @@ def classify_plc_stage(
     else:
         return "성숙"
 
-
 def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     """
-    PLC 단계가
-    도입 -> 성장 -> 성숙 -> 쇠퇴
-    흐름을 최대한 따르도록 보정한다.
+    PLC 단계 흐름을 보정한다.
+
+    기본 흐름:
+    도입 -> 성장 -> 비시즌 -> 성장 -> 성숙 -> 쇠퇴
 
     규칙:
-    - 도입은 맨 앞 1개 연속 구간만 허용
+    - 도입은 맨 앞 최대 INTRO_WEEKS까지만 허용
     - 쇠퇴는 맨 뒤 1개 연속 구간만 허용
-    - 중간에 나온 도입/쇠퇴는 성장 또는 성숙으로 보정
+    - 비시즌은 peak 이전의 낮은 판매 구간 중 회복이 있는 경우만 허용
     """
     df = item_df.copy().reset_index(drop=True)
 
@@ -444,7 +529,6 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
 
     # -------------------------
     # 1. 도입 구간 확정
-    # 시작부터 연속된 도입만 인정
     # -------------------------
     intro_end = -1
     for i in range(n):
@@ -452,47 +536,36 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
             intro_end = i
         else:
             break
-    # ✅ 도입 최대 기간 제한
+
     intro_end = min(intro_end, INTRO_WEEKS - 1)
 
-    # 시작 이후에 다시 나온 도입은 성장으로 변경
     for i in range(intro_end + 1, n):
         if df.loc[i, "plc_stage_raw"] == "도입":
             df.loc[i, "plc_stage_raw"] = "성장" if i < peak_idx else "성숙"
 
     # -------------------------
-    # 2. 쇠퇴 구간 확정
-    # 끝에서부터 연속된 쇠퇴만 인정
+    # 2. peak 이전 쇠퇴 금지
     # -------------------------
-    # peak 이전에는 쇠퇴 금지
     for i in range(0, peak_idx):
         if df.loc[i, "plc_stage_raw"] == "쇠퇴":
             df.loc[i, "plc_stage_raw"] = "성장"
-    
-    
+
     # -------------------------
-    # 마지막 연속 쇠퇴 찾기
+    # 3. 끝 연속 쇠퇴만 인정
     # -------------------------
     decline_start = n
-    
     for i in range(n - 1, -1, -1):
         if df.loc[i, "plc_stage_raw"] == "쇠퇴":
             decline_start = i
         else:
             break
-    
-    
-    # 마지막 이전에 나온 쇠퇴는 성숙/성장으로 보정
+
     for i in range(0, decline_start):
         if df.loc[i, "plc_stage_raw"] == "쇠퇴":
             df.loc[i, "plc_stage_raw"] = "성숙" if i >= peak_idx else "성장"
-    
-
 
     # -------------------------
-    # 3. 피크 기준으로 앞/뒤 정리
-    # peak 이전: 도입/성장/성숙만
-    # peak 이후: 성숙/쇠퇴만
+    # 4. peak 전후 기본 정리
     # -------------------------
     for i in range(n):
         stage = df.loc[i, "plc_stage_raw"]
@@ -505,13 +578,58 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
                 df.loc[i, "plc_stage_raw"] = "성숙"
 
     # -------------------------
-    # 4. 최종 단계명 저장
-    # 변곡점은 peak 주차만 별도 표시하고,
-    # plc_stage는 4단계 체계만 유지
+    # 5. 최종 컬럼 준비
     # -------------------------
-    df["plc_stage"] = df["plc_stage_raw"]
+    df["plc_stage_final"] = df["plc_stage_raw"]
+
+    # -------------------------
+    # 6. 비시즌 표시
+    # -------------------------
+    df = mark_off_season_stage(df)
+
+    # -------------------------
+    # 7. 최종 흐름 정리
+    # -------------------------
+    off_idx = df.index[df["plc_stage_final"] == "비시즌"].tolist()
+
+    if off_idx:
+        first_off = min(off_idx)
+        last_off = max(off_idx)
+
+        # 도입 뒤 ~ 비시즌 전 = 성장
+        for i in range(intro_end + 1, first_off):
+            if df.loc[i, "plc_stage_final"] not in ["도입", "비시즌"]:
+                df.loc[i, "plc_stage_final"] = "성장"
+
+        # 비시즌 뒤 ~ peak 전 = 성장
+        for i in range(last_off + 1, peak_idx):
+            if df.loc[i, "plc_stage_final"] != "비시즌":
+                df.loc[i, "plc_stage_final"] = "성장"
+
+        # peak 이후 ~ 쇠퇴 전 = 성숙
+        for i in range(peak_idx + 1, decline_start):
+            if df.loc[i, "plc_stage_final"] != "쇠퇴":
+                df.loc[i, "plc_stage_final"] = "성숙"
+
+    else:
+        # 비시즌 없으면 기존 구조 유지
+        for i in range(intro_end + 1, peak_idx):
+            df.loc[i, "plc_stage_final"] = "성장"
+
+        for i in range(peak_idx + 1, decline_start):
+            df.loc[i, "plc_stage_final"] = "성숙"
+
+    # peak 주차는 성숙으로 두고, 마커만 별도로 표시
+    df.loc[peak_idx, "plc_stage_final"] = "성숙"
+
+    # 마지막 쇠퇴 구간 유지
+    for i in range(decline_start, n):
+        df.loc[i, "plc_stage_final"] = "쇠퇴"
+
+    df["plc_stage"] = df["plc_stage_final"]
 
     return df
+
 
 
 
@@ -626,6 +744,7 @@ PLC_LINE_COLOR_MAP = {
     "성숙": "#ff7f0e",          # 주황
     "쇠퇴": "#d62728",          # 빨강
     "변곡점(최고점)": "#8c564b"  # 갈색
+    "비시즌": "#7f7f7f",   # 회색
 }
 
 def draw_item_chart(item_df: pd.DataFrame, item_name: str) -> go.Figure:
