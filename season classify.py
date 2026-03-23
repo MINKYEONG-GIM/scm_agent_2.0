@@ -12,12 +12,14 @@ st.title("아이템 시즌 분류 화면")
 st.markdown("""
 주차별 판매량 데이터를 기준으로 각 아이템을 아래 규칙으로 분류합니다.
 
-- ALL_SEASON: 모든 시즌 비중 15% 이상
+
 - SUMMER_PEAK: 여름 비중 40% 이상
 - WINTER_PEAK: 겨울 비중 40% 이상
+- SPRING_FALL_PEAK: 봄+가을 비중 60% 이상
 - SPRING_PEAK: 봄 비중 35% 이상
 - FALL_PEAK: 가을 비중 35% 이상
-- SPRING_FALL_PEAK: 봄+가을 비중 50% 이상
+- ALL_SEASON: 기타
+
 """)
 
 # -------------------------------------------------
