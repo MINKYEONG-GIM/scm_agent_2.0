@@ -3,8 +3,7 @@ pandas
 plotly
 gspread
 google-auth
-google-auth-oauthlib
-google-auth-httplib2
+
 requests
 datetime
 scipy
@@ -12,4 +11,4 @@ sqlalchemy
 psycopg2-binary
 pyodbc
 st-gsheets-connection
-streamlit-gsheets
+
