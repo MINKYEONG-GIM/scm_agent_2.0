@@ -94,22 +94,30 @@ def mark_off_season_stage(df: pd.DataFrame) -> pd.DataFrame:
         out["plc_stage_final"] = out["plc_stage_raw"]
 
     candidate_idx = []
+
+    off_threshold = get_off_season_threshold(out, INTRO_WEEKS, peak_idx)
+    
     for i in range(n):
-        ratio = out.loc[i, "ratio_to_peak"]
-
-        if pd.isna(ratio):
+    
+        qty = out.loc[i, "qty"]
+    
+        if pd.isna(qty):
             continue
-
+    
         # peak 이전만 비시즌 후보
         if i >= peak_idx:
             continue
-
-        # 도입 직후 너무 초반 구간 제외
+    
+        # 도입 이후만
         if i <= INTRO_WEEKS:
             continue
-
+    
+        # 평균 / 중간값 기준
         if qty <= off_threshold:
             candidate_idx.append(i)
+    
+    
+    
 
     if not candidate_idx:
         return out
