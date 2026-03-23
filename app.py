@@ -12,8 +12,8 @@ WORKSHEET_NAME = "plc db"
 conn = st.connection("gsheets", type=GSheetsConnection)
 
 df = conn.read(
-    spreadsheet=SHEET_ID,
-    worksheet=WORKSHEET_NAME,
+    spreadsheet="1IlJxe4ocFeNODRxMxpgtHA1xKC-Xn5-YvRsaHciUfLw",
+    worksheet="plc db",
     ttl=0
 )
 
