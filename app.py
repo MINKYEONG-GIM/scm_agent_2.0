@@ -90,7 +90,22 @@ def normalize_source_columns(df: pd.DataFrame) -> pd.DataFrame:
     - 흔한 별칭을 표준 컬럼으로 매핑
     """
     out = df.copy()
-    out.columns = [str(c).replace("\n", "").replace("\r", "").strip() for c in out.columns]
+
+    def _clean_col_name(v: str) -> str:
+        s = str(v)
+        # BOM/제로폭/개행/탭 제거 + 좌우 공백 정리
+        s = s.replace("\ufeff", "").replace("\u200b", "")
+        s = s.replace("\n", "").replace("\r", "").replace("\t", "")
+        return s.strip()
+
+    def _canonical(v: str) -> str:
+        s = _clean_col_name(v).lower()
+        # 표기 흔들림(공백/구분자) 제거
+        for ch in [" ", "_", "-", "/", "(", ")", "[", "]"]:
+            s = s.replace(ch, "")
+        return s
+
+    out.columns = [_clean_col_name(c) for c in out.columns]
 
     alias_map = {
         "아이템": ["아이템", "item", "품목", "상품", "스타일", "style_code", "style"],
@@ -101,12 +116,12 @@ def normalize_source_columns(df: pd.DataFrame) -> pd.DataFrame:
     }
 
     rename_dict = {}
-    normalized_lookup = {str(c).strip().lower(): c for c in out.columns}
+    normalized_lookup = {_canonical(c): c for c in out.columns}
     for target, aliases in alias_map.items():
         if target in out.columns:
             continue
         for alias in aliases:
-            key = str(alias).strip().lower()
+            key = _canonical(alias)
             if key in normalized_lookup:
                 rename_dict[normalized_lookup[key]] = target
                 break
@@ -117,6 +132,50 @@ def normalize_source_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def convert_wide_weekly_to_long(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    wide 포맷(연도/주 + 아이템별 컬럼)을 long 포맷으로 변환합니다.
+    예)
+    연도/주 | 가디건 | 가방 ...
+    ->
+    연도/주 | 아이템 | 판매수량 | 외형매출 | 정상가
+    """
+    out = df.copy()
+    if "연도/주" not in out.columns:
+        return out
+
+    id_candidates = ["연도/주", "채널", "year", "week", "yearweek_num"]
+    id_vars = [c for c in id_candidates if c in out.columns]
+
+    value_vars = [c for c in out.columns if c not in id_vars]
+    if not value_vars:
+        return out
+
+    melted = out.melt(
+        id_vars=id_vars,
+        value_vars=value_vars,
+        var_name="아이템",
+        value_name="판매수량",
+    )
+
+    melted["아이템"] = melted["아이템"].astype(str).str.strip()
+    melted["판매수량"] = (
+        melted["판매수량"]
+        .astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("₩", "", regex=False)
+        .str.strip()
+    )
+    melted["판매수량"] = pd.to_numeric(melted["판매수량"], errors="coerce").fillna(0)
+    melted = melted[melted["판매수량"] > 0].copy()
+
+    # 수량 기반 원천데이터인 경우, 기존 파이프라인 호환을 위해 기본값 구성
+    melted["외형매출"] = melted["판매수량"]
+    melted["정상가"] = melted["판매수량"]
+
+    return melted
+
+
 # =========================
 # 2) PLC 분류 함수
 # =========================
@@ -125,8 +184,18 @@ def prepare_weekly_item_data(df: pd.DataFrame) -> pd.DataFrame:
 
     required_cols = ["아이템", "연도/주", "외형매출", "정상가", "판매수량"]
     missing_cols = [col for col in required_cols if col not in data.columns]
+
+    # wide 포맷 자동 감지: 연도/주 + 다수 아이템 컬럼
+    if missing_cols and "연도/주" in data.columns and "아이템" not in data.columns and "판매수량" not in data.columns:
+        data = convert_wide_weekly_to_long(data)
+        data = normalize_source_columns(data)
+        missing_cols = [col for col in required_cols if col not in data.columns]
+
     if missing_cols:
-        raise ValueError(f"필수 컬럼이 없습니다: {missing_cols}")
+        current_cols = [str(c) for c in data.columns]
+        raise ValueError(
+            f"필수 컬럼이 없습니다: {missing_cols} / 현재 컬럼: {current_cols}"
+        )
 
     for col in ["외형매출", "정상가", "판매수량"]:
         data[col] = (
