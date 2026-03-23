@@ -42,21 +42,13 @@ def classify_item(row: pd.Series) -> str:
     fall_ratio = row["FALL_RATIO"]
     winter_ratio = row["WINTER_RATIO"]
 
-    if (
-        spring_ratio >= 0.15
-        and summer_ratio >= 0.15
-        and fall_ratio >= 0.15
-        and winter_ratio >= 0.15
-    ):
-        return "ALL_SEASON"
-
     if summer_ratio >= 0.40:
         return "SUMMER_PEAK"
 
     if winter_ratio >= 0.40:
         return "WINTER_PEAK"
 
-    if (spring_ratio + fall_ratio) >= 0.50:
+    if (spring_ratio + fall_ratio) >= 0.60:
         return "SPRING_FALL_PEAK"
 
     if spring_ratio >= 0.35:
@@ -65,7 +57,7 @@ def classify_item(row: pd.Series) -> str:
     if fall_ratio >= 0.35:
         return "FALL_PEAK"
 
-    return "UNCLASSIFIED"
+    return "ALL_SEASON"
 
 # -------------------------------------------------
 # 4. 구글시트 연결
