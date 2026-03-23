@@ -56,14 +56,14 @@ def classify_item(row: pd.Series) -> str:
     if winter_ratio >= 0.40:
         return "WINTER_PEAK"
 
+    if (spring_ratio + fall_ratio) >= 0.50:
+        return "SPRING_FALL_PEAK"
+
     if spring_ratio >= 0.35:
         return "SPRING_PEAK"
 
     if fall_ratio >= 0.35:
         return "FALL_PEAK"
-
-    if (spring_ratio + fall_ratio) >= 0.50:
-        return "SPRING_FALL_PEAK"
 
     return "UNCLASSIFIED"
 
@@ -95,20 +95,26 @@ def load_data_from_gsheet():
     sheet_url = st.secrets["sheets"]["SHEET_URL"]
     worksheet_name = st.secrets["sheets"]["WORKSHEET_NAME"]
 
-
-
-
     spreadsheet = client.open_by_url(sheet_url)
     worksheet = spreadsheet.worksheet(worksheet_name)
 
     values = worksheet.get_all_values()
 
-    if not values or len(values) < 2:
-        raise ValueError("구글시트에 데이터가 없거나 헤더만 있습니다.")
+    if not values or len(values) < 3:
+        raise ValueError("구글시트 데이터 구조를 확인해주세요. 최소 3행 이상 필요합니다.")
 
-    df = pd.DataFrame(values[1:], columns=values[0])
+    # 0행: 상단 제목(판매수량의 SUM, 아이템 등)
+    # 1행: 실제 헤더(연도/주, 가디건, 가방, ...)
+    # 2행부터: 실제 데이터
+    header = values[1]
+    data = values[2:]
+
+    df = pd.DataFrame(data, columns=header)
+
+    # 완전히 빈 컬럼 제거
+    df = df.loc[:, [str(col).strip() != "" for col in df.columns]]
+
     return df
-
 # -------------------------------------------------
 # 6. 가로형 데이터 -> 세로형 변환
 # -------------------------------------------------
@@ -116,14 +122,19 @@ def convert_wide_to_long(df_wide: pd.DataFrame) -> pd.DataFrame:
     df_wide = df_wide.copy()
     df_wide.columns = [str(c).strip() for c in df_wide.columns]
 
+    # 첫 컬럼명 찾기
     first_col = df_wide.columns[0]
 
-    # 첫 컬럼명이 '연도/주' 또는 year_week라고 가정
+    # 보통 '연도/주' 이지만 혹시 다르면 첫 컬럼을 year_week로 강제 사용
     df_long = df_wide.melt(
         id_vars=[first_col],
         var_name="item_name",
         value_name="sales_qty"
     ).rename(columns={first_col: "year_week"})
+
+    # 빈 아이템 제거
+    df_long["item_name"] = df_long["item_name"].astype(str).str.strip()
+    df_long = df_long[df_long["item_name"] != ""]
 
     return df_long
 
