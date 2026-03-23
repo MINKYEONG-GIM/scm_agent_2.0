@@ -1,8 +1,15 @@
 # scm-agent
 
 최근 매출 기반 이번 시즌 전체 주차별 매출 예측 
+
+
+
+
 ↓
 ↓
+
+
+
 핵심시즌 분석
 - SUMMER_PEAK: 여름 비중 40% 이상
 - WINTER_PEAK: 겨울 비중 40% 이상
@@ -10,8 +17,14 @@
 - SPRING_PEAK: 봄 비중 35% 이상
 - FALL_PEAK: 가을 비중 35% 이상
 - ALL_SEASON: 기타
+
+
+
 ↓
 ↓
+
+
+
 plc 분석
 ↓
 ↓
