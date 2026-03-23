@@ -7,6 +7,7 @@ from streamlit_gsheets import GSheetsConnection
 st.title("구글시트 연결 테스트")
 
 conn = st.connection("gsheets", type=GSheetsConnection)
+df = conn.read(worksheet="plc db", ttl=0)
 
 df = conn.read(
     spreadsheet="https://docs.google.com/spreadsheets/d/1IlJxe4ocFeNODRxMxpgtHA1xKC-Xn5-YvRsaHciUfLw/edit#gid=1403494331",
