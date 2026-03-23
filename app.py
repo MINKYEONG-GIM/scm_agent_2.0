@@ -13,7 +13,7 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 
 df = conn.read(
     spreadsheet=SHEET_ID,
-    worksheet="plc db",
+    worksheet=WORKSHEET_NAME,
     ttl=0
 )
 
