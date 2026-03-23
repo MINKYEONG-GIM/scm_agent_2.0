@@ -72,93 +72,6 @@ def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
     values = ws.get_all_records()
     return pd.DataFrame(values)
 
-
-# 비시즌 판별 함수
-def mark_off_season_stage(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    조건:
-    - peak 이전 구간
-    - 최고점 대비 OFF_SEASON_RATIO 이하
-    - 최소 OFF_SEASON_MIN_WEEKS주 이상 연속
-    - 이후 다시 OFF_SEASON_RECOVERY_RATIO 이상으로 회복
-    """
-    out = df.copy().reset_index(drop=True)
-
-    if out.empty:
-        return out
-
-    peak_idx = int(out["qty"].fillna(0).values.argmax())
-    n = len(out)
-
-    if "plc_stage_final" not in out.columns:
-        out["plc_stage_final"] = out["plc_stage_raw"]
-
-    candidate_idx = []
-
-    off_threshold = get_off_season_threshold(out, INTRO_WEEKS, peak_idx)
-    
-    for i in range(n):
-    
-        qty = out.loc[i, "qty"]
-    
-        if pd.isna(qty):
-            continue
-    
-        # peak 이전만 비시즌 후보
-        if i >= peak_idx:
-            continue
-    
-        # 도입 이후만
-        if i <= INTRO_WEEKS:
-            continue
-    
-        # 평균 / 중간값 기준
-        if qty <= off_threshold:
-            candidate_idx.append(i)
-    
-    
-    
-
-    if not candidate_idx:
-        return out
-
-    # 연속 구간 묶기
-    groups = []
-    current = [candidate_idx[0]]
-
-    for idx in candidate_idx[1:]:
-        if idx == current[-1] + 1:
-            current.append(idx)
-        else:
-            groups.append(current)
-            current = [idx]
-    groups.append(current)
-
-    valid_groups = []
-    for g in groups:
-        if len(g) < OFF_SEASON_MIN_WEEKS:
-            continue
-
-        # 이후에 다시 회복되는지 확인
-        after_end = g[-1] + 1
-        if after_end >= n:
-            continue
-
-        future_ratios = out.loc[after_end:peak_idx, "ratio_to_peak"]
-        if (future_ratios >= OFF_SEASON_RECOVERY_RATIO).any():
-            valid_groups.append(g)
-
-    if not valid_groups:
-        return out
-
-    # peak에 가장 가까운 비시즌 구간 1개 선택
-    best_group = min(valid_groups, key=lambda g: abs(peak_idx - g[-1]))
-
-    for i in best_group:
-        out.loc[i, "plc_stage_final"] = "비시즌"
-
-    return out
-
 def get_off_season_threshold(df: pd.DataFrame, intro_end: int, peak_idx: int) -> float:
     """
     비시즌 판정 기준값:
@@ -747,7 +660,9 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     # -------------------------
     # 6. 비시즌 표시
     # -------------------------
-    df = mark_off_season_stage(df)
+    off_ranges = find_off_season_ranges(df, intro_end, peak_idx, decline_start)
+    for start, end in off_ranges:
+        df.loc[start:end, "plc_stage_final"] = "비시즌"
 
     # -------------------------
     # 7. 최종 흐름 정리
