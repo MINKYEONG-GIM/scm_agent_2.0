@@ -465,8 +465,8 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     # 끝에서부터 연속된 쇠퇴만 인정
     # -------------------------
     for i in range(0, peak_idx):
-    if df.loc[i, "plc_stage_raw"] == "쇠퇴":
-        df.loc[i, "plc_stage_raw"] = "성장"
+        if df.loc[i, "plc_stage_raw"] == "쇠퇴":
+            df.loc[i, "plc_stage_raw"] = "성장"
         
         
 
