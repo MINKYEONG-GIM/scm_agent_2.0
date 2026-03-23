@@ -1,5 +1,24 @@
 import pandas as pd
 import numpy as np
+import streamlit as st
+from streamlit_gsheets import GSheetsConnection
+
+st.set_page_config(page_title="PLC 분석기", layout="wide")
+st.title("아이템 PLC 자동 분류")
+
+conn = st.connection("gsheets", type=GSheetsConnection)
+df = conn.read(worksheet="plc db", ttl=0)
+
+st.subheader("원본 데이터")
+st.dataframe(df, use_container_width=True)
+
+result_df = run_plc_classification(df)
+
+st.subheader("분석 결과")
+st.dataframe(
+    result_df[["아이템", "연도/주", "판매수량", "판매수량_ma", "할인율", "plc"]],
+    use_container_width=True
+)
 
 # -------------------------------------------------
 # 1. 데이터 불러오기
