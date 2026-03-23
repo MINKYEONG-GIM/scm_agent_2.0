@@ -102,6 +102,11 @@ def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int, decl
     - peak 직전 1~2주는 비시즌 금지
     - 이후 확실한 회복이 있어야 함
     - 비시즌은 도입기와 쇠퇴기를 제외한 구간의 최저점을 반드시 포함해야 함
+    - 도입 이후 ~ 본격 성장 직전까지 이어지는 긴 저판매 유지 구간 우선
+    - 길이가 길수록 우선
+    - 평균 판매량이 낮을수록 우선
+    - 기울기가 평평할수록 우선
+    - peak에 가까운지 여부는 우선순위에서 빼기
     """
     if df.empty:
         return []
@@ -935,6 +940,18 @@ def draw_item_chart(item_df: pd.DataFrame, item_name: str) -> go.Figure:
     fig.update_xaxes(type="category")
 
     return fig
+
+
+# 3. 기울기 함수
+def get_segment_slope(series: pd.Series) -> float: 
+    s = series.dropna().astype(float)
+
+    if len(s) < 2:
+        return 0.0
+
+    x = np.arange(len(s))
+    y = s.values
+    return float(np.polyfit(x, y, 1)[0])
 
 
 
