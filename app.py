@@ -2,7 +2,7 @@ import os
 import json
 from typing import Tuple
 from datetime import date
-
+from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -103,24 +103,6 @@ def get_forecast_base_sheet_name() -> str:
     )
 
 
-
-
-st.set_page_config(page_title="PLC 분석기", layout="wide")
-st.title("아이템 PLC 자동 분류")
-
-conn = st.connection("gsheets", type=GSheetsConnection)
-df = conn.read(worksheet="plc db", ttl=0)
-
-st.subheader("원본 데이터")
-st.dataframe(df, use_container_width=True)
-
-result_df = run_plc_classification(df)
-
-st.subheader("분석 결과")
-st.dataframe(
-    result_df[["아이템", "연도/주", "판매수량", "판매수량_ma", "할인율", "plc"]],
-    use_container_width=True
-)
 
 # -------------------------------------------------
 # 1. 데이터 불러오기
@@ -343,3 +325,24 @@ def run_plc_classification(df: pd.DataFrame,
 
 # 파일 저장
 # result_df.to_csv("item_plc_result.csv", index=False, encoding="utf-8-sig")
+
+
+# =========================
+# 6) 실행
+# =========================
+try:
+    df = load_sheet_as_df("plc db")
+
+    st.subheader("원본 데이터")
+    st.dataframe(df, use_container_width=True)
+
+    result_df = run_plc_classification(df)
+
+    st.subheader("분석 결과")
+    st.dataframe(
+        result_df[["아이템", "연도/주", "판매수량", "판매수량_ma", "할인율", "plc"]],
+        use_container_width=True
+    )
+
+except Exception as e:
+    st.error(f"오류 발생: {e}")
