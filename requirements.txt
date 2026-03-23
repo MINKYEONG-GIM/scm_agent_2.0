@@ -12,3 +12,4 @@ sqlalchemy
 psycopg2-binary
 pyodbc
 st-gsheets-connection
+streamlit-gsheets
