@@ -11,3 +11,4 @@ scipy
 sqlalchemy
 psycopg2-binary
 pyodbc
+st-gsheets-connection
