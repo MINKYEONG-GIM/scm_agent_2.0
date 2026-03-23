@@ -1,21 +1,24 @@
 import pandas as pd
 import numpy as np
+
 import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 
-
 st.title("구글시트 연결 테스트")
 
+SHEET_ID = "1IlJxe4ocFeNODRxMxpgtHA1xKC-Xn5-YvRsaHciUfLw"
+WORKSHEET_NAME = "plc db"
+
 conn = st.connection("gsheets", type=GSheetsConnection)
-df = conn.read(worksheet="plc db", ttl=0)
 
 df = conn.read(
-    spreadsheet="https://docs.google.com/spreadsheets/d/1IlJxe4ocFeNODRxMxpgtHA1xKC-Xn5-YvRsaHciUfLw/edit#gid=1403494331",
-    worksheet="plc db",
+    spreadsheet=SHEET_ID,
+    worksheet=WORKSHEET_NAME,
     ttl=0
 )
 
 st.dataframe(df, use_container_width=True)
+
 
 st.set_page_config(page_title="PLC 분석기", layout="wide")
 st.title("아이템 PLC 자동 분류")
