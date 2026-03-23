@@ -1,272 +1,224 @@
 import pandas as pd
-import streamlit as st
-import gspread
-from google.oauth2.service_account import Credentials
+import numpy as np
 
 # -------------------------------------------------
-# 1. 기본 설정
+# 1. 데이터 불러오기
 # -------------------------------------------------
-st.set_page_config(page_title="아이템 시즌 분류", layout="wide")
-st.title("아이템 시즌 분류 화면")
+# 예시:
+# df = pd.read_csv("sales.csv", encoding="utf-8-sig")
 
-st.markdown("""
-주차별 판매량 데이터를 기준으로 각 아이템을 아래 규칙으로 분류합니다.
-
-- ALL_SEASON: 모든 시즌 비중 15% 이상
-- SUMMER_PEAK: 여름 비중 40% 이상
-- WINTER_PEAK: 겨울 비중 40% 이상
-- SPRING_PEAK: 봄 비중 35% 이상
-- FALL_PEAK: 가을 비중 35% 이상
-- SPRING_FALL_PEAK: 봄+가을 비중 50% 이상
-""")
+# 이미 DataFrame이 있다면 이 부분은 생략 가능
+# 반드시 필요한 컬럼:
+# 아이템, 연도/주, 외형매출, 정상가, 판매수량
 
 # -------------------------------------------------
-# 2. 시즌 정의
+# 2. 전처리 함수
 # -------------------------------------------------
-def get_season(week: int) -> str:
-    if 9 <= week <= 18:
-        return "SPRING"
-    elif 19 <= week <= 30:
-        return "SUMMER"
-    elif 31 <= week <= 40:
-        return "FALL"
+def prepare_weekly_item_data(df: pd.DataFrame) -> pd.DataFrame:
+    data = df.copy()
+
+    required_cols = ["아이템", "연도/주", "외형매출", "정상가", "판매수량"]
+    missing_cols = [col for col in required_cols if col not in data.columns]
+    if missing_cols:
+        raise ValueError(f"필수 컬럼이 없습니다: {missing_cols}")
+
+    # 숫자형 변환
+    for col in ["외형매출", "정상가", "판매수량"]:
+        data[col] = (
+            data[col]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+        )
+        data[col] = pd.to_numeric(data[col], errors="coerce").fillna(0)
+
+    # 반품/음수 데이터가 있으면 그대로 둘 수도 있고 제외할 수도 있음
+    # 여기서는 판매 흐름 분석용이므로 판매수량 0 이하 주차는 제외
+    # 필요하면 아래 줄을 주석 처리
+    data = data[data["판매수량"] > 0].copy()
+
+    # 연도/주 -> 정렬용 숫자 컬럼 생성
+    # 예: 2025-01 -> year=2025, week=1
+    data[["year", "week"]] = data["연도/주"].str.split("-", expand=True)
+    data["year"] = pd.to_numeric(data["year"], errors="coerce")
+    data["week"] = pd.to_numeric(data["week"], errors="coerce")
+    data["yearweek_num"] = data["year"] * 100 + data["week"]
+
+    # 아이템-주차 단위 집계
+    weekly = (
+        data.groupby(["아이템", "연도/주", "year", "week", "yearweek_num"], as_index=False)
+        .agg({
+            "외형매출": "sum",
+            "정상가": "sum",
+            "판매수량": "sum"
+        })
+        .sort_values(["아이템", "yearweek_num"])
+        .reset_index(drop=True)
+    )
+
+    # 할인율 계산
+    # 정상가가 0이면 할인율 계산 불가 -> 0 처리
+    weekly["할인율"] = np.where(
+        weekly["정상가"] > 0,
+        1 - (weekly["외형매출"] / weekly["정상가"]),
+        0
+    )
+
+    # 이상치 방지
+    weekly["할인율"] = weekly["할인율"].clip(lower=0, upper=1)
+
+    return weekly
+
+
+# -------------------------------------------------
+# 3. 아이템별 PLC 단계 분류 함수
+# -------------------------------------------------
+def classify_plc_by_item(item_df: pd.DataFrame,
+                         intro_weeks: int = 3,
+                         decline_discount_threshold: float = 0.30) -> pd.DataFrame:
+    """
+    intro_weeks: 판매 시작 후 몇 주까지 도입으로 볼지
+    decline_discount_threshold: 쇠퇴로 보는 평균 할인율 기준 (예: 0.30 = 30%)
+    """
+    g = item_df.sort_values("yearweek_num").copy().reset_index(drop=True)
+
+    # 이동평균 판매량 (노이즈 완화)
+    g["판매수량_ma"] = g["판매수량"].rolling(window=3, min_periods=1).mean()
+
+    # 이전/다음 주 값
+    g["prev_ma"] = g["판매수량_ma"].shift(1)
+    g["next_ma"] = g["판매수량_ma"].shift(-1)
+
+    # 결측 처리
+    g["prev_ma"] = g["prev_ma"].fillna(g["판매수량_ma"])
+    g["next_ma"] = g["next_ma"].fillna(g["판매수량_ma"])
+
+    # 시작 후 몇 번째 판매 주차인지
+    g["판매주차순번"] = np.arange(1, len(g) + 1)
+
+    # 최고점
+    peak_idx = g["판매수량_ma"].idxmax()
+    peak_value = g.loc[peak_idx, "판매수량_ma"]
+
+    if peak_value == 0:
+        g["peak_ratio"] = 0
     else:
-        return "WINTER"
+        g["peak_ratio"] = g["판매수량_ma"] / peak_value
 
-# -------------------------------------------------
-# 3. 분류 함수
-# -------------------------------------------------
-def classify_item(row: pd.Series) -> str:
-    spring_ratio = row["SPRING_RATIO"]
-    summer_ratio = row["SUMMER_RATIO"]
-    fall_ratio = row["FALL_RATIO"]
-    winter_ratio = row["WINTER_RATIO"]
-
-    if summer_ratio >= 0.40:
-        return "SUMMER_PEAK"
-
-    if winter_ratio >= 0.40:
-        return "WINTER_PEAK"
-
-    if (spring_ratio + fall_ratio) >= 0.60:
-        return "SPRING_FALL_PEAK"
-
-    if spring_ratio >= 0.35:
-        return "SPRING_PEAK"
-
-    if fall_ratio >= 0.35:
-        return "FALL_PEAK"
-
-    return "ALL_SEASON"
-
-# -------------------------------------------------
-# 4. 구글시트 연결
-# -------------------------------------------------
-@st.cache_resource
-def get_gsheet_client():
-    scope = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-
-    credentials = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
-        scopes=scope,
+    # 최근 증감률
+    g["growth_rate"] = np.where(
+        g["prev_ma"] > 0,
+        (g["판매수량_ma"] - g["prev_ma"]) / g["prev_ma"],
+        0
     )
 
-    client = gspread.authorize(credentials)
-    return client
+    # 최고점 이후 여부
+    g["is_after_peak"] = g.index > peak_idx
 
-# -------------------------------------------------
-# 5. 구글시트 데이터 읽기
-# -------------------------------------------------
-@st.cache_data(show_spinner=False)
-def load_data_from_gsheet():
-    client = get_gsheet_client()
-
-    sheet_url = st.secrets["sheets"]["SHEET_URL"]
-    worksheet_name = st.secrets["sheets"]["WORKSHEET_NAME"]
-
-    spreadsheet = client.open_by_url(sheet_url)
-    worksheet = spreadsheet.worksheet(worksheet_name)
-
-    values = worksheet.get_all_values()
-
-    if not values or len(values) < 3:
-        raise ValueError("구글시트 데이터 구조를 확인해주세요. 최소 3행 이상 필요합니다.")
-
-    # 0행: 상단 제목(판매수량의 SUM, 아이템 등)
-    # 1행: 실제 헤더(연도/주, 가디건, 가방, ...)
-    # 2행부터: 실제 데이터
-    header = values[1]
-    data = values[2:]
-
-    df = pd.DataFrame(data, columns=header)
-
-    # 완전히 빈 컬럼 제거
-    df = df.loc[:, [str(col).strip() != "" for col in df.columns]]
-
-    return df
-# -------------------------------------------------
-# 6. 가로형 데이터 -> 세로형 변환
-# -------------------------------------------------
-def convert_wide_to_long(df_wide: pd.DataFrame) -> pd.DataFrame:
-    df_wide = df_wide.copy()
-    df_wide.columns = [str(c).strip() for c in df_wide.columns]
-
-    # 첫 컬럼명 찾기
-    first_col = df_wide.columns[0]
-
-    # 보통 '연도/주' 이지만 혹시 다르면 첫 컬럼을 year_week로 강제 사용
-    df_long = df_wide.melt(
-        id_vars=[first_col],
-        var_name="item_name",
-        value_name="sales_qty"
-    ).rename(columns={first_col: "year_week"})
-
-    # 빈 아이템 제거
-    df_long["item_name"] = df_long["item_name"].astype(str).str.strip()
-    df_long = df_long[df_long["item_name"] != ""]
-
-    return df_long
-
-# -------------------------------------------------
-# 7. 전처리
-# -------------------------------------------------
-def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-
-    # 가로형이면 자동 변환
-    if "year_week" not in df.columns and "item_name" not in df.columns and "sales_qty" not in df.columns:
-        df = convert_wide_to_long(df)
-
-    # 한글 헤더 대응
-    rename_map = {}
-    for col in df.columns:
-        if col == "연도/주":
-            rename_map[col] = "year_week"
-        elif col == "아이템":
-            rename_map[col] = "item_name"
-        elif col in ["판매수량", "판매수량의 SUM"]:
-            rename_map[col] = "sales_qty"
-
-    df = df.rename(columns=rename_map)
-
-    required_cols = {"year_week", "item_name", "sales_qty"}
-    missing = required_cols - set(df.columns)
-    if missing:
-        raise ValueError(f"필수 컬럼이 없습니다: {missing}")
-
-    df["year_week"] = df["year_week"].astype(str).str.strip()
-    df["item_name"] = df["item_name"].astype(str).str.strip()
-
-    df["sales_qty"] = (
-        df["sales_qty"]
-        .astype(str)
-        .str.replace(",", "", regex=False)
-        .str.strip()
-        .replace("", "0")
-    )
-    df["sales_qty"] = pd.to_numeric(df["sales_qty"], errors="coerce").fillna(0)
-
-    extracted = df["year_week"].str.extract(r"(?P<year>\d{4})-(?P<week>\d{1,2})")
-    df["year"] = pd.to_numeric(extracted["year"], errors="coerce")
-    df["week"] = pd.to_numeric(extracted["week"], errors="coerce")
-
-    df = df.dropna(subset=["year", "week"])
-    df["year"] = df["year"].astype(int)
-    df["week"] = df["week"].astype(int)
-
-    df["season"] = df["week"].apply(get_season)
-
-    return df
-
-# -------------------------------------------------
-# 8. 분류 테이블 생성
-# -------------------------------------------------
-def make_classification_table(df: pd.DataFrame) -> pd.DataFrame:
-    season_sum = (
-        df.groupby(["item_name", "season"], as_index=False)["sales_qty"]
-        .sum()
+    # local peak 조건
+    g["is_local_peak"] = (
+        (g["판매수량_ma"] >= g["prev_ma"]) &
+        (g["판매수량_ma"] >= g["next_ma"])
     )
 
-    pivot = (
-        season_sum.pivot(index="item_name", columns="season", values="sales_qty")
-        .fillna(0)
-        .reset_index()
+    plc_list = []
+
+    for idx, row in g.iterrows():
+        stage = None
+
+        # 1) 변곡점: 전체 최고점 주차를 우선 지정
+        if idx == peak_idx:
+            stage = "변곡점"
+
+        # 2) 도입
+        elif (
+            row["판매주차순번"] <= intro_weeks and
+            row["peak_ratio"] < 0.35
+        ):
+            stage = "도입"
+
+        # 3) 쇠퇴
+        elif (
+            row["is_after_peak"] and
+            row["growth_rate"] < -0.05 and
+            (
+                row["peak_ratio"] < 0.70 or
+                row["할인율"] >= decline_discount_threshold
+            )
+        ):
+            stage = "쇠퇴"
+
+        # 4) 성숙
+        elif (
+            row["peak_ratio"] >= 0.85 and
+            abs(row["growth_rate"]) <= 0.10
+        ):
+            stage = "성숙"
+
+        # 5) 성장
+        elif (
+            (not row["is_after_peak"]) and
+            row["peak_ratio"] >= 0.35 and
+            row["growth_rate"] > 0.05
+        ):
+            stage = "성장"
+
+        # 6) 나머지 보정 규칙
+        else:
+            # 최고점 전이면 성장 쪽
+            if not row["is_after_peak"]:
+                if row["peak_ratio"] < 0.35:
+                    stage = "도입"
+                elif row["peak_ratio"] < 0.85:
+                    stage = "성장"
+                else:
+                    stage = "성숙"
+            # 최고점 후면 성숙/쇠퇴 중 선택
+            else:
+                if row["peak_ratio"] >= 0.70 and row["할인율"] < decline_discount_threshold:
+                    stage = "성숙"
+                else:
+                    stage = "쇠퇴"
+
+        plc_list.append(stage)
+
+    g["plc"] = plc_list
+    return g
+
+
+# -------------------------------------------------
+# 4. 전체 아이템에 적용
+# -------------------------------------------------
+def run_plc_classification(df: pd.DataFrame,
+                           intro_weeks: int = 3,
+                           decline_discount_threshold: float = 0.30) -> pd.DataFrame:
+    weekly = prepare_weekly_item_data(df)
+
+    result = (
+        weekly.groupby("아이템", group_keys=False)
+        .apply(
+            lambda x: classify_plc_by_item(
+                x,
+                intro_weeks=intro_weeks,
+                decline_discount_threshold=decline_discount_threshold
+            )
+        )
+        .reset_index(drop=True)
     )
 
-    for col in ["SPRING", "SUMMER", "FALL", "WINTER"]:
-        if col not in pivot.columns:
-            pivot[col] = 0
-
-    pivot["TOTAL_QTY"] = (
-        pivot["SPRING"] + pivot["SUMMER"] + pivot["FALL"] + pivot["WINTER"]
-    )
-
-    total_nonzero = pivot["TOTAL_QTY"].replace(0, pd.NA)
-    pivot["SPRING_RATIO"] = pivot["SPRING"] / total_nonzero
-    pivot["SUMMER_RATIO"] = pivot["SUMMER"] / total_nonzero
-    pivot["FALL_RATIO"] = pivot["FALL"] / total_nonzero
-    pivot["WINTER_RATIO"] = pivot["WINTER"] / total_nonzero
-    pivot = pivot.fillna(0)
-
-    pivot["CATEGORY"] = pivot.apply(classify_item, axis=1)
-
-    result = pivot[
-        [
-            "item_name",
-            "SPRING",
-            "SUMMER",
-            "FALL",
-            "WINTER",
-            "TOTAL_QTY",
-            "SPRING_RATIO",
-            "SUMMER_RATIO",
-            "FALL_RATIO",
-            "WINTER_RATIO",
-            "CATEGORY",
-        ]
-    ].copy()
-
-    for col in ["SPRING_RATIO", "SUMMER_RATIO", "FALL_RATIO", "WINTER_RATIO"]:
-        result[col] = (result[col] * 100).round(1)
-
-    result = result.sort_values(["CATEGORY", "TOTAL_QTY"], ascending=[True, False])
     return result
 
+
 # -------------------------------------------------
-# 9. 실행
+# 5. 사용 예시
 # -------------------------------------------------
-if st.button("구글시트 데이터 가져오기"):
-    try:
-        raw_df = load_data_from_gsheet()
-        df = preprocess_data(raw_df)
-        result_df = make_classification_table(df)
+# result_df = run_plc_classification(df)
 
-        st.success("구글시트 데이터를 불러왔습니다.")
+# 보고 싶은 컬럼만 확인
+# print(result_df[[
+#     "아이템", "연도/주", "판매수량", "판매수량_ma",
+#     "할인율", "peak_ratio", "growth_rate", "plc"
+# ]].head(50))
 
-        st.subheader("분류 결과")
-        st.dataframe(result_df, use_container_width=True)
-
-        st.subheader("분류별 건수")
-        summary_df = (
-            result_df.groupby("CATEGORY", as_index=False)
-            .agg(
-                item_count=("item_name", "count"),
-                total_qty=("TOTAL_QTY", "sum"),
-            )
-            .sort_values("item_count", ascending=False)
-        )
-        st.dataframe(summary_df, use_container_width=True)
-
-        st.subheader("아이템 상세 조회")
-        item_list = result_df["item_name"].dropna().unique().tolist()
-        selected_item = st.selectbox("아이템 선택", item_list)
-
-        item_detail = result_df[result_df["item_name"] == selected_item]
-        st.dataframe(item_detail, use_container_width=True)
-
-    except Exception as e:
-        st.error(f"구글시트 조회 중 오류가 발생했습니다: {e}")
+# 파일 저장
+# result_df.to_csv("item_plc_result.csv", index=False, encoding="utf-8-sig")
