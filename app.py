@@ -464,16 +464,30 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     # 2. 쇠퇴 구간 확정
     # 끝에서부터 연속된 쇠퇴만 인정
     # -------------------------
+    # peak 이전에는 쇠퇴 금지
     for i in range(0, peak_idx):
         if df.loc[i, "plc_stage_raw"] == "쇠퇴":
             df.loc[i, "plc_stage_raw"] = "성장"
-        
-        
-
-    # 마지막 이전에 나온 쇠퇴는 성숙으로 변경
+    
+    
+    # -------------------------
+    # 마지막 연속 쇠퇴 찾기
+    # -------------------------
+    decline_start = n
+    
+    for i in range(n - 1, -1, -1):
+        if df.loc[i, "plc_stage_raw"] == "쇠퇴":
+            decline_start = i
+        else:
+            break
+    
+    
+    # 마지막 이전에 나온 쇠퇴는 성숙/성장으로 보정
     for i in range(0, decline_start):
         if df.loc[i, "plc_stage_raw"] == "쇠퇴":
             df.loc[i, "plc_stage_raw"] = "성숙" if i >= peak_idx else "성장"
+    
+
 
     # -------------------------
     # 3. 피크 기준으로 앞/뒤 정리
