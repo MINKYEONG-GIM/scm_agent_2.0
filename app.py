@@ -368,8 +368,8 @@ def classify_plc_stage(
     # local peak 여부
     local_peak = is_local_peak(qty_series.fillna(0), idx, window=LOCAL_PEAK_WINDOW)
 
-    # 1) 변곡점(최고점)
-    if idx == peak_idx or local_peak:
+    # 1) 최고점은 peak_idx 1개만 별도 표시
+    if idx == peak_idx:
         return "변곡점(최고점)"
 
     # 2) 쇠퇴
@@ -423,6 +423,84 @@ def classify_plc_stage(
         return "성숙"
 
 
+def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    PLC 단계가
+    도입 -> 성장 -> 성숙 -> 쇠퇴
+    흐름을 최대한 따르도록 보정한다.
+
+    규칙:
+    - 도입은 맨 앞 1개 연속 구간만 허용
+    - 쇠퇴는 맨 뒤 1개 연속 구간만 허용
+    - 중간에 나온 도입/쇠퇴는 성장 또는 성숙으로 보정
+    """
+    df = item_df.copy().reset_index(drop=True)
+
+    if df.empty:
+        return df
+
+    peak_idx = int(df["qty"].fillna(0).values.argmax())
+    n = len(df)
+
+    # -------------------------
+    # 1. 도입 구간 확정
+    # 시작부터 연속된 도입만 인정
+    # -------------------------
+    intro_end = -1
+    for i in range(n):
+        if df.loc[i, "plc_stage_raw"] == "도입":
+            intro_end = i
+        else:
+            break
+    # ✅ 도입 최대 기간 제한
+    intro_end = min(intro_end, INTRO_WEEKS - 1)
+
+    # 시작 이후에 다시 나온 도입은 성장으로 변경
+    for i in range(intro_end + 1, n):
+        if df.loc[i, "plc_stage_raw"] == "도입":
+            df.loc[i, "plc_stage_raw"] = "성장" if i < peak_idx else "성숙"
+
+    # -------------------------
+    # 2. 쇠퇴 구간 확정
+    # 끝에서부터 연속된 쇠퇴만 인정
+    # -------------------------
+    for i in range(0, peak_idx):
+    if df.loc[i, "plc_stage_raw"] == "쇠퇴":
+        df.loc[i, "plc_stage_raw"] = "성장"
+        
+        
+
+    # 마지막 이전에 나온 쇠퇴는 성숙으로 변경
+    for i in range(0, decline_start):
+        if df.loc[i, "plc_stage_raw"] == "쇠퇴":
+            df.loc[i, "plc_stage_raw"] = "성숙" if i >= peak_idx else "성장"
+
+    # -------------------------
+    # 3. 피크 기준으로 앞/뒤 정리
+    # peak 이전: 도입/성장/성숙만
+    # peak 이후: 성숙/쇠퇴만
+    # -------------------------
+    for i in range(n):
+        stage = df.loc[i, "plc_stage_raw"]
+
+        if i < peak_idx:
+            if stage == "쇠퇴":
+                df.loc[i, "plc_stage_raw"] = "성장"
+        elif i > peak_idx:
+            if stage == "도입":
+                df.loc[i, "plc_stage_raw"] = "성숙"
+
+    # -------------------------
+    # 4. 최종 단계명 저장
+    # 변곡점은 peak 주차만 별도 표시하고,
+    # plc_stage는 4단계 체계만 유지
+    # -------------------------
+    df["plc_stage"] = df["plc_stage_raw"]
+
+    return df
+
+
+
 def build_item_plc(item_df: pd.DataFrame) -> pd.DataFrame:
     item_df = item_df.sort_values("sort_key").reset_index(drop=True).copy()
 
@@ -437,17 +515,27 @@ def build_item_plc(item_df: pd.DataFrame) -> pd.DataFrame:
         for i in range(len(item_df))
     ]
 
-    item_df["plc_stage"] = [
-        classify_plc_stage(i, qty_series, discount_series)
-        for i in range(len(item_df))
+    item_df["plc_stage_raw"] = [
+    classify_plc_stage(i, qty_series, discount_series)
+    for i in range(len(item_df))
     ]
 
     peak_idx = int(qty_series.values.argmax()) if len(qty_series) > 0 else None
     item_df["is_peak_week"] = False
     if peak_idx is not None:
         item_df.loc[peak_idx, "is_peak_week"] = True
-
+    
+    # 변곡점(최고점)은 마커로만 표시하고,
+    # plc_stage는 4단계 체계로 정리
+    item_df["plc_stage_raw"] = item_df["plc_stage_raw"].replace("변곡점(최고점)", "성숙")
+    
+    item_df = enforce_single_intro_decline(item_df)
+    
     return item_df
+    
+    
+    
+   
 
 
 def summarize_latest_status(all_plc_df: pd.DataFrame) -> pd.DataFrame:
