@@ -529,20 +529,89 @@ def make_stage_reason(row: pd.Series) -> str:
         return "현재 데이터만으로 단계 판단이 어렵습니다."
 
 
+PLC_LINE_COLOR_MAP = {
+    "도입": "#1f77b4",          # 파랑
+    "성장": "#2ca02c",          # 초록
+    "성숙": "#ff7f0e",          # 주황
+    "쇠퇴": "#d62728",          # 빨강
+    "변곡점(최고점)": "#8c564b"  # 갈색
+}
+
 def draw_item_chart(item_df: pd.DataFrame, item_name: str) -> go.Figure:
     fig = go.Figure()
 
-    fig.add_trace(
-        go.Scatter(
-            x=item_df["year_week"],
-            y=item_df["qty"],
-            mode="lines+markers",
-            name="판매수량",
-        )
-    )
+    plot_df = item_df.sort_values("sort_key").reset_index(drop=True).copy()
 
-    # 최고점 표시
-    peak_rows = item_df[item_df["is_peak_week"] == True]
+    # PLC 단계가 바뀌는 지점마다 선을 끊어서 별도 trace로 그림
+    segment_start = 0
+    segment_id = 0
+
+    for i in range(1, len(plot_df)):
+        prev_stage = plot_df.loc[i - 1, "plc_stage"]
+        curr_stage = plot_df.loc[i, "plc_stage"]
+
+        if prev_stage != curr_stage:
+            seg = plot_df.iloc[segment_start:i].copy()
+            if len(seg) > 0:
+                stage = seg["plc_stage"].iloc[0]
+                fig.add_trace(
+                    go.Scatter(
+                        x=seg["year_week"],
+                        y=seg["qty"],
+                        mode="lines+markers",
+                        name=stage if segment_id == 0 or stage not in [t.name for t in fig.data] else stage,
+                        line=dict(
+                            color=PLC_LINE_COLOR_MAP.get(stage, "#6b7280"),
+                            width=3
+                        ),
+                        marker=dict(
+                            size=8,
+                            color=PLC_LINE_COLOR_MAP.get(stage, "#6b7280")
+                        ),
+                        legendgroup=stage,
+                        showlegend=stage not in [t.name for t in fig.data],
+                        hovertemplate=(
+                            "<b>%{x}</b><br>"
+                            "판매수량: %{y:,.0f}<br>"
+                            f"PLC: {stage}"
+                            "<extra></extra>"
+                        )
+                    )
+                )
+                segment_id += 1
+            segment_start = i - 1
+
+    # 마지막 구간 추가
+    last_seg = plot_df.iloc[segment_start:].copy()
+    if len(last_seg) > 0:
+        stage = last_seg["plc_stage"].iloc[0]
+        fig.add_trace(
+            go.Scatter(
+                x=last_seg["year_week"],
+                y=last_seg["qty"],
+                mode="lines+markers",
+                name=stage,
+                line=dict(
+                    color=PLC_LINE_COLOR_MAP.get(stage, "#6b7280"),
+                    width=3
+                ),
+                marker=dict(
+                    size=8,
+                    color=PLC_LINE_COLOR_MAP.get(stage, "#6b7280")
+                ),
+                legendgroup=stage,
+                showlegend=stage not in [t.name for t in fig.data],
+                hovertemplate=(
+                    "<b>%{x}</b><br>"
+                    "판매수량: %{y:,.0f}<br>"
+                    f"PLC: {stage}"
+                    "<extra></extra>"
+                )
+            )
+        )
+
+    # 변곡점(최고점) 표시
+    peak_rows = plot_df[plot_df["is_peak_week"] == True]
     if len(peak_rows) > 0:
         fig.add_trace(
             go.Scatter(
@@ -550,9 +619,20 @@ def draw_item_chart(item_df: pd.DataFrame, item_name: str) -> go.Figure:
                 y=peak_rows["qty"],
                 mode="markers+text",
                 name="변곡점(최고점)",
-                text=["최고점"],
+                text=["최고점"] * len(peak_rows),
                 textposition="top center",
-                marker=dict(size=12, symbol="diamond"),
+                marker=dict(
+                    size=13,
+                    symbol="diamond",
+                    color=PLC_LINE_COLOR_MAP.get("변곡점(최고점)", "#8c564b"),
+                    line=dict(color="white", width=1)
+                ),
+                hovertemplate=(
+                    "<b>%{x}</b><br>"
+                    "판매수량: %{y:,.0f}<br>"
+                    "PLC: 변곡점(최고점)"
+                    "<extra></extra>"
+                )
             )
         )
 
@@ -561,9 +641,14 @@ def draw_item_chart(item_df: pd.DataFrame, item_name: str) -> go.Figure:
         xaxis_title="연도/주",
         yaxis_title="판매수량",
         hovermode="x unified",
-        height=480
+        height=480,
+        legend_title="PLC 단계"
     )
+
+    fig.update_xaxes(type="category")
+
     return fig
+
 
 
 # =========================
