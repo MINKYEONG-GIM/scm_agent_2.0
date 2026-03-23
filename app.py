@@ -6,7 +6,7 @@ from streamlit_gsheets import GSheetsConnection
 
 st.title("구글시트 연결 테스트")
 
-SHEET_ID = "1IlJxe4ocFeNODRxMxpgtHA1xKC-Xn5-YvRsaHciUfLw"
+SHEET_ID = 1IlJxe4ocFeNODRxMxpgtHA1xKC-Xn5-YvRsaHciUfLw
 WORKSHEET_NAME = "plc db"
 
 conn = st.connection("gsheets", type=GSheetsConnection)
