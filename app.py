@@ -8,245 +8,10 @@ import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
 from streamlit_gsheets import GSheetsConnection
+from typing import List, Optional, Tuple
 
 # =========================
-# 1-1) 구글시트 연결
-# =========================
-def get_gspread_client():
-    """
-    Streamlit secrets 또는 환경변수에서 구글 서비스계정 정보를 읽어
-    gspread client를 생성합니다.
-    """
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ]
-
-    if "gcp_service_account" in st.secrets:
-        creds_dict = dict(st.secrets["gcp_service_account"])
-        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        return gspread.authorize(credentials)
-
-    service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if service_account_json:
-        creds_dict = json.loads(service_account_json)
-        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        return gspread.authorize(credentials)
-
-    raise ValueError(
-        "구글 서비스 계정 정보가 없습니다. "
-    )
-
-
-def get_sheets_config() -> dict:
-    """
-    secrets.toml의 [sheets] 섹션을 dict로 반환합니다.
-    필수 키: sheet_id
-    선택 키: worksheet(기본값 forecast_base)
-    """
-    if "sheets" not in st.secrets:
-        raise ValueError("st.secrets['sheets'] 설정이 없습니다. secrets.toml에 [sheets] 섹션을 추가하세요.")
-    return dict(st.secrets["sheets"])
-
-
-@st.cache_data(ttl=300)
-def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
-    """
-    구글시트의 특정 워크시트를 DataFrame으로 읽습니다.
-    """
-    client = get_gspread_client()
-    sheets_cfg = get_sheets_config()
-    sheet_id = sheets_cfg.get("sheet_id")
-    if not sheet_id:
-        raise ValueError("secrets.toml의 [sheets].sheet_id 가 비어있습니다.")
-
-    sh = client.open_by_key(sheet_id)
-    try:
-        ws = sh.worksheet(worksheet_name)
-    except Exception as e:
-        available = [w.title for w in sh.worksheets()]
-        raise ValueError(
-            f"워크시트 '{worksheet_name}'를 찾지 못했습니다. 사용 가능한 워크시트: {available}"
-        ) from e
-
-    values = ws.get_all_records()
-    return pd.DataFrame(values)
-
-def get_off_season_threshold(df: pd.DataFrame, intro_end: int, peak_idx: int) -> float:
-    """
-    비시즌 판정 기준값:
-    평균의 50%, 중간값의 50% 중 더 큰 값을 사용
-    """
-    base_series = df.loc[intro_end + 1:peak_idx - 1, "qty"].dropna()
-
-    if base_series.empty:
-        return 0.0
-
-    avg_val = float(base_series.mean())
-    median_val = float(base_series.median())
-
-    threshold_avg = avg_val * OFF_SEASON_BASE_RATIO
-    threshold_median = median_val * OFF_SEASON_BASE_RATIO
-
-    return max(threshold_avg, threshold_median)
-
-def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int, decline_start: int):
-    """
-    비시즌 구간 여러 개를 찾는다.
-
-    조건
-    - 도입 이후 ~ 쇠퇴 이전 구간에서 판정
-    - INTRO_WEEKS 이후만 가능
-    - 평균/중간값 대비 50% 이하
-    - 최소 3주 이상 연속
-    - peak 직전 1~2주는 비시즌 금지
-    - 이후 확실한 회복이 있어야 함
-    - 비시즌은 도입기와 쇠퇴기를 제외한 구간의 최저점을 반드시 포함해야 함
-    - 도입 이후 ~ 본격 성장 직전까지 이어지는 긴 저판매 유지 구간 우선
-    - 길이가 길수록 우선
-    - 평균 판매량이 낮을수록 우선
-    - 기울기가 평평할수록 우선
-    - peak에 가까운지 여부는 우선순위에서 빼기
-    """
-    if df.empty:
-        return []
-
-    search_start = max(intro_end + 1, INTRO_WEEKS)
-    search_end = decline_start - 1
-
-    if search_start > search_end:
-        return []
-
-    off_threshold = get_off_season_threshold(df, intro_end, peak_idx)
-    if off_threshold <= 0:
-        return []
-
-    # -------------------------
-    # 1. 도입/쇠퇴 제외 구간의 최저점 찾기
-    # -------------------------
-    valley_start = intro_end + 1
-    valley_end = max(intro_end + 1, decline_start - 1)
-
-    if valley_start > valley_end:
-        return []
-
-    valley_df = df.loc[valley_start:valley_end, ["qty"]].copy()
-    valley_df = valley_df.dropna(subset=["qty"])
-
-    if valley_df.empty:
-        return []
-
-    valley_idx = int(valley_df["qty"].idxmin())
-
-    # -------------------------
-    # 2. 비시즌 후보 찾기
-    # -------------------------
-    candidate_idx = []
-
-    for i in range(search_start, search_end + 1):
-        qty = df.loc[i, "qty"]
-
-        if pd.isna(qty):
-            continue
-
-        if qty <= off_threshold:
-            candidate_idx.append(i)
-
-    if not candidate_idx:
-        return []
-
-    # 연속 구간 묶기
-    groups = []
-    current_group = [candidate_idx[0]]
-
-    for idx in candidate_idx[1:]:
-        if idx == current_group[-1] + 1:
-            current_group.append(idx)
-        else:
-            groups.append(current_group)
-            current_group = [idx]
-    groups.append(current_group)
-
-    valid_groups = []
-
-    peak_qty = float(df["qty"].max()) if pd.notna(df["qty"].max()) else 0.0
-    recovery_threshold = peak_qty * OFF_SEASON_RECOVERY_RATIO
-
-    for g in groups:
-        if len(g) < OFF_SEASON_MIN_WEEKS:
-            continue
-
-        after_idx = g[-1] + 1
-        if after_idx >= decline_start:
-            continue
-
-        future_qty = df.loc[after_idx:peak_idx, "qty"].dropna()
-        if future_qty.empty:
-            continue
-
-        if not (future_qty >= recovery_threshold).any():
-            continue
-
-        avg_qty = float(df.loc[g, "qty"].mean())
-        contains_valley = g[0] <= valley_idx <= g[-1]
-
-        valid_groups.append({
-            "start": g[0],
-            "end": g[-1],
-            "length": len(g),
-            "avg_qty": avg_qty,
-            "contains_valley": contains_valley
-        })
-
-    if not valid_groups:
-        return []
-
-    # -------------------------
-    # 3. 최저점 포함 구간은 반드시 유지
-    # -------------------------
-    selected_groups = []
-
-    valley_groups = [g for g in valid_groups if g["contains_valley"]]
-    if valley_groups:
-        best_valley_group = sorted(
-            valley_groups,
-            key=lambda x: (-x["length"], x["avg_qty"], x["start"])
-        )[0]
-        selected_groups.append(best_valley_group)
-
-    # -------------------------
-    # 4. 나머지 유효 구간도 추가 가능
-    # -------------------------
-    other_groups = sorted(
-        valid_groups,
-        key=lambda x: (-x["length"], x["avg_qty"], x["start"])
-    )
-
-    for g in other_groups:
-        already_exists = any(
-            s["start"] == g["start"] and s["end"] == g["end"]
-            for s in selected_groups
-        )
-        if not already_exists:
-            selected_groups.append(g)
-
-    return [(g["start"], g["end"]) for g in selected_groups]
-
-
-# =========================
-# 1) 기본 설정
-# =========================
-st.set_page_config(
-    page_title="아이템별 PLC 포인트 분석",
-    layout="wide",
-)
-
-st.title("아이템별 PLC 포인트 분석")
-st.caption("구글시트 기반으로 아이템별 주차 판매 흐름을 분석하고 PLC 단계를 자동 분류합니다.")
-
-
-# =========================
-# 2) 설정값
+# 1. 설정값 / 상수
 # =========================
 INTRO_WEEKS = 3
 GROWTH_MIN_RATIO = 0.35
@@ -254,18 +19,28 @@ GROWTH_MAX_RATIO = 0.85
 MATURE_RATIO = 0.85
 DECLINE_RATIO = 0.70
 HIGH_DISCOUNT_RATIO = 0.30
-#비시즌 관련 수치
-OFF_SEASON_BASE_RATIO = 0.50 #평균/중간값의 50% 이하
-OFF_SEASON_MIN_WEEKS = 3 #최소 3주 연속
-OFF_SEASON_RECOVERY_RATIO = 0.60 #이후 회복 판정용
-OFF_SEASON_PEAK_BUFFER = 2 #peak 직전 2주 제외
+# 비시즌 관련 수치
+OFF_SEASON_BASE_RATIO = 0.50  # 평균/중간값의 50% 이하
+OFF_SEASON_MIN_WEEKS = 6  # 너무 짧은 구간 제외, 길게 잡기
+OFF_SEASON_RECOVERY_RATIO = 0.60
+OFF_SEASON_PEAK_BUFFER = 2
+OFF_SEASON_SLOPE_LIMIT_RATIO = 0.03  # 최고점 대비 주차당 허용 기울기
+OFF_SEASON_MAX_RATIO_TO_PEAK = 0.35  # 최고점 대비 35% 이하만 비시즌 후보
 
 ROLLING_WINDOW = 3  # 최근 흐름 판단용
 LOCAL_PEAK_WINDOW = 1  # 앞/뒤 1주 비교
 
+PLC_LINE_COLOR_MAP = {
+    "도입": "#1f77b4",  # 파랑
+    "성장": "#2ca02c",  # 초록
+    "성숙": "#ff7f0e",  # 주황
+    "쇠퇴": "#d62728",  # 빨강
+    "변곡점(최고점)": "#8c564b",  # 갈색
+    "비시즌": "#7f7f7f",  # 회색
+}
 
 # =========================
-# 3) 유틸 함수
+# 2. 아주 기본 유틸
 # =========================
 def parse_year_week(value: str) -> Tuple[Optional[int], Optional[int]]:
     """
@@ -303,6 +78,15 @@ def safe_to_numeric(series: pd.Series) -> pd.Series:
     )
 
 
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    컬럼명 앞뒤 공백 제거
+    """
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
 def calc_discount_rate(gross_sales: pd.Series, full_price_sales: pd.Series) -> pd.Series:
     """
     할인율 = 1 - (외형매출 / 정상가)
@@ -313,15 +97,9 @@ def calc_discount_rate(gross_sales: pd.Series, full_price_sales: pd.Series) -> p
     return discount.clip(lower=0, upper=1)
 
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    컬럼명 앞뒤 공백 제거
-    """
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
-
-
+# =========================
+# 3. 데이터 전처리 유틸
+# =========================
 def infer_sheet_format(df: pd.DataFrame) -> str:
     """
     wide:
@@ -452,6 +230,9 @@ def prepare_data(raw_df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+# =========================
+# 4. 분석 보조 유틸
+# =========================
 def is_local_peak(series: pd.Series, idx: int, window: int = 1) -> bool:
     """
     주변 주차보다 뚜렷하게 높은 local peak 판단
@@ -489,6 +270,152 @@ def get_recent_slope(values: pd.Series, window: int = 3) -> float:
     return float(slope)
 
 
+def get_segment_slope(series: pd.Series) -> float:
+    s = series.dropna().astype(float)
+
+    if len(s) < 2:
+        return 0.0
+
+    x = np.arange(len(s))
+    y = s.values
+    return float(np.polyfit(x, y, 1)[0])
+
+
+def get_off_season_threshold(df: pd.DataFrame, intro_end: int, peak_idx: int) -> float:
+    """
+    비시즌 판정 기준값:
+    평균의 50%, 중간값의 50% 중 더 큰 값을 사용
+    """
+    base_series = df.loc[intro_end + 1:peak_idx - 1, "qty"].dropna()
+
+    if base_series.empty:
+        return 0.0
+
+    avg_val = float(base_series.mean())
+    median_val = float(base_series.median())
+
+    threshold_avg = avg_val * OFF_SEASON_BASE_RATIO
+    threshold_median = median_val * OFF_SEASON_BASE_RATIO
+
+    return max(threshold_avg, threshold_median)
+
+
+def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int, decline_start: int):
+    """
+    비시즌 구간 찾기
+
+    목표:
+    - 잠깐 꺼진 구간이 아니라
+    - 오랫동안 팔리지 않는 중심 저판매 구간을 찾는다.
+
+    조건:
+    - 도입 이후 ~ peak 이전까지만 후보
+    - 판매량이 충분히 낮아야 함
+    - 최소 6주 이상 연속
+    - 기울기가 너무 가파르면 제외
+    - peak 직전 1~2주는 제외
+    """
+    if df.empty:
+        return []
+
+    search_start = max(intro_end + 1, INTRO_WEEKS)
+    search_end = peak_idx - OFF_SEASON_PEAK_BUFFER - 1
+
+    if search_start > search_end:
+        return []
+
+    off_threshold = get_off_season_threshold(df, intro_end, peak_idx)
+    if off_threshold <= 0:
+        return []
+
+    peak_qty = float(df["qty"].max()) if pd.notna(df["qty"].max()) else 0.0
+    if peak_qty <= 0:
+        return []
+
+    slope_limit = peak_qty * OFF_SEASON_SLOPE_LIMIT_RATIO
+    max_qty_limit = peak_qty * OFF_SEASON_MAX_RATIO_TO_PEAK
+
+    # 1) 후보 인덱스 추출
+    candidate_idx = []
+
+    for i in range(search_start, search_end + 1):
+        qty = df.loc[i, "qty"]
+
+        if pd.isna(qty):
+            continue
+
+        # 기준 이하 + 최고점 대비 너무 높지 않아야 함
+        if qty <= off_threshold and qty <= max_qty_limit:
+            candidate_idx.append(i)
+
+    if not candidate_idx:
+        return []
+
+    # 2) 연속 구간 묶기
+    groups = []
+    current_group = [candidate_idx[0]]
+
+    for idx in candidate_idx[1:]:
+        if idx == current_group[-1] + 1:
+            current_group.append(idx)
+        else:
+            groups.append(current_group)
+            current_group = [idx]
+    groups.append(current_group)
+
+    valid_groups = []
+
+    for g in groups:
+        if len(g) < OFF_SEASON_MIN_WEEKS:
+            continue
+
+        segment_qty = df.loc[g, "qty"].dropna()
+        if segment_qty.empty:
+            continue
+
+        avg_qty = float(segment_qty.mean())
+        max_qty = float(segment_qty.max())
+        min_qty = float(segment_qty.min())
+        segment_slope = get_segment_slope(segment_qty)
+
+        # 너무 가파르게 오르거나 내리면 비시즌 아님
+        if abs(segment_slope) > slope_limit:
+            continue
+
+        # 점수:
+        # 길수록 좋고, 평균이 낮을수록 좋고, 기울기가 작을수록 좋다
+        score = (
+            len(g) * 1000
+            - avg_qty
+            - abs(segment_slope) * 10
+        )
+
+        valid_groups.append({
+            "start": g[0],
+            "end": g[-1],
+            "length": len(g),
+            "avg_qty": avg_qty,
+            "max_qty": max_qty,
+            "min_qty": min_qty,
+            "slope": segment_slope,
+            "score": score
+        })
+
+    if not valid_groups:
+        return []
+
+    # 가장 긴 저판매 유지 구간 우선
+    best_group = sorted(
+        valid_groups,
+        key=lambda x: (-x["length"], x["avg_qty"], abs(x["slope"]), x["start"])
+    )[0]
+
+    return [(best_group["start"], best_group["end"])]
+
+
+# =========================
+# 5. 핵심 PLC 로직
+# =========================
 def classify_plc_stage(
     idx: int,
     qty_series: pd.Series,
@@ -587,6 +514,7 @@ def classify_plc_stage(
     else:
         return "성숙"
 
+
 def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     """
     PLC 단계 흐름을 보정한다.
@@ -666,8 +594,10 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     # 6. 비시즌 표시
     # -------------------------
     off_ranges = find_off_season_ranges(df, intro_end, peak_idx, decline_start)
-    for start, end in off_ranges:
-        df.loc[start:end, "plc_stage_final"] = "비시즌"
+
+    for start_idx, end_idx in off_ranges:
+        for i in range(start_idx, end_idx + 1):
+            df.loc[i, "plc_stage_final"] = "비시즌"
 
     # -------------------------
     # 7. 최종 흐름 정리
@@ -713,8 +643,6 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-
-
 def build_item_plc(item_df: pd.DataFrame) -> pd.DataFrame:
     item_df = item_df.sort_values("sort_key").reset_index(drop=True).copy()
 
@@ -730,26 +658,22 @@ def build_item_plc(item_df: pd.DataFrame) -> pd.DataFrame:
     ]
 
     item_df["plc_stage_raw"] = [
-    classify_plc_stage(i, qty_series, discount_series)
-    for i in range(len(item_df))
+        classify_plc_stage(i, qty_series, discount_series)
+        for i in range(len(item_df))
     ]
 
     peak_idx = int(qty_series.values.argmax()) if len(qty_series) > 0 else None
     item_df["is_peak_week"] = False
     if peak_idx is not None:
         item_df.loc[peak_idx, "is_peak_week"] = True
-    
+
     # 변곡점(최고점)은 마커로만 표시하고,
     # plc_stage는 4단계 체계로 정리
     item_df["plc_stage_raw"] = item_df["plc_stage_raw"].replace("변곡점(최고점)", "성숙")
-    
+
     item_df = enforce_single_intro_decline(item_df)
-    
+
     return item_df
-    
-    
-    
-   
 
 
 def summarize_latest_status(all_plc_df: pd.DataFrame) -> pd.DataFrame:
@@ -819,15 +743,6 @@ def make_stage_reason(row: pd.Series) -> str:
     else:
         return "현재 데이터만으로 단계 판단이 어렵습니다."
 
-
-PLC_LINE_COLOR_MAP = {
-    "도입": "#1f77b4",          # 파랑
-    "성장": "#2ca02c",          # 초록
-    "성숙": "#ff7f0e",          # 주황
-    "쇠퇴": "#d62728",          # 빨강
-    "변곡점(최고점)": "#8c564b",  # 갈색
-    "비시즌": "#7f7f7f"  # 회색
-}
 
 def draw_item_chart(item_df: pd.DataFrame, item_name: str) -> go.Figure:
     fig = go.Figure()
@@ -942,22 +857,70 @@ def draw_item_chart(item_df: pd.DataFrame, item_name: str) -> go.Figure:
     return fig
 
 
-# 3. 기울기 함수
-def get_segment_slope(series: pd.Series) -> float: 
-    s = series.dropna().astype(float)
-
-    if len(s) < 2:
-        return 0.0
-
-    x = np.arange(len(s))
-    y = s.values
-    return float(np.polyfit(x, y, 1)[0])
-
-
-
 # =========================
-# 4) 구글시트 읽기
+# 6. 시트 로딩 함수
 # =========================
+def get_gspread_client():
+    """
+    Streamlit secrets 또는 환경변수에서 구글 서비스계정 정보를 읽어
+    gspread client를 생성합니다.
+    """
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+
+    if "gcp_service_account" in st.secrets:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        return gspread.authorize(credentials)
+
+    service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if service_account_json:
+        creds_dict = json.loads(service_account_json)
+        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        return gspread.authorize(credentials)
+
+    raise ValueError(
+        "구글 서비스 계정 정보가 없습니다. "
+    )
+
+
+def get_sheets_config() -> dict:
+    """
+    secrets.toml의 [sheets] 섹션을 dict로 반환합니다.
+    필수 키: sheet_id
+    선택 키: worksheet(기본값 forecast_base)
+    """
+    if "sheets" not in st.secrets:
+        raise ValueError("st.secrets['sheets'] 설정이 없습니다. secrets.toml에 [sheets] 섹션을 추가하세요.")
+    return dict(st.secrets["sheets"])
+
+
+@st.cache_data(ttl=300)
+def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
+    """
+    구글시트의 특정 워크시트를 DataFrame으로 읽습니다.
+    """
+    client = get_gspread_client()
+    sheets_cfg = get_sheets_config()
+    sheet_id = sheets_cfg.get("sheet_id")
+    if not sheet_id:
+        raise ValueError("secrets.toml의 [sheets].sheet_id 가 비어있습니다.")
+
+    sh = client.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet(worksheet_name)
+    except Exception as e:
+        available = [w.title for w in sh.worksheets()]
+        raise ValueError(
+            f"워크시트 '{worksheet_name}'를 찾지 못했습니다. 사용 가능한 워크시트: {available}"
+        ) from e
+
+    values = ws.get_all_records()
+    return pd.DataFrame(values)
+
+
 @st.cache_data(ttl=300)
 def load_sheet_data() -> pd.DataFrame:
     sheets_cfg = get_sheets_config()
@@ -976,10 +939,17 @@ def load_sheet_data() -> pd.DataFrame:
     return load_sheet_as_df(worksheet_name)
 
 
+# =========================
+# 7. Streamlit 실행부
+# =========================
+st.set_page_config(
+    page_title="아이템별 PLC 포인트 분석",
+    layout="wide",
+)
 
-# =========================
-# 5) 데이터 처리
-# =========================
+st.title("아이템별 PLC 포인트 분석")
+st.caption("구글시트 기반으로 아이템별 주차 판매 흐름을 분석하고 PLC 단계를 자동 분류합니다.")
+
 try:
     raw_df = load_sheet_data()
     st.success("구글시트 데이터를 불러왔습니다.")
@@ -1007,7 +977,7 @@ except Exception as e:
 
 
 # =========================
-# 6) 상단 요약
+# 8) 상단 요약
 # =========================
 latest_summary_df = summarize_latest_status(plc_df)
 
@@ -1049,7 +1019,7 @@ st.dataframe(display_summary, use_container_width=True, hide_index=True)
 
 
 # =========================
-# 7) 상세 분석
+# 9) 상세 분석
 # =========================
 st.subheader("아이템 상세 분석")
 
@@ -1096,7 +1066,7 @@ with st.expander("주차별 상세 데이터", expanded=False):
 
 
 # =========================
-# 8) 기준 설명
+# 10) 기준 설명
 # =========================
 st.subheader("PLC 분류 기준")
 
