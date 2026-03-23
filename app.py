@@ -83,11 +83,45 @@ def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
     return pd.DataFrame(values)
 
 
+def normalize_source_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    시트 컬럼명을 PLC 파이프라인 표준명으로 정규화합니다.
+    - 공백/개행 제거
+    - 흔한 별칭을 표준 컬럼으로 매핑
+    """
+    out = df.copy()
+    out.columns = [str(c).replace("\n", "").replace("\r", "").strip() for c in out.columns]
+
+    alias_map = {
+        "아이템": ["아이템", "item", "품목", "상품", "스타일", "style_code", "style"],
+        "연도/주": ["연도/주", "year_week", "week", "주차", "similar_week", "연도주차"],
+        "외형매출": ["외형매출", "매출", "sales_amount", "gross_sales", "actual_sales", "net_sales"],
+        "정상가": ["정상가", "정가", "list_price", "original_price", "price"],
+        "판매수량": ["판매수량", "수량", "판매량", "qty", "sales_qty", "similar_forecast_qty"],
+    }
+
+    rename_dict = {}
+    normalized_lookup = {str(c).strip().lower(): c for c in out.columns}
+    for target, aliases in alias_map.items():
+        if target in out.columns:
+            continue
+        for alias in aliases:
+            key = str(alias).strip().lower()
+            if key in normalized_lookup:
+                rename_dict[normalized_lookup[key]] = target
+                break
+
+    if rename_dict:
+        out = out.rename(columns=rename_dict)
+
+    return out
+
+
 # =========================
 # 2) PLC 분류 함수
 # =========================
 def prepare_weekly_item_data(df: pd.DataFrame) -> pd.DataFrame:
-    data = df.copy()
+    data = normalize_source_columns(df)
 
     required_cols = ["아이템", "연도/주", "외형매출", "정상가", "판매수량"]
     missing_cols = [col for col in required_cols if col not in data.columns]
@@ -342,6 +376,7 @@ try:
     sheets_cfg = get_sheets_config()
     worksheet_name = sheets_cfg.get("worksheet") or "forecast_base"
     raw_df = load_sheet_as_df(worksheet_name)
+    raw_df = normalize_source_columns(raw_df)
     st.caption(f"데이터 소스: Google Sheets / 워크시트 `{worksheet_name}`")
 except Exception as e:
     st.error("구글시트 데이터 로드 중 오류가 발생했습니다.")
