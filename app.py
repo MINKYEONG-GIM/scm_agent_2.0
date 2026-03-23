@@ -743,8 +743,8 @@ PLC_LINE_COLOR_MAP = {
     "성장": "#2ca02c",          # 초록
     "성숙": "#ff7f0e",          # 주황
     "쇠퇴": "#d62728",          # 빨강
-    "변곡점(최고점)": "#8c564b"  # 갈색
-    "비시즌": "#7f7f7f",   # 회색
+    "변곡점(최고점)": "#8c564b",  # 갈색
+    "비시즌": "#7f7f7f"  # 회색
 }
 
 def draw_item_chart(item_df: pd.DataFrame, item_name: str) -> go.Figure:
