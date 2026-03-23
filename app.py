@@ -1,253 +1,313 @@
-#PLC는 N개(6개이상, 도입-성장-성숙-쇠퇴 + 정점, 기울기 꺾이는 변곡점)로 쪼개시고 정점이 언제인지, 그래프가 급격히 꺽이는 시점이 언제인지 등을 통해 구간을 분류해주세요
-#app.py 에서 from plc_utils import 함수명 으로 가져다 쓸 수 있음
-
-# 포함할 기능: 주차 집계, 스무딩, slope, accel, peak 찾기, turning point 찾기, stage 분류 (7단계 기준), 시즌종료 (discount 기준 가능하게), 급감, 변곡점 flag
-
+import re
 import pandas as pd
+import streamlit as st
+from sqlalchemy import create_engine
 
+# -------------------------------------------------
+# 1. 기본 설정
+# -------------------------------------------------
+st.set_page_config(page_title="아이템 시즌 분류", layout="wide")
+st.title("아이템 시즌 분류 화면")
 
-# =========================
-# 1. week 정렬용 변환
-# =========================
+st.markdown("""
+주차별 판매량 데이터를 기준으로 각 아이템을 아래 규칙으로 분류합니다.
 
-def parse_year_week(week_str: str):
-    """
-    '2024-23' -> (2024, 23)
-    """
-    try:
-        y, w = week_str.split("-")
-        return int(y), int(w)
-    except:
-        return 0, 0
+- ALL_SEASON: 모든 시즌 비중 15% 이상
+- SUMMER_PEAK: 여름 비중 40% 이상
+- WINTER_PEAK: 겨울 비중 40% 이상
+- SPRING_PEAK: 봄 비중 35% 이상
+- FALL_PEAK: 가을 비중 35% 이상
+- SPRING_FALL_PEAK: 봄+가을 비중 50% 이상
+""")
 
+# -------------------------------------------------
+# 2. 시즌 정의
+# -------------------------------------------------
+# 기준:
+# 봄   = 9~18주
+# 여름 = 19~30주
+# 가을 = 31~40주
+# 겨울 = 41~52주 + 1~8주
 
-# =========================
-# 2. 주차별 집계
-# =========================
-
-def build_plc_weekly_series(
-    base_df: pd.DataFrame,
-    week_col: str = "similar_week",
-    qty_col: str = "similar_forecast_qty_num"
-) -> pd.DataFrame:
-
-    df = (
-        base_df.groupby(week_col, as_index=False)[qty_col]
-        .sum()
-        .rename(columns={
-            week_col: "week",
-            qty_col: "qty"
-        })
-    )
-
-    df["sort_key"] = df["week"].apply(parse_year_week)
-    df = df.sort_values("sort_key").reset_index(drop=True)
-
-    df["t"] = range(len(df))
-
-    return df
-
-
-# =========================
-# 3. 스무딩 + slope + accel
-# =========================
-
-def add_plc_features(
-    df: pd.DataFrame,
-    window: int = 3
-) -> pd.DataFrame:
-
-    result = df.copy()
-
-    # 이동평균
-    result["smooth_qty"] = (
-        result["qty"]
-        .rolling(window=window, center=True, min_periods=1)
-        .mean()
-    )
-
-    # 기울기
-    result["slope"] = result["smooth_qty"].diff()
-
-    # 기울기 변화
-    result["accel"] = result["slope"].diff()
-
-    # 최대값
-    max_qty = result["smooth_qty"].max()
-
-    if max_qty == 0:
-        result["qty_ratio"] = 0
+def get_season(week: int) -> str:
+    if 9 <= week <= 18:
+        return "SPRING"
+    elif 19 <= week <= 30:
+        return "SUMMER"
+    elif 31 <= week <= 40:
+        return "FALL"
     else:
-        result["qty_ratio"] = result["smooth_qty"] / max_qty
-
-    return result
+        return "WINTER"
 
 
-# =========================
-# 4. peak 찾기
-# =========================
+# -------------------------------------------------
+# 3. 분류 함수
+# -------------------------------------------------
+def classify_item(row: pd.Series) -> str:
+    spring_ratio = row["SPRING_RATIO"]
+    summer_ratio = row["SUMMER_RATIO"]
+    fall_ratio = row["FALL_RATIO"]
+    winter_ratio = row["WINTER_RATIO"]
 
-def find_peak_idx(df: pd.DataFrame):
+    # 우선순위 중요
+    if (
+        spring_ratio >= 0.15
+        and summer_ratio >= 0.15
+        and fall_ratio >= 0.15
+        and winter_ratio >= 0.15
+    ):
+        return "ALL_SEASON"
 
-    if df.empty:
-        return None
+    if summer_ratio >= 0.40:
+        return "SUMMER_PEAK"
 
-    return df["smooth_qty"].idxmax()
+    if winter_ratio >= 0.40:
+        return "WINTER_PEAK"
 
+    if (spring_ratio + fall_ratio) >= 0.50:
+        return "SPRING_FALL_PEAK"
 
-# =========================
-# 5. turning point 찾기
-# =========================
+    if spring_ratio >= 0.35:
+        return "SPRING_PEAK"
 
-def find_turning_points(df: pd.DataFrame):
+    if fall_ratio >= 0.35:
+        return "FALL_PEAK"
 
-    turning = []
-
-    slope = df["slope"].fillna(0)
-
-    for i in range(1, len(df)):
-
-        prev = slope.iloc[i - 1]
-        curr = slope.iloc[i]
-
-        if prev > 0 and curr < 0:
-            turning.append(i)
-
-    return turning
-
-
-# =========================
-# 6. 급감 찾기
-# =========================
-
-def find_fast_drop(df: pd.DataFrame):
-
-    fast = []
-
-    for i in range(1, len(df)):
-
-        prev = df["smooth_qty"].iloc[i - 1]
-        curr = df["smooth_qty"].iloc[i]
-
-        if prev == 0:
-            continue
-
-        if curr < prev * 0.8:
-            fast.append(i)
-
-    return fast
+    return "UNCLASSIFIED"
 
 
-# =========================
-# 7. stage 분류
-# =========================
+# -------------------------------------------------
+# 4. DB 조회 함수
+# -------------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_data_from_db():
+    """
+    예시:
+    DB에서 아래 형태의 결과가 나오도록 조회한다고 가정
 
-def classify_plc_stage(
-    df: pd.DataFrame,
-    discount_series: pd.Series | None = None
-) -> pd.DataFrame:
+    컬럼:
+    - year_week : '2025-01'
+    - item_name : '가디건'
+    - sales_qty : 4035
 
-    result = df.copy()
+    실제 테이블명/컬럼명에 맞게 SQL만 수정하면 됨
+    """
 
-    result["stage"] = "도입"
-    result["is_peak"] = False
-    result["is_turning"] = False
-    result["is_fast_drop"] = False
-    result["is_season_end"] = False
+    # ---------------------------------------------
+    # DB 접속 정보 예시
+    # 본인 환경에 맞게 수정
+    # ---------------------------------------------
+    DB_USER = "your_id"
+    DB_PASSWORD = "your_pw"
+    DB_HOST = "your_host"
+    DB_PORT = "5432"
+    DB_NAME = "your_db"
 
-    if result.empty:
-        return result
-
-    max_qty = result["smooth_qty"].max()
-
-    peak_idx = find_peak_idx(result)
-    turning = find_turning_points(result)
-    fast = find_fast_drop(result)
-
-    # peak
-    if peak_idx is not None:
-        result.loc[peak_idx, "stage"] = "정점"
-        result.loc[peak_idx, "is_peak"] = True
-
-    # turning
-    for i in turning:
-        result.loc[i, "is_turning"] = True
-
-    # fast drop
-    for i in fast:
-        result.loc[i, "is_fast_drop"] = True
-
-    for i in result.index:
-
-        if i == peak_idx:
-            continue
-
-        qty_ratio = result.loc[i, "qty_ratio"]
-        slope = result.loc[i, "slope"]
-        accel = result.loc[i, "accel"]
-
-        # 시즌종료
-        if discount_series is not None:
-
-            if i < len(discount_series):
-
-                discount = discount_series.iloc[i]
-
-                if discount >= 0.5 and qty_ratio < 0.4:
-                    result.loc[i, "stage"] = "시즌종료"
-                    result.loc[i, "is_season_end"] = True
-                    continue
-
-        # 급감
-        if slope < 0 and accel < 0 and qty_ratio < 0.7:
-            result.loc[i, "stage"] = "급감시작"
-            continue
-
-        # 쇠퇴
-        if qty_ratio < 0.3 and slope <= 0:
-            result.loc[i, "stage"] = "쇠퇴"
-            continue
-
-        # 성숙
-        if qty_ratio >= 0.7 and abs(slope) < max_qty * 0.05:
-            result.loc[i, "stage"] = "성숙"
-            continue
-
-        # 성장
-        if slope > 0 and qty_ratio >= 0.3:
-            result.loc[i, "stage"] = "성장"
-            continue
-
-        # 도입
-        result.loc[i, "stage"] = "도입"
-
-    return result
-
-
-# =========================
-# 8. 전체 파이프라인
-# =========================
-
-def run_plc_pipeline(
-    base_df: pd.DataFrame,
-    week_col="similar_week",
-    qty_col="similar_forecast_qty_num",
-    discount_series=None
-):
-
-    df = build_plc_weekly_series(
-        base_df,
-        week_col=week_col,
-        qty_col=qty_col
+    # PostgreSQL 예시
+    engine = create_engine(
+        f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
     )
 
-    df = add_plc_features(df)
+    sql = """
+    SELECT
+        year_week,
+        item_name,
+        sales_qty
+    FROM item_weekly_sales
+    WHERE year_week IS NOT NULL
+      AND item_name IS NOT NULL
+    """
 
-    df = classify_plc_stage(
-        df,
-        discount_series=discount_series
+    df = pd.read_sql(sql, engine)
+    return df
+
+
+# -------------------------------------------------
+# 5. 업로드 파일 형태(가로형)도 처리 가능하도록 변환 함수
+# -------------------------------------------------
+def convert_wide_to_long(df_wide: pd.DataFrame) -> pd.DataFrame:
+    """
+    현재 업로드한 텍스트처럼
+    행 = 연도/주
+    열 = 아이템명
+    값 = 판매수량
+    형태일 때 long 형태로 바꿔줌
+    """
+
+    first_col = df_wide.columns[0]
+
+    df_long = df_wide.melt(
+        id_vars=[first_col],
+        var_name="item_name",
+        value_name="sales_qty"
+    ).rename(columns={first_col: "year_week"})
+
+    return df_long
+
+
+# -------------------------------------------------
+# 6. 데이터 전처리
+# -------------------------------------------------
+def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # 컬럼명 정리
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # 필수 컬럼 확인
+    required_cols = {"year_week", "item_name", "sales_qty"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"필수 컬럼이 없습니다: {missing}")
+
+    # 값 정리
+    df["year_week"] = df["year_week"].astype(str).str.strip()
+    df["item_name"] = df["item_name"].astype(str).str.strip()
+
+    # 숫자 변환
+    df["sales_qty"] = (
+        df["sales_qty"]
+        .astype(str)
+        .str.replace(",", "", regex=False)
+        .str.strip()
+        .replace("", "0")
     )
+    df["sales_qty"] = pd.to_numeric(df["sales_qty"], errors="coerce").fillna(0)
+
+    # year / week 분리
+    extracted = df["year_week"].str.extract(r"(?P<year>\d{4})-(?P<week>\d{1,2})")
+    df["year"] = pd.to_numeric(extracted["year"], errors="coerce")
+    df["week"] = pd.to_numeric(extracted["week"], errors="coerce")
+
+    df = df.dropna(subset=["year", "week"])
+    df["year"] = df["year"].astype(int)
+    df["week"] = df["week"].astype(int)
+
+    # 시즌 부여
+    df["season"] = df["week"].apply(get_season)
 
     return df
 
 
+# -------------------------------------------------
+# 7. 시즌 비중 계산 및 분류
+# -------------------------------------------------
+def make_classification_table(df: pd.DataFrame) -> pd.DataFrame:
+    # 시즌별 판매량 합계
+    season_sum = (
+        df.groupby(["item_name", "season"], as_index=False)["sales_qty"]
+        .sum()
+    )
+
+    pivot = (
+        season_sum.pivot(index="item_name", columns="season", values="sales_qty")
+        .fillna(0)
+        .reset_index()
+    )
+
+    for col in ["SPRING", "SUMMER", "FALL", "WINTER"]:
+        if col not in pivot.columns:
+            pivot[col] = 0
+
+    pivot["TOTAL_QTY"] = (
+        pivot["SPRING"] + pivot["SUMMER"] + pivot["FALL"] + pivot["WINTER"]
+    )
+
+    # 0으로 나누기 방지
+    pivot["SPRING_RATIO"] = pivot["SPRING"] / pivot["TOTAL_QTY"].replace(0, pd.NA)
+    pivot["SUMMER_RATIO"] = pivot["SUMMER"] / pivot["TOTAL_QTY"].replace(0, pd.NA)
+    pivot["FALL_RATIO"] = pivot["FALL"] / pivot["TOTAL_QTY"].replace(0, pd.NA)
+    pivot["WINTER_RATIO"] = pivot["WINTER"] / pivot["TOTAL_QTY"].replace(0, pd.NA)
+
+    pivot = pivot.fillna(0)
+
+    pivot["CATEGORY"] = pivot.apply(classify_item, axis=1)
+
+    result = pivot[
+        [
+            "item_name",
+            "SPRING",
+            "SUMMER",
+            "FALL",
+            "WINTER",
+            "TOTAL_QTY",
+            "SPRING_RATIO",
+            "SUMMER_RATIO",
+            "FALL_RATIO",
+            "WINTER_RATIO",
+            "CATEGORY",
+        ]
+    ].copy()
+
+    # 퍼센트 보기 좋게
+    for col in ["SPRING_RATIO", "SUMMER_RATIO", "FALL_RATIO", "WINTER_RATIO"]:
+        result[col] = (result[col] * 100).round(1)
+
+    result = result.sort_values(["CATEGORY", "TOTAL_QTY"], ascending=[True, False])
+
+    return result
+
+
+# -------------------------------------------------
+# 8. 실행 영역
+# -------------------------------------------------
+data_source = st.radio(
+    "데이터 소스 선택",
+    ["DB에서 조회", "CSV 업로드"],
+    horizontal=True
+)
+
+raw_df = None
+
+if data_source == "DB에서 조회":
+    if st.button("DB 데이터 가져오기"):
+        try:
+            raw_df = load_data_from_db()
+            st.success("DB 데이터를 불러왔습니다.")
+        except Exception as e:
+            st.error(f"DB 조회 중 오류가 발생했습니다: {e}")
+
+else:
+    uploaded_file = st.file_uploader("CSV 파일 업로드", type=["csv"])
+    if uploaded_file is not None:
+        try:
+            temp_df = pd.read_csv(uploaded_file)
+
+            # CSV가 가로형이면 변환
+            if temp_df.shape[1] > 3 and "year_week" not in temp_df.columns:
+                temp_df = convert_wide_to_long(temp_df)
+
+            raw_df = temp_df
+            st.success("파일을 불러왔습니다.")
+        except Exception as e:
+            st.error(f"파일 처리 중 오류가 발생했습니다: {e}")
+
+if raw_df is not None:
+    try:
+        df = preprocess_data(raw_df)
+        result_df = make_classification_table(df)
+
+        st.subheader("분류 결과")
+        st.dataframe(result_df, use_container_width=True)
+
+        st.subheader("분류별 건수")
+        summary_df = (
+            result_df.groupby("CATEGORY", as_index=False)
+            .agg(
+                item_count=("item_name", "count"),
+                total_qty=("TOTAL_QTY", "sum")
+            )
+            .sort_values("item_count", ascending=False)
+        )
+        st.dataframe(summary_df, use_container_width=True)
+
+        # 상세 조회
+        st.subheader("아이템 상세 조회")
+        item_list = result_df["item_name"].dropna().unique().tolist()
+        selected_item = st.selectbox("아이템 선택", item_list)
+
+        item_detail = result_df[result_df["item_name"] == selected_item]
+        st.dataframe(item_detail, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"분류 처리 중 오류가 발생했습니다: {e}")
