@@ -45,7 +45,6 @@ def get_gspread_client():
 
     raise ValueError(
         "구글 서비스 계정 정보가 없습니다. "
-        "st.secrets['gcp_service_account'] 또는 GOOGLE_SERVICE_ACCOUNT_JSON을 설정하세요."
     )
 
 
