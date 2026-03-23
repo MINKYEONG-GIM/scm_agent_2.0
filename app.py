@@ -83,471 +83,687 @@ def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
     return pd.DataFrame(values)
 
 
-def normalize_source_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    시트 컬럼명을 PLC 파이프라인 표준명으로 정규화합니다.
-    - 공백/개행 제거
-    - 흔한 별칭을 표준 컬럼으로 매핑
-    """
-    out = df.copy()
+# =========================
+# 1) 기본 설정
+# =========================
+st.set_page_config(
+    page_title="아이템별 PLC 포인트 분석",
+    layout="wide",
+)
 
-    def _clean_col_name(v: str) -> str:
-        s = str(v)
-        # BOM/제로폭/개행/탭 제거 + 좌우 공백 정리
-        s = s.replace("\ufeff", "").replace("\u200b", "")
-        s = s.replace("\n", "").replace("\r", "").replace("\t", "")
-        return s.strip()
-
-    def _canonical(v: str) -> str:
-        s = _clean_col_name(v).lower()
-        # 표기 흔들림(공백/구분자) 제거
-        for ch in [" ", "_", "-", "/", "(", ")", "[", "]"]:
-            s = s.replace(ch, "")
-        return s
-
-    out.columns = [_clean_col_name(c) for c in out.columns]
-
-    alias_map = {
-        "아이템": ["아이템", "item", "품목", "상품", "스타일", "style_code", "style"],
-        "연도/주": ["연도/주", "year_week", "week", "주차", "similar_week", "연도주차"],
-        "외형매출": ["외형매출", "매출", "sales_amount", "gross_sales", "actual_sales", "net_sales"],
-        "정상가": ["정상가", "정가", "list_price", "original_price", "price"],
-        "판매수량": ["판매수량", "수량", "판매량", "qty", "sales_qty", "similar_forecast_qty"],
-    }
-
-    rename_dict = {}
-    normalized_lookup = {_canonical(c): c for c in out.columns}
-    for target, aliases in alias_map.items():
-        if target in out.columns:
-            continue
-        for alias in aliases:
-            key = _canonical(alias)
-            if key in normalized_lookup:
-                rename_dict[normalized_lookup[key]] = target
-                break
-
-    if rename_dict:
-        out = out.rename(columns=rename_dict)
-
-    return out
-
-
-def infer_and_rename_week_column(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    연도/주 컬럼명이 비정형일 때 값 패턴(YYYY-WW)으로 주차 컬럼을 추론합니다.
-    """
-    out = df.copy()
-    if "연도/주" in out.columns:
-        return out
-
-    week_pattern = re.compile(r"^\s*\d{4}\s*-\s*\d{1,2}\s*$")
-
-    best_col = None
-    best_hits = 0
-    for col in out.columns:
-        s = out[col].astype(str).str.strip()
-        hits = s.map(lambda x: bool(week_pattern.match(x))).sum()
-        if hits > best_hits:
-            best_hits = hits
-            best_col = col
-
-    # 최소 2개 이상 주차 패턴이 확인되면 주차 컬럼으로 간주
-    if best_col is not None and best_hits >= 2:
-        out = out.rename(columns={best_col: "연도/주"})
-    return out
-
-
-def convert_wide_weekly_to_long(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    wide 포맷(연도/주 + 아이템별 컬럼)을 long 포맷으로 변환합니다.
-    예)
-    연도/주 | 가디건 | 가방 ...
-    ->
-    연도/주 | 아이템 | 판매수량 | 외형매출 | 정상가
-    """
-    out = infer_and_rename_week_column(df.copy())
-    if "연도/주" not in out.columns:
-        return out
-
-    id_candidates = ["연도/주", "채널", "year", "week", "yearweek_num"]
-    id_vars = [c for c in id_candidates if c in out.columns]
-
-    value_vars = [c for c in out.columns if c not in id_vars]
-    if not value_vars:
-        return out
-
-    melted = out.melt(
-        id_vars=id_vars,
-        value_vars=value_vars,
-        var_name="아이템",
-        value_name="판매수량",
-    )
-
-    melted["아이템"] = melted["아이템"].astype(str).str.strip()
-    melted["판매수량"] = (
-        melted["판매수량"]
-        .astype(str)
-        .str.replace(",", "", regex=False)
-        .str.replace("₩", "", regex=False)
-        .str.strip()
-    )
-    melted["판매수량"] = pd.to_numeric(melted["판매수량"], errors="coerce").fillna(0)
-    melted = melted[melted["판매수량"] > 0].copy()
-
-    # 수량 기반 원천데이터인 경우, 기존 파이프라인 호환을 위해 기본값 구성
-    melted["외형매출"] = melted["판매수량"]
-    melted["정상가"] = melted["판매수량"]
-
-    return melted
+st.title("아이템별 PLC 포인트 분석")
+st.caption("구글시트 기반으로 아이템별 주차 판매 흐름을 분석하고 PLC 단계를 자동 분류합니다.")
 
 
 # =========================
-# 2) PLC 분류 함수
+# 2) 설정값
 # =========================
-def prepare_weekly_item_data(df: pd.DataFrame) -> pd.DataFrame:
-    data = normalize_source_columns(df)
-    data = infer_and_rename_week_column(data)
+INTRO_WEEKS = 3
+GROWTH_MIN_RATIO = 0.35
+GROWTH_MAX_RATIO = 0.85
+MATURE_RATIO = 0.85
+DECLINE_RATIO = 0.70
+HIGH_DISCOUNT_RATIO = 0.30
 
-    required_cols = ["아이템", "연도/주", "외형매출", "정상가", "판매수량"]
-    missing_cols = [col for col in required_cols if col not in data.columns]
+ROLLING_WINDOW = 3  # 최근 흐름 판단용
+LOCAL_PEAK_WINDOW = 1  # 앞/뒤 1주 비교
 
-    # wide 포맷 자동 감지: 연도/주 + 다수 아이템 컬럼
-    if missing_cols and "연도/주" in data.columns and "아이템" not in data.columns and "판매수량" not in data.columns:
-        data = convert_wide_weekly_to_long(data)
-        data = normalize_source_columns(data)
-        data = infer_and_rename_week_column(data)
-        missing_cols = [col for col in required_cols if col not in data.columns]
 
-    if missing_cols:
-        current_cols = [str(c) for c in data.columns]
-        raise ValueError(
-            f"필수 컬럼이 없습니다: {missing_cols} / 현재 컬럼: {current_cols}"
-        )
+# =========================
+# 3) 유틸 함수
+# =========================
+def parse_year_week(value: str) -> Tuple[Optional[int], Optional[int]]:
+    """
+    '2025-01', '2025/01', '202501' 같은 값을 year, week로 변환
+    """
+    if pd.isna(value):
+        return None, None
 
-    for col in ["외형매출", "정상가", "판매수량"]:
-        data[col] = (
-            data[col]
-            .astype(str)
-            .str.replace(",", "", regex=False)
-            .str.strip()
-        )
-        data[col] = pd.to_numeric(data[col], errors="coerce").fillna(0)
+    text = str(value).strip()
 
-    # 판매 흐름 분석용이므로 판매수량 0 초과만 사용
-    data = data[data["판매수량"] > 0].copy()
+    # 2025-01 / 2025/01 / 2025_01
+    m = re.match(r"^(\d{4})[-/_]?(\d{1,2})$", text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
 
-    # 연도/주 분리
-    data[["year", "week"]] = data["연도/주"].str.split("-", expand=True)
-    data["year"] = pd.to_numeric(data["year"], errors="coerce")
-    data["week"] = pd.to_numeric(data["week"], errors="coerce")
-    data["yearweek_num"] = data["year"] * 100 + data["week"]
+    # 혹시 숫자만 있는 경우
+    m = re.match(r"^(\d{4})(\d{2})$", text)
+    if m:
+        return int(m.group(1)), int(m.group(2))
 
-    # 아이템-주차 단위 집계
-    weekly = (
-        data.groupby(["아이템", "연도/주", "year", "week", "yearweek_num"], as_index=False)
-        .agg({
-            "외형매출": "sum",
-            "정상가": "sum",
-            "판매수량": "sum"
-        })
-        .sort_values(["아이템", "yearweek_num"])
-        .reset_index(drop=True)
+    return None, None
+
+
+def yearweek_to_sort_key(year_week: str) -> int:
+    year, week = parse_year_week(year_week)
+    if year is None or week is None:
+        return 99999999
+    return year * 100 + week
+
+
+def safe_to_numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        series.astype(str).str.replace(",", "", regex=False).str.strip(),
+        errors="coerce"
     )
 
-    # 할인율 계산
-    weekly["할인율"] = np.where(
-        weekly["정상가"] > 0,
-        1 - (weekly["외형매출"] / weekly["정상가"]),
-        0
+
+def calc_discount_rate(gross_sales: pd.Series, full_price_sales: pd.Series) -> pd.Series:
+    """
+    할인율 = 1 - (외형매출 / 정상가)
+    정상가가 0이거나 없으면 NaN 처리
+    """
+    denom = full_price_sales.replace(0, np.nan)
+    discount = 1 - (gross_sales / denom)
+    return discount.clip(lower=0, upper=1)
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    컬럼명 앞뒤 공백 제거
+    """
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def infer_sheet_format(df: pd.DataFrame) -> str:
+    """
+    wide:
+      연도/주, 가디건, 가방, ...
+    long:
+      item, 연도/주, 판매수량, 외형매출, 정상가 등
+    """
+    cols = set(df.columns)
+
+    if "연도/주" in cols and len(cols) >= 2:
+        # long 판단용 후보
+        long_keywords = {"아이템", "item", "판매수량", "외형매출", "정상가"}
+        if len(cols.intersection(long_keywords)) >= 2:
+            return "long"
+        return "wide"
+
+    return "unknown"
+
+
+def convert_wide_to_long(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    예시처럼 가로형 데이터:
+    연도/주 | 가디건 | 가방 | ...
+    를
+    연도/주 | item | 판매수량
+    형태로 변환
+    """
+    if "연도/주" not in df.columns:
+        raise ValueError("wide 형식 시트에는 '연도/주' 컬럼이 있어야 합니다.")
+
+    value_cols = [c for c in df.columns if c != "연도/주"]
+
+    long_df = df.melt(
+        id_vars=["연도/주"],
+        value_vars=value_cols,
+        var_name="item",
+        value_name="판매수량"
     )
-    weekly["할인율"] = weekly["할인율"].clip(lower=0, upper=1)
 
-    return weekly
+    long_df["판매수량"] = safe_to_numeric(long_df["판매수량"])
+    long_df = long_df.dropna(subset=["판매수량"])
+    long_df = long_df[long_df["item"].astype(str).str.strip() != ""]
+
+    return long_df
 
 
-def classify_plc_by_item(
-    item_df: pd.DataFrame,
-    intro_weeks: int = 3,
-    decline_discount_threshold: float = 0.30
-) -> pd.DataFrame:
-    g = item_df.sort_values("yearweek_num").copy().reset_index(drop=True)
+def standardize_long_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    long 형식 데이터를 내부 표준 컬럼으로 맞춤
+    내부 표준:
+    - year_week
+    - item
+    - qty
+    - gross_sales (optional)
+    - full_price_sales (optional)
+    """
+    df = df.copy()
 
-    # 이동평균 판매량
-    g["판매수량_ma"] = g["판매수량"].rolling(window=3, min_periods=1).mean()
+    col_map = {}
+    for c in df.columns:
+        c_strip = str(c).strip()
+        if c_strip == "연도/주":
+            col_map[c] = "year_week"
+        elif c_strip.lower() == "item" or c_strip == "아이템":
+            col_map[c] = "item"
+        elif c_strip == "판매수량":
+            col_map[c] = "qty"
+        elif c_strip == "외형매출":
+            col_map[c] = "gross_sales"
+        elif c_strip == "정상가":
+            col_map[c] = "full_price_sales"
 
-    # 이전/다음 주
-    g["prev_ma"] = g["판매수량_ma"].shift(1)
-    g["next_ma"] = g["판매수량_ma"].shift(-1)
+    df = df.rename(columns=col_map)
 
-    g["prev_ma"] = g["prev_ma"].fillna(g["판매수량_ma"])
-    g["next_ma"] = g["next_ma"].fillna(g["판매수량_ma"])
+    required = {"year_week", "item", "qty"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"필수 컬럼이 없습니다: {sorted(list(missing))}")
 
-    # 판매 시작 후 몇 번째 주인지
-    g["판매주차순번"] = np.arange(1, len(g) + 1)
+    df["qty"] = safe_to_numeric(df["qty"])
+    if "gross_sales" in df.columns:
+        df["gross_sales"] = safe_to_numeric(df["gross_sales"])
+    if "full_price_sales" in df.columns:
+        df["full_price_sales"] = safe_to_numeric(df["full_price_sales"])
 
-    # 최고점
-    peak_idx = g["판매수량_ma"].idxmax()
-    peak_value = g.loc[peak_idx, "판매수량_ma"]
+    df = df.dropna(subset=["year_week", "item", "qty"])
+    df["item"] = df["item"].astype(str).str.strip()
 
-    if peak_value == 0:
-        g["peak_ratio"] = 0
+    year_week_info = df["year_week"].apply(parse_year_week)
+    df["year"] = year_week_info.apply(lambda x: x[0])
+    df["week"] = year_week_info.apply(lambda x: x[1])
+    df["sort_key"] = df["year_week"].astype(str).apply(yearweek_to_sort_key)
+
+    if "gross_sales" in df.columns and "full_price_sales" in df.columns:
+        df["discount_rate"] = calc_discount_rate(df["gross_sales"], df["full_price_sales"])
     else:
-        g["peak_ratio"] = g["판매수량_ma"] / peak_value
+        df["discount_rate"] = np.nan
 
-    # 증가율
-    g["growth_rate"] = np.where(
-        g["prev_ma"] > 0,
-        (g["판매수량_ma"] - g["prev_ma"]) / g["prev_ma"],
-        0
+    return df
+
+
+def prepare_data(raw_df: pd.DataFrame) -> pd.DataFrame:
+    raw_df = normalize_columns(raw_df)
+    sheet_format = infer_sheet_format(raw_df)
+
+    if sheet_format == "wide":
+        temp_df = convert_wide_to_long(raw_df)
+        temp_df = temp_df.rename(columns={
+            "연도/주": "year_week",
+            "판매수량": "qty"
+        })
+
+        year_week_info = temp_df["year_week"].apply(parse_year_week)
+        temp_df["year"] = year_week_info.apply(lambda x: x[0])
+        temp_df["week"] = year_week_info.apply(lambda x: x[1])
+        temp_df["sort_key"] = temp_df["year_week"].astype(str).apply(yearweek_to_sort_key)
+        temp_df["discount_rate"] = np.nan
+
+        return temp_df
+
+    if sheet_format == "long":
+        return standardize_long_columns(raw_df)
+
+    raise ValueError(
+        "시트 형식을 인식하지 못했습니다. "
+        "현재 지원 형식은 1) 연도/주 + 아이템별 컬럼(wide) 또는 "
+        "2) 연도/주, 아이템, 판매수량 기반(long) 입니다."
     )
 
-    # 최고점 이후 여부
-    g["is_after_peak"] = g.index > peak_idx
 
-    plc_list = []
+def is_local_peak(series: pd.Series, idx: int, window: int = 1) -> bool:
+    """
+    주변 주차보다 뚜렷하게 높은 local peak 판단
+    """
+    current = series.iloc[idx]
+    start = max(0, idx - window)
+    end = min(len(series), idx + window + 1)
 
-    for idx, row in g.iterrows():
-        stage = None
+    neighbors = series.iloc[start:end].copy()
+    neighbors = neighbors.drop(series.index[idx], errors="ignore")
 
-        # 변곡점(최고점)
-        if idx == peak_idx:
-            stage = "변곡점"
+    if len(neighbors) == 0:
+        return False
 
-        # 도입
-        elif (
-            row["판매주차순번"] <= intro_weeks and
-            row["peak_ratio"] < 0.35
-        ):
-            stage = "도입"
-
-        # 쇠퇴
-        elif (
-            row["is_after_peak"] and
-            row["growth_rate"] < -0.05 and
-            (
-                row["peak_ratio"] < 0.70 or
-                row["할인율"] >= decline_discount_threshold
-            )
-        ):
-            stage = "쇠퇴"
-
-        # 성숙
-        elif (
-            row["peak_ratio"] >= 0.85 and
-            abs(row["growth_rate"]) <= 0.10
-        ):
-            stage = "성숙"
-
-        # 성장
-        elif (
-            (not row["is_after_peak"]) and
-            row["peak_ratio"] >= 0.35 and
-            row["growth_rate"] > 0.05
-        ):
-            stage = "성장"
-
-        # 보정 규칙
-        else:
-            if not row["is_after_peak"]:
-                if row["peak_ratio"] < 0.35:
-                    stage = "도입"
-                elif row["peak_ratio"] < 0.85:
-                    stage = "성장"
-                else:
-                    stage = "성숙"
-            else:
-                if row["peak_ratio"] >= 0.70 and row["할인율"] < decline_discount_threshold:
-                    stage = "성숙"
-                else:
-                    stage = "쇠퇴"
-
-        plc_list.append(stage)
-
-    g["plc"] = plc_list
-    return g
+    return current > neighbors.max()
 
 
-def run_plc_classification(
-    df: pd.DataFrame,
-    intro_weeks: int = 3,
-    decline_discount_threshold: float = 0.30
-) -> pd.DataFrame:
-    weekly = prepare_weekly_item_data(df)
+def get_recent_slope(values: pd.Series, window: int = 3) -> float:
+    """
+    최근 흐름 단순 기울기
+    예: 최근 3개 값 기준으로 증가/감소 판단
+    """
+    s = values.dropna()
+    if len(s) < 2:
+        return 0.0
 
-    result = (
-        weekly.groupby("아이템", group_keys=False)
-        .apply(
-            lambda x: classify_plc_by_item(
-                x,
-                intro_weeks=intro_weeks,
-                decline_discount_threshold=decline_discount_threshold
-            )
+    s = s.iloc[-window:]
+    x = np.arange(len(s))
+    y = s.values.astype(float)
+
+    if len(y) < 2:
+        return 0.0
+
+    slope = np.polyfit(x, y, 1)[0]
+    return float(slope)
+
+
+def classify_plc_stage(
+    idx: int,
+    qty_series: pd.Series,
+    discount_series: Optional[pd.Series] = None
+) -> str:
+    """
+    사용자가 제시한 기준에 맞춰 주차별 PLC 단계 분류
+    우선순위:
+    1) 변곡점(최고점)
+    2) 쇠퇴
+    3) 성숙
+    4) 성장
+    5) 도입
+    """
+
+    current_qty = qty_series.iloc[idx]
+    if pd.isna(current_qty):
+        return "판단불가"
+
+    max_qty = qty_series.max()
+    if max_qty <= 0 or pd.isna(max_qty):
+        return "판단불가"
+
+    ratio_to_peak = current_qty / max_qty
+    peak_idx = int(qty_series.values.argmax())
+    recent_series = qty_series.iloc[max(0, idx - ROLLING_WINDOW + 1): idx + 1]
+    recent_slope = get_recent_slope(recent_series, window=ROLLING_WINDOW)
+
+    discount = np.nan
+    if discount_series is not None and len(discount_series) > idx:
+        discount = discount_series.iloc[idx]
+
+    # 판매 시작 후 첫 3주 계산
+    non_zero_idx = np.where(qty_series.fillna(0).values > 0)[0]
+    if len(non_zero_idx) > 0:
+        start_idx = non_zero_idx[0]
+        weeks_since_start = idx - start_idx + 1
+    else:
+        start_idx = idx
+        weeks_since_start = 999
+
+    # local peak 여부
+    local_peak = is_local_peak(qty_series.fillna(0), idx, window=LOCAL_PEAK_WINDOW)
+
+    # 1) 변곡점(최고점)
+    if idx == peak_idx or local_peak:
+        return "변곡점(최고점)"
+
+    # 2) 쇠퇴
+    # - 최고점 이후
+    # - 최고점 대비 70% 미만
+    # - 최근 기울기 음수
+    # - 평균 할인율 30% 이상이면서 하락 중
+    if idx > peak_idx:
+        if (ratio_to_peak < DECLINE_RATIO and recent_slope < 0):
+            return "쇠퇴"
+
+        if (not pd.isna(discount)) and (discount >= HIGH_DISCOUNT_RATIO) and (recent_slope < 0):
+            return "쇠퇴"
+
+    # 3) 성숙
+    # - 최고점 부근
+    # - 최고 판매량 대비 85% 이상
+    # - 최근 증감률이 크지 않음
+    # 최근 기울기가 거의 0에 가까우면 유지라고 판단
+    if ratio_to_peak >= MATURE_RATIO:
+        if abs(recent_slope) <= max_qty * 0.05:
+            return "성숙"
+        # 피크 부근이면 기울기가 조금 있어도 성숙 처리 가능
+        return "성숙"
+
+    # 4) 성장
+    # - 최고점 이전
+    # - 35% 이상 ~ 85% 미만
+    # - 증가 중
+    if idx < peak_idx:
+        if (GROWTH_MIN_RATIO <= ratio_to_peak < GROWTH_MAX_RATIO) and (recent_slope > 0):
+            return "성장"
+
+    # 5) 도입
+    # - 판매 시작 후 첫 3주
+    # - 최고 판매량 대비 35% 미만
+    # - 완만 증가
+    if weeks_since_start <= INTRO_WEEKS:
+        return "도입"
+
+    if ratio_to_peak < GROWTH_MIN_RATIO and recent_slope >= 0:
+        return "도입"
+
+    # 남는 경우 보정
+    # 피크 이전이면 성장, 이후면 쇠퇴 쪽으로 보정
+    if idx < peak_idx:
+        return "성장"
+    elif idx > peak_idx:
+        return "쇠퇴"
+    else:
+        return "성숙"
+
+
+def build_item_plc(item_df: pd.DataFrame) -> pd.DataFrame:
+    item_df = item_df.sort_values("sort_key").reset_index(drop=True).copy()
+
+    qty_series = item_df["qty"].fillna(0)
+    discount_series = item_df["discount_rate"] if "discount_rate" in item_df.columns else pd.Series([np.nan] * len(item_df))
+
+    item_df["peak_qty"] = qty_series.max()
+    item_df["ratio_to_peak"] = np.where(item_df["peak_qty"] > 0, item_df["qty"] / item_df["peak_qty"], np.nan)
+
+    item_df["recent_slope"] = [
+        get_recent_slope(qty_series.iloc[max(0, i - ROLLING_WINDOW + 1): i + 1], window=ROLLING_WINDOW)
+        for i in range(len(item_df))
+    ]
+
+    item_df["plc_stage"] = [
+        classify_plc_stage(i, qty_series, discount_series)
+        for i in range(len(item_df))
+    ]
+
+    peak_idx = int(qty_series.values.argmax()) if len(qty_series) > 0 else None
+    item_df["is_peak_week"] = False
+    if peak_idx is not None:
+        item_df.loc[peak_idx, "is_peak_week"] = True
+
+    return item_df
+
+
+def summarize_latest_status(all_plc_df: pd.DataFrame) -> pd.DataFrame:
+    latest_df = (
+        all_plc_df.sort_values(["item", "sort_key"])
+        .groupby("item", as_index=False)
+        .tail(1)
+        .copy()
+    )
+
+    latest_df = latest_df.rename(columns={
+        "year_week": "최신주차",
+        "qty": "최신판매수량",
+        "peak_qty": "최고판매수량",
+        "ratio_to_peak": "최고점대비비율",
+        "discount_rate": "최신할인율",
+        "plc_stage": "현재PLC"
+    })
+
+    cols = ["item", "최신주차", "최신판매수량", "최고판매수량", "최고점대비비율", "최신할인율", "현재PLC"]
+    existing_cols = [c for c in cols if c in latest_df.columns]
+    latest_df = latest_df[existing_cols].sort_values("item").reset_index(drop=True)
+
+    return latest_df
+
+
+def make_stage_reason(row: pd.Series) -> str:
+    stage = row.get("plc_stage", "")
+    qty = row.get("qty", np.nan)
+    peak = row.get("peak_qty", np.nan)
+    ratio = row.get("ratio_to_peak", np.nan)
+    slope = row.get("recent_slope", np.nan)
+    discount = row.get("discount_rate", np.nan)
+
+    ratio_pct = f"{ratio * 100:.1f}%" if pd.notna(ratio) else "-"
+    discount_pct = f"{discount * 100:.1f}%" if pd.notna(discount) else "-"
+
+    if stage == "도입":
+        return (
+            f"판매 시작 초기 구간으로 판단했습니다. "
+            f"현재 판매수량은 {qty:.0f}, 최고점 대비 {ratio_pct} 수준입니다. "
+            f"최근 흐름은 완만한 증가로 보고 도입 단계로 분류했습니다."
         )
-        .reset_index(drop=True)
-    )
+    elif stage == "성장":
+        return (
+            f"최고점 이전 상승 구간으로 판단했습니다. "
+            f"현재 판매수량은 {qty:.0f}, 최고점 대비 {ratio_pct} 수준이며 "
+            f"최근 흐름이 증가 중이어서 성장 단계로 분류했습니다."
+        )
+    elif stage == "성숙":
+        return (
+            f"최고점 부근의 유지 구간으로 판단했습니다. "
+            f"현재 판매수량은 {qty:.0f}, 최고점 대비 {ratio_pct} 수준입니다. "
+            f"잘 팔리는 수준이 유지되고 있어 성숙 단계로 분류했습니다."
+        )
+    elif stage == "변곡점(최고점)":
+        return (
+            f"해당 주차가 전체 기간 중 최고 판매량이거나 주변 주차보다 뚜렷하게 높은 구간입니다. "
+            f"현재 판매수량은 {qty:.0f}이며 정점 주차로 판단했습니다."
+        )
+    elif stage == "쇠퇴":
+        return (
+            f"최고점 이후 하락 구간으로 판단했습니다. "
+            f"현재 판매수량은 {qty:.0f}, 최고점 대비 {ratio_pct} 수준입니다. "
+            f"최근 흐름이 하락 중이며 할인율은 {discount_pct}입니다."
+        )
+    else:
+        return "현재 데이터만으로 단계 판단이 어렵습니다."
 
-    return result
 
-
-# =========================
-# 3) 그래프 함수
-# =========================
-PLC_COLOR_MAP = {
-    "도입": "#1f77b4",     # 파랑
-    "성장": "#2ca02c",     # 초록
-    "성숙": "#ff7f0e",     # 주황
-    "변곡점": "#d62728",   # 빨강
-    "쇠퇴": "#9467bd",     # 보라
-}
-
-
-def make_plc_chart(plot_df: pd.DataFrame, selected_item: str) -> go.Figure:
+def draw_item_chart(item_df: pd.DataFrame, item_name: str) -> go.Figure:
     fig = go.Figure()
 
-    # 전체 매출 추이 선
     fig.add_trace(
         go.Scatter(
-            x=plot_df["연도/주"],
-            y=plot_df["외형매출"],
-            mode="lines",
-            name="전체 매출 추이",
-            line=dict(color="#6b7280", width=3),
-            hovertemplate=(
-                "<b>%{x}</b><br>"
-                "매출: %{y:,.0f}<extra></extra>"
-            )
+            x=item_df["year_week"],
+            y=item_df["qty"],
+            mode="lines+markers",
+            name="판매수량",
         )
     )
 
-    # PLC 단계별 점
-    plc_order = ["도입", "성장", "성숙", "변곡점", "쇠퇴"]
-
-    for plc_stage in plc_order:
-        stage_df = plot_df[plot_df["plc"] == plc_stage].copy()
-
-        if stage_df.empty:
-            continue
-
+    # 최고점 표시
+    peak_rows = item_df[item_df["is_peak_week"] == True]
+    if len(peak_rows) > 0:
         fig.add_trace(
             go.Scatter(
-                x=stage_df["연도/주"],
-                y=stage_df["외형매출"],
-                mode="markers",
-                name=plc_stage,
-                marker=dict(
-                    size=11,
-                    color=PLC_COLOR_MAP[plc_stage],
-                    line=dict(color="white", width=1)
-                ),
-                hovertemplate=(
-                    "<b>%{x}</b><br>"
-                    f"PLC: {plc_stage}<br>"
-                    "매출: %{y:,.0f}<br>"
-                    "판매수량: %{customdata[0]:,.0f}<br>"
-                    "할인율: %{customdata[1]:.1%}"
-                    "<extra></extra>"
-                ),
-                customdata=stage_df[["판매수량", "할인율"]].values
+                x=peak_rows["year_week"],
+                y=peak_rows["qty"],
+                mode="markers+text",
+                name="변곡점(최고점)",
+                text=["최고점"],
+                textposition="top center",
+                marker=dict(size=12, symbol="diamond"),
             )
         )
 
     fig.update_layout(
-        title=f"{selected_item} 주차별 매출 추이 및 PLC 단계",
+        title=f"{item_name} 주차별 판매수량 흐름",
         xaxis_title="연도/주",
-        yaxis_title="외형매출",
+        yaxis_title="판매수량",
         hovermode="x unified",
-        legend_title="PLC 단계",
-        height=550
+        height=480
     )
-
-    fig.update_xaxes(type="category")
-
     return fig
 
 
 # =========================
-# 4) 데이터 불러오기
+# 4) 구글시트 읽기
 # =========================
-try:
-    sheets_cfg = get_sheets_config()
-    worksheet_name = sheets_cfg.get("worksheet") or "forecast_base"
-    raw_df = load_sheet_as_df(worksheet_name)
-    raw_df = normalize_source_columns(raw_df)
-    st.caption(f"데이터 소스: Google Sheets / 워크시트 `{worksheet_name}`")
-except Exception as e:
-    st.error("구글시트 데이터 로드 중 오류가 발생했습니다.")
-    st.exception(e)
-    st.stop()
+@st.cache_data(ttl=300)
+def load_sheet_data() -> pd.DataFrame:
+    """
+    secrets 예시
+    [sheets]
+    SHEET_URL = "https://docs.google.com/spreadsheets/d/1IlJxe4ocFeNODRxMxpgtHA1xKC-Xn5-YvRsaHciUfLw"
+    WORKSHEET_NAME = "plc db"
+    """
+    if "sheets" not in st.secrets:
+        raise ValueError("Streamlit secrets에 [sheets] 설정이 없습니다.")
 
-# =========================
-# 5) PLC 계산
-# =========================
-with st.spinner("PLC 단계 계산 중입니다..."):
-    result_df = run_plc_classification(raw_df)
+    sheet_url = st.secrets["sheets"]["SHEET_URL"]
+    worksheet_name = st.secrets["sheets"]["WORKSHEET_NAME"]
 
-if result_df.empty:
-    st.warning("분석할 데이터가 없습니다. 판매수량과 필수 컬럼을 확인하세요.")
-    st.stop()
+    if GSheetsConnection is None:
+        raise ImportError(
+            "streamlit_gsheets 패키지가 없습니다. "
+            "requirements.txt에 streamlit-gsheets 를 추가하세요."
+        )
 
-# =========================
-# 6) 아이템 선택
-# =========================
-item_list = sorted(result_df["아이템"].dropna().unique().tolist())
+    conn = st.connection("gsheets", type=GSheetsConnection)
 
-selected_item = st.selectbox("아이템 선택", item_list)
-
-item_df = (
-    result_df[result_df["아이템"] == selected_item]
-    .sort_values("yearweek_num")
-    .copy()
-)
-
-# =========================
-# 7) 요약 정보
-# =========================
-latest_row = item_df.iloc[-1]
-peak_row = item_df.loc[item_df["외형매출"].idxmax()]
-
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric("현재 PLC", latest_row["plc"])
-col2.metric("최근 주차", latest_row["연도/주"])
-col3.metric("최근 매출", f"{latest_row['외형매출']:,.0f}")
-col4.metric("최고 매출 주차", peak_row["연도/주"])
-
-# =========================
-# 8) 그래프
-# =========================
-fig = make_plc_chart(item_df, selected_item)
-st.plotly_chart(fig, use_container_width=True)
-
-# =========================
-# 9) PLC 단계 설명
-# =========================
-with st.expander("PLC 단계 기준 보기"):
-    st.markdown(
-        """
-        - **도입**: 판매 시작 후 초기 구간이며 최고점 대비 낮은 수준
-        - **성장**: 최고점 이전 구간에서 판매가 증가하는 단계
-        - **성숙**: 최고점 부근에서 높은 판매 수준이 유지되는 단계
-        - **변곡점**: 전체 기간 중 최고 판매 수준의 주차
-        - **쇠퇴**: 최고점 이후 판매 하락 또는 할인율 상승이 나타나는 단계
-        """
+    df = conn.read(
+        spreadsheet=sheet_url,
+        worksheet=worksheet_name,
+        usecols=None,
+        ttl=300
     )
 
+    if df is None or df.empty:
+        raise ValueError("구글시트에서 데이터를 읽어오지 못했습니다.")
+
+    return pd.DataFrame(df)
+
+
 # =========================
-# 10) 테이블
+# 5) 데이터 처리
 # =========================
-st.subheader("주차별 PLC 결과")
+try:
+    raw_df = load_sheet_data()
+    st.success("구글시트 데이터를 불러왔습니다.")
 
-show_cols = [
-    "아이템", "연도/주", "외형매출", "판매수량",
-    "할인율", "판매수량_ma", "peak_ratio", "growth_rate", "plc"
-]
+    with st.expander("원본 데이터 미리보기", expanded=False):
+        st.dataframe(raw_df.head(20), use_container_width=True)
 
-table_df = item_df[show_cols].copy()
-table_df["할인율"] = table_df["할인율"].map(lambda x: f"{x:.1%}")
-table_df["peak_ratio"] = table_df["peak_ratio"].map(lambda x: f"{x:.1%}")
-table_df["growth_rate"] = table_df["growth_rate"].map(lambda x: f"{x:.1%}")
+    prepared_df = prepare_data(raw_df)
 
-st.dataframe(table_df, use_container_width=True)
+    # item별 PLC 계산
+    item_result_list: List[pd.DataFrame] = []
+    for item_name, g in prepared_df.groupby("item"):
+        item_plc_df = build_item_plc(g)
+        item_result_list.append(item_plc_df)
+
+    if not item_result_list:
+        st.error("분석 가능한 아이템 데이터가 없습니다.")
+        st.stop()
+
+    plc_df = pd.concat(item_result_list, ignore_index=True)
+
+except Exception as e:
+    st.error(f"오류 발생: {e}")
+    st.stop()
+
+
+# =========================
+# 6) 상단 요약
+# =========================
+latest_summary_df = summarize_latest_status(plc_df)
+
+st.subheader("아이템별 현재 PLC 요약")
+
+col1, col2 = st.columns([2, 1])
+with col1:
+    keyword = st.text_input("아이템 검색", value="")
+with col2:
+    stage_filter = st.multiselect(
+        "현재 PLC 필터",
+        options=sorted(latest_summary_df["현재PLC"].dropna().unique().tolist()),
+        default=[]
+    )
+
+filtered_summary = latest_summary_df.copy()
+
+if keyword.strip():
+    filtered_summary = filtered_summary[
+        filtered_summary["item"].astype(str).str.contains(keyword.strip(), case=False, na=False)
+    ]
+
+if stage_filter:
+    filtered_summary = filtered_summary[
+        filtered_summary["현재PLC"].isin(stage_filter)
+    ]
+
+display_summary = filtered_summary.copy()
+if "최고점대비비율" in display_summary.columns:
+    display_summary["최고점대비비율"] = (display_summary["최고점대비비율"] * 100).round(1).astype(str) + "%"
+if "최신할인율" in display_summary.columns:
+    display_summary["최신할인율"] = np.where(
+        display_summary["최신할인율"].notna(),
+        (display_summary["최신할인율"] * 100).round(1).astype(str) + "%",
+        "-"
+    )
+
+st.dataframe(display_summary, use_container_width=True, hide_index=True)
+
+
+# =========================
+# 7) 상세 분석
+# =========================
+st.subheader("아이템 상세 분석")
+
+item_list = sorted(plc_df["item"].dropna().unique().tolist())
+selected_item = st.selectbox("아이템 선택", item_list)
+
+item_df = plc_df[plc_df["item"] == selected_item].sort_values("sort_key").reset_index(drop=True)
+
+if item_df.empty:
+    st.warning("선택한 아이템 데이터가 없습니다.")
+    st.stop()
+
+latest_row = item_df.iloc[-1]
+peak_row = item_df.loc[item_df["qty"].idxmax()]
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("현재 PLC", latest_row["plc_stage"])
+m2.metric("최신 판매수량", f"{latest_row['qty']:.0f}")
+m3.metric("최고 판매수량", f"{peak_row['qty']:.0f}")
+m4.metric("최고점 주차", str(peak_row["year_week"]))
+
+fig = draw_item_chart(item_df, selected_item)
+st.plotly_chart(fig, use_container_width=True)
+
+st.markdown("### 최신 주차 판단 근거")
+st.write(make_stage_reason(latest_row))
+
+with st.expander("주차별 상세 데이터", expanded=False):
+    detail_df = item_df.copy()
+    detail_df["ratio_to_peak"] = (detail_df["ratio_to_peak"] * 100).round(1)
+    if "discount_rate" in detail_df.columns:
+        detail_df["discount_rate"] = np.where(
+            detail_df["discount_rate"].notna(),
+            (detail_df["discount_rate"] * 100).round(1),
+            np.nan
+        )
+
+    show_cols = [
+        "year_week", "qty", "peak_qty", "ratio_to_peak",
+        "recent_slope", "discount_rate", "plc_stage"
+    ]
+    show_cols = [c for c in show_cols if c in detail_df.columns]
+    st.dataframe(detail_df[show_cols], use_container_width=True, hide_index=True)
+
+
+# =========================
+# 8) 기준 설명
+# =========================
+st.subheader("PLC 분류 기준")
+
+st.markdown(
+    """
+**도입**
+- 판매 시작 후 첫 3주 이내
+- 최고 판매량 대비 35% 미만
+- 최근 흐름이 완만하게 증가 중
+
+**성장**
+- 최고점 이전 구간
+- 최고 판매량 대비 35% 이상 ~ 85% 미만
+- 최근 판매량이 이전보다 증가 중
+
+**성숙**
+- 최고점 부근
+- 최고 판매량 대비 85% 이상
+- 최근 증감률이 크지 않음
+
+**변곡점(최고점)**
+- 전체 기간 중 가장 높은 판매량 주차
+- 또는 주변 주차보다 뚜렷하게 높은 local peak
+
+**쇠퇴**
+- 최고점 이후 구간
+- 최고점 대비 70% 미만
+- 최근 증감률 음수
+- 평균 할인율 30% 이상이면서 하락 중
+"""
+)
+
+st.markdown(
+    """
+**할인율 계산식**
+- 할인율 = 1 - (외형매출 / 정상가)
+
+예시:
+- 정상가 100,000
+- 외형매출 80,000
+- 할인율 = 1 - 80,000 / 100,000 = 0.2
+- 즉 20% 할인
+"""
+)
