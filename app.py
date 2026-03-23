@@ -22,6 +22,10 @@ HIGH_DISCOUNT_RATIO = 0.30
 # 비시즌 관련 수치
 OFF_SEASON_BASE_RATIO = 0.50  # 평균/중간값의 50% 이하
 OFF_SEASON_MIN_WEEKS = 6  # 너무 짧은 구간 제외, 길게 잡기
+OFF_SEASON_MEDIAN_RATIO = 0.60          # 전체 판매량 중간값의 60%
+OFF_SEASON_MA_WINDOW = 3                # 3주 이동평균
+OFF_SEASON_SLOPE_WINDOW = 3             # 3주 이상 완만
+OFF_SEASON_SLOPE_LIMIT_RATIO = 0.02     # peak의 2% 이하이면 완만
 OFF_SEASON_RECOVERY_RATIO = 0.60
 OFF_SEASON_PEAK_BUFFER = 2
 OFF_SEASON_SLOPE_LIMIT_RATIO = 0.03  # 최고점 대비 주차당 허용 기울기
@@ -281,77 +285,101 @@ def get_segment_slope(series: pd.Series) -> float:
     return float(np.polyfit(x, y, 1)[0])
 
 
-def get_off_season_threshold(df: pd.DataFrame, intro_end: int, peak_idx: int) -> float:
+def get_off_season_threshold(df: pd.DataFrame) -> float:
     """
-    비시즌 판정 기준값:
-    평균의 50%, 중간값의 50% 중 더 큰 값을 사용
+    비시즌 기준값:
+    전체 판매량 중간값의 60%
     """
-    base_series = df.loc[intro_end + 1:peak_idx - 1, "qty"].dropna()
+    base_series = df["qty"].dropna()
 
     if base_series.empty:
         return 0.0
 
-    avg_val = float(base_series.mean())
     median_val = float(base_series.median())
-
-    threshold_avg = avg_val * OFF_SEASON_BASE_RATIO
-    threshold_median = median_val * OFF_SEASON_BASE_RATIO
-
-    return max(threshold_avg, threshold_median)
-
-
+    return median_val * OFF_SEASON_MEDIAN_RATIO
 def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int, decline_start: int):
     """
-    비시즌 구간 찾기
-
+    비시즌 구간 찾기 - 수정 규칙
     목표:
     - 잠깐 꺼진 구간이 아니라
     - 오랫동안 팔리지 않는 중심 저판매 구간을 찾는다.
-
-    조건:
-    - 도입 이후 ~ peak 이전까지만 후보
-    - 판매량이 충분히 낮아야 함
-    - 최소 6주 이상 연속
-    - 기울기가 너무 가파르면 제외
-    - peak 직전 1~2주는 제외
+    1. 최저점을 반드시 포함
+    2. 3주 이동평균이 전체 판매량 중간값의 60%보다 낮아야 함
+    3. 3주 기울기가 완만해야 함
+    4. peak 이전/이후 모두 가능
+    5. 최소 6주 이상 연속
     """
     if df.empty:
         return []
 
     search_start = max(intro_end + 1, INTRO_WEEKS)
-    search_end = peak_idx - OFF_SEASON_PEAK_BUFFER - 1
+    search_end = len(df) - 1
 
     if search_start > search_end:
         return []
 
-    off_threshold = get_off_season_threshold(df, intro_end, peak_idx)
-    if off_threshold <= 0:
+    qty_series = df["qty"].dropna()
+    if qty_series.empty:
         return []
+
+    median_val = float(qty_series.median())
+    off_threshold = median_val * 0.60
 
     peak_qty = float(df["qty"].max()) if pd.notna(df["qty"].max()) else 0.0
     if peak_qty <= 0:
         return []
 
-    slope_limit = peak_qty * OFF_SEASON_SLOPE_LIMIT_RATIO
-    max_qty_limit = peak_qty * OFF_SEASON_MAX_RATIO_TO_PEAK
+    slope_limit = peak_qty * 0.02   # 완만 기준
+    min_weeks = 6
 
-    # 1) 후보 인덱스 추출
+    work_df = df.copy()
+
+    # 3주 이동평균
+    work_df["ma3"] = (
+        work_df["qty"]
+        .rolling(window=3, min_periods=3)
+        .mean()
+    )
+
+    # 3주 기울기
+    slopes = [np.nan] * len(work_df)
+    for i in range(2, len(work_df)):
+        seg = work_df.loc[i-2:i, "qty"].dropna()
+        if len(seg) == 3:
+            slopes[i] = get_segment_slope(seg)
+
+    work_df["slope3"] = slopes
+
+    # 전체 탐색 구간에서 최저점 찾기
+    min_qty = work_df.loc[search_start:search_end, "qty"].min()
+    min_idx_list = work_df.index[
+        (work_df.index >= search_start) &
+        (work_df.index <= search_end) &
+        (work_df["qty"] == min_qty)
+    ].tolist()
+
+    if not min_idx_list:
+        return []
+
     candidate_idx = []
 
     for i in range(search_start, search_end + 1):
-        qty = df.loc[i, "qty"]
+        ma3 = work_df.loc[i, "ma3"]
+        slope3 = work_df.loc[i, "slope3"]
 
-        if pd.isna(qty):
+        if pd.isna(ma3) or pd.isna(slope3):
             continue
 
-        # 기준 이하 + 최고점 대비 너무 높지 않아야 함
-        if qty <= off_threshold and qty <= max_qty_limit:
+        cond_low = ma3 < off_threshold
+        cond_flat = abs(slope3) <= slope_limit
+
+        if cond_low and cond_flat:
             candidate_idx.append(i)
 
     if not candidate_idx:
         return []
 
-    # 2) 연속 구간 묶기
+    # 연속 구간 묶기
     groups = []
     current_group = [candidate_idx[0]]
 
@@ -366,52 +394,38 @@ def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int, decl
     valid_groups = []
 
     for g in groups:
-        if len(g) < OFF_SEASON_MIN_WEEKS:
+        if len(g) < min_weeks:
             continue
 
-        segment_qty = df.loc[g, "qty"].dropna()
-        if segment_qty.empty:
+        # 최저점 포함 필수
+        if not any(min_idx in g for min_idx in min_idx_list):
             continue
 
-        avg_qty = float(segment_qty.mean())
-        max_qty = float(segment_qty.max())
-        min_qty = float(segment_qty.min())
-        segment_slope = get_segment_slope(segment_qty)
+        seg_qty = work_df.loc[g, "qty"].dropna()
+        seg_ma3 = work_df.loc[g, "ma3"].dropna()
+        seg_slope = work_df.loc[g, "slope3"].dropna()
 
-        # 너무 가파르게 오르거나 내리면 비시즌 아님
-        if abs(segment_slope) > slope_limit:
+        if seg_qty.empty or seg_ma3.empty or seg_slope.empty:
             continue
-
-        # 점수:
-        # 길수록 좋고, 평균이 낮을수록 좋고, 기울기가 작을수록 좋다
-        score = (
-            len(g) * 1000
-            - avg_qty
-            - abs(segment_slope) * 10
-        )
 
         valid_groups.append({
             "start": g[0],
             "end": g[-1],
             "length": len(g),
-            "avg_qty": avg_qty,
-            "max_qty": max_qty,
-            "min_qty": min_qty,
-            "slope": segment_slope,
-            "score": score
+            "avg_qty": float(seg_qty.mean()),
+            "avg_ma3": float(seg_ma3.mean()),
+            "avg_abs_slope": float(np.mean(np.abs(seg_slope)))
         })
 
     if not valid_groups:
         return []
 
-    # 가장 긴 저판매 유지 구간 우선
     best_group = sorted(
         valid_groups,
-        key=lambda x: (-x["length"], x["avg_qty"], abs(x["slope"]), x["start"])
+        key=lambda x: (-x["length"], x["avg_ma3"], x["avg_abs_slope"], x["start"])
     )[0]
 
     return [(best_group["start"], best_group["end"])]
-
 
 # =========================
 # 5. 핵심 PLC 로직
