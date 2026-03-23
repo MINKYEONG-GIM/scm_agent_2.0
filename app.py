@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -132,6 +133,31 @@ def normalize_source_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def infer_and_rename_week_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    연도/주 컬럼명이 비정형일 때 값 패턴(YYYY-WW)으로 주차 컬럼을 추론합니다.
+    """
+    out = df.copy()
+    if "연도/주" in out.columns:
+        return out
+
+    week_pattern = re.compile(r"^\s*\d{4}\s*-\s*\d{1,2}\s*$")
+
+    best_col = None
+    best_hits = 0
+    for col in out.columns:
+        s = out[col].astype(str).str.strip()
+        hits = s.map(lambda x: bool(week_pattern.match(x))).sum()
+        if hits > best_hits:
+            best_hits = hits
+            best_col = col
+
+    # 최소 2개 이상 주차 패턴이 확인되면 주차 컬럼으로 간주
+    if best_col is not None and best_hits >= 2:
+        out = out.rename(columns={best_col: "연도/주"})
+    return out
+
+
 def convert_wide_weekly_to_long(df: pd.DataFrame) -> pd.DataFrame:
     """
     wide 포맷(연도/주 + 아이템별 컬럼)을 long 포맷으로 변환합니다.
@@ -140,7 +166,7 @@ def convert_wide_weekly_to_long(df: pd.DataFrame) -> pd.DataFrame:
     ->
     연도/주 | 아이템 | 판매수량 | 외형매출 | 정상가
     """
-    out = df.copy()
+    out = infer_and_rename_week_column(df.copy())
     if "연도/주" not in out.columns:
         return out
 
@@ -181,6 +207,7 @@ def convert_wide_weekly_to_long(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 def prepare_weekly_item_data(df: pd.DataFrame) -> pd.DataFrame:
     data = normalize_source_columns(df)
+    data = infer_and_rename_week_column(data)
 
     required_cols = ["아이템", "연도/주", "외형매출", "정상가", "판매수량"]
     missing_cols = [col for col in required_cols if col not in data.columns]
@@ -189,6 +216,7 @@ def prepare_weekly_item_data(df: pd.DataFrame) -> pd.DataFrame:
     if missing_cols and "연도/주" in data.columns and "아이템" not in data.columns and "판매수량" not in data.columns:
         data = convert_wide_weekly_to_long(data)
         data = normalize_source_columns(data)
+        data = infer_and_rename_week_column(data)
         missing_cols = [col for col in required_cols if col not in data.columns]
 
     if missing_cols:
