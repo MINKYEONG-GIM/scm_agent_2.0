@@ -177,7 +177,7 @@ def get_off_season_threshold(df: pd.DataFrame, intro_end: int, peak_idx: int) ->
 
     return max(threshold_avg, threshold_median)
 
-def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int):
+def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int, decline_start: int):
     """
     비시즌 구간 여러 개를 찾는다.
 
@@ -188,6 +188,7 @@ def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int):
     - 최소 3주 이상 연속
     - peak 직전 1~2주는 비시즌 금지
     - 이후 확실한 회복이 있어야 함
+    - 비시즌은 도입기와 쇠퇴기를 제외한 구간의 최저점을 반드시 포함해야 함
     """
     if df.empty:
         return []
@@ -198,12 +199,30 @@ def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int):
     if search_start > search_end:
         return []
 
-    # 비시즌 기준값 계산
     off_threshold = get_off_season_threshold(df, intro_end, peak_idx)
-
     if off_threshold <= 0:
         return []
 
+    # -------------------------
+    # 1. 도입/쇠퇴 제외 구간의 최저점 찾기
+    # -------------------------
+    valley_start = intro_end + 1
+    valley_end = max(intro_end + 1, decline_start - 1)
+
+    if valley_start > valley_end:
+        return []
+
+    valley_df = df.loc[valley_start:valley_end, ["qty"]].copy()
+    valley_df = valley_df.dropna(subset=["qty"])
+
+    if valley_df.empty:
+        return []
+
+    valley_idx = int(valley_df["qty"].idxmin())
+
+    # -------------------------
+    # 2. 비시즌 후보 찾기
+    # -------------------------
     candidate_idx = []
 
     for i in range(search_start, search_end + 1):
@@ -212,7 +231,6 @@ def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int):
         if pd.isna(qty):
             continue
 
-        # 평균/중간값 대비 50% 이하
         if qty <= off_threshold:
             candidate_idx.append(i)
 
@@ -233,7 +251,6 @@ def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int):
 
     valid_groups = []
 
-    # 회복 기준은 peak 대비로 두는 게 자연스러움
     peak_qty = float(df["qty"].max()) if pd.notna(df["qty"].max()) else 0.0
     recovery_threshold = peak_qty * OFF_SEASON_RECOVERY_RATIO
 
@@ -246,8 +263,6 @@ def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int):
             continue
 
         future_qty = df.loc[after_idx:peak_idx, "qty"].dropna()
-
-        # 이후 확실한 회복 필요
         if future_qty.empty:
             continue
 
@@ -255,29 +270,49 @@ def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int):
             continue
 
         avg_qty = float(df.loc[g, "qty"].mean())
+        contains_valley = g[0] <= valley_idx <= g[-1]
 
         valid_groups.append({
             "start": g[0],
             "end": g[-1],
             "length": len(g),
-            "avg_qty": avg_qty
+            "avg_qty": avg_qty,
+            "contains_valley": contains_valley
         })
 
     if not valid_groups:
         return []
 
-    # 우선순위:
-    # 1. 더 긴 구간
-    # 2. 평균 판매수량이 더 낮은 구간
-    # 3. 더 이른 구간
-    valid_groups = sorted(
+    # -------------------------
+    # 3. 최저점 포함 구간은 반드시 유지
+    # -------------------------
+    selected_groups = []
+
+    valley_groups = [g for g in valid_groups if g["contains_valley"]]
+    if valley_groups:
+        best_valley_group = sorted(
+            valley_groups,
+            key=lambda x: (-x["length"], x["avg_qty"], x["start"])
+        )[0]
+        selected_groups.append(best_valley_group)
+
+    # -------------------------
+    # 4. 나머지 유효 구간도 추가 가능
+    # -------------------------
+    other_groups = sorted(
         valid_groups,
         key=lambda x: (-x["length"], x["avg_qty"], x["start"])
     )
 
-    return [(g["start"], g["end"]) for g in valid_groups]
+    for g in other_groups:
+        already_exists = any(
+            s["start"] == g["start"] and s["end"] == g["end"]
+            for s in selected_groups
+        )
+        if not already_exists:
+            selected_groups.append(g)
 
-
+    return [(g["start"], g["end"]) for g in selected_groups]
 
 
 # =========================
