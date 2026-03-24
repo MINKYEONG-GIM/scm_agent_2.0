@@ -605,6 +605,8 @@ def classify_plc(
             stages[1] = "성장"
         if n >= 3:
             stages[2] = "성숙"
+        # 짧은 시계열도 가능한 범위에서 필수 단계를 최대한 보정
+        _enforce_core_stages(stages, q, wow, peak_idx, 0, n)
         df["plc_stage"] = stages
         df["is_peak_week"] = False
         df.loc[peak_idx, "is_peak_week"] = True
@@ -656,6 +658,31 @@ def classify_plc(
         stages[i] = "성숙"
 
     _enforce_core_stages(stages, q, wow, peak_idx, intro_end, n)
+    # 최종 세이프가드: n>=4 인 경우 도입/성장/성숙/쇠퇴 4단계를 반드시 포함
+    if n >= 4:
+        need = {"도입", "성장", "성숙", "쇠퇴"}
+        present = set(stages)
+        if "도입" not in present:
+            stages[0] = "도입"
+        if "성숙" not in present:
+            stages[min(max(peak_idx, 0), n - 1)] = "성숙"
+        if "쇠퇴" not in set(stages):
+            stages[n - 1] = "쇠퇴"
+        if "성장" not in set(stages):
+            gidx = min(max(intro_end + 1, 1), n - 2)
+            if stages[gidx] in {"도입", "성숙", "쇠퇴"}:
+                for k in range(1, n - 1):
+                    if stages[k] not in {"도입", "성숙", "쇠퇴"}:
+                        gidx = k
+                        break
+            stages[gidx] = "성장"
+        # 한 번 더 확인
+        if not need.issubset(set(stages)):
+            # 극단 케이스 대비 고정 배치
+            stages[0] = "도입"
+            stages[1] = "성장"
+            stages[min(max(peak_idx, 2), n - 2)] = "성숙"
+            stages[n - 1] = "쇠퇴"
 
     df["plc_stage"] = stages
     df["is_peak_week"] = False
