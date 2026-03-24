@@ -281,8 +281,7 @@ def find_off_season_ranges(df: pd.DataFrame) -> List[Tuple[int, int]]:
     """
     비시즌 정의:
     - 5주 이동평균이 전체 평균의 60% 이하인 구간만 후보
-    - 후보는 '저조 구간이 5주 이상 연속'일 때만 유효
-    - 유효 후보 주차 중 판매량이 가장 낮은 5개 주차만 비시즌으로 선택
+    - 후보 중 5주 평균이 가장 낮은 '연속 5주 1구간'만 비시즌으로 선택
     """
     if df.empty or "qty" not in df.columns:
         return []
@@ -306,39 +305,10 @@ def find_off_season_ranges(df: pd.DataFrame) -> List[Tuple[int, int]]:
     if not valid_window_ends:
         return []
 
-    # 이동평균 조건을 만족하는 window들에서 주차 후보를 수집
-    candidate_weeks = set()
-    for end_idx in valid_window_ends:
-        start_idx = end_idx - OFF_SEASON_WINDOW + 1
-        for w in range(start_idx, end_idx + 1):
-            candidate_weeks.add(w)
-
-    if len(candidate_weeks) < OFF_SEASON_MIN_WEEKS:
-        return []
-
-    # 5주 이상 연속되는 저조 구간만 유효
-    sorted_weeks = sorted(candidate_weeks)
-    valid_pool: List[int] = []
-    streak = [sorted_weeks[0]]
-    for i in range(1, len(sorted_weeks)):
-        if sorted_weeks[i] == sorted_weeks[i - 1] + 1:
-            streak.append(sorted_weeks[i])
-        else:
-            if len(streak) >= OFF_SEASON_MIN_WEEKS:
-                valid_pool.extend(streak)
-            streak = [sorted_weeks[i]]
-    if len(streak) >= OFF_SEASON_MIN_WEEKS:
-        valid_pool.extend(streak)
-
-    if len(valid_pool) < OFF_SEASON_MIN_WEEKS:
-        return []
-
-    # 최종 비시즌은 정확히 5주(판매량 가장 낮은 5개 주차)
-    unique_pool = sorted(set(valid_pool))
-    lowest_five = sorted(unique_pool, key=lambda i: float(qty_series.iloc[i]))[:OFF_SEASON_WINDOW]
-    lowest_five = sorted(lowest_five)
-
-    return [(i, i) for i in lowest_five]
+    # 최종 비시즌은 정확히 연속 5주 1구간
+    best_end = min(valid_window_ends, key=lambda i: float(rolling_avg.iloc[i]))
+    best_start = best_end - OFF_SEASON_WINDOW + 1
+    return [(best_start, best_end)]
 
 
 # =========================
@@ -1013,7 +983,7 @@ st.markdown(
 **비시즌**
 - 저조한 판매가 5주 이상 지속되는 구간
 - 5주 이동평균이 전체 평균의 60% 이하
-- 유효 후보 주차 중 판매량이 가장 낮은 5주만 비시즌으로 지정
+- 후보 중 5주 평균이 가장 낮은 연속 5주 1구간만 비시즌으로 지정
 
 **변곡점(최고점)**
 - 전체 기간 중 가장 높은 판매량 주차
