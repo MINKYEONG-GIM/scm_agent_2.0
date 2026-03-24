@@ -551,6 +551,27 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     df.loc[mature_anchor, "plc_stage_final"] = "성숙"
     df.loc[decline_start:, "plc_stage_final"] = "쇠퇴"
 
+    # 안전장치: 비시즌은 0주 또는 연속 5주 1구간만 허용
+    final_off_idx = df.index[df["plc_stage_final"] == "비시즌"].tolist()
+    if final_off_idx and len(final_off_idx) != OFF_SEASON_WINDOW:
+        # 일단 비시즌을 제거하고 기본 흐름으로 복원
+        for i in final_off_idx:
+            if i <= intro_end:
+                df.loc[i, "plc_stage_final"] = "도입"
+            elif i < mature_start:
+                df.loc[i, "plc_stage_final"] = "성장"
+            elif i < decline_start:
+                df.loc[i, "plc_stage_final"] = "성숙"
+            else:
+                df.loc[i, "plc_stage_final"] = "쇠퇴"
+
+        # 규칙에 맞는 5주 구간이 있으면 다시 1구간만 적용
+        recalculated_off = find_off_season_ranges(df)
+        for start_idx, end_idx in recalculated_off:
+            for i in range(start_idx, end_idx + 1):
+                if i < decline_start:
+                    df.loc[i, "plc_stage_final"] = "비시즌"
+
     df["plc_stage"] = df["plc_stage_final"]
 
     return df
