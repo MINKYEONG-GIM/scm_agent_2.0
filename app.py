@@ -300,7 +300,11 @@ def get_segment_slope(series: pd.Series) -> float:
     return float(np.polyfit(x, y, 1)[0])
 
 
-def find_off_season_ranges(df: pd.DataFrame) -> List[Tuple[int, int]]:
+def find_off_season_ranges(
+    df: pd.DataFrame,
+    intro_end: int,
+    decline_start: int
+) -> List[Tuple[int, int]]:
     """
     비시즌 정의:
     - 5주 이동평균이 전체 평균의 60% 이하인 구간만 후보
@@ -321,10 +325,19 @@ def find_off_season_ranges(df: pd.DataFrame) -> List[Tuple[int, int]]:
     rolling_avg = qty_series.rolling(window=OFF_SEASON_WINDOW).mean()
     threshold = overall_mean * OFF_SEASON_RATIO_TO_MEAN
 
-    valid_window_ends = [
-        i for i in range(OFF_SEASON_WINDOW - 1, n)
-        if pd.notna(rolling_avg.iloc[i]) and float(rolling_avg.iloc[i]) <= threshold
-    ]
+    # 도입/쇠퇴 구간을 제외한 중간 구간에서만 비시즌 후보를 찾는다.
+    # (비시즌이 앞/뒤에 길게 찍히는 문제 방지)
+    search_start = max(intro_end + OFF_SEASON_WINDOW, OFF_SEASON_WINDOW - 1)
+    search_end = max(search_start - 1, decline_start - 1)
+    if search_end < search_start:
+        return []
+
+    valid_window_ends = []
+    for i in range(search_start, search_end + 1):
+        if pd.isna(rolling_avg.iloc[i]):
+            continue
+        if float(rolling_avg.iloc[i]) <= threshold:
+            valid_window_ends.append(i)
     if not valid_window_ends:
         return []
 
@@ -492,7 +505,17 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     # 3. 필수 단계 경계 강제 설정
     # -------------------------
     growth_start = intro_end + 1
-    decline_start = n - 1  # 쇠퇴는 마지막 주차에 최소 1주 강제
+
+    # 기존 raw 분류에서 끝 연속 쇠퇴를 우선 존중하고, 없으면 마지막 1주를 쇠퇴로 강제
+    decline_start = n
+    for i in range(n - 1, -1, -1):
+        if df.loc[i, "plc_stage_raw"] == "쇠퇴":
+            decline_start = i
+        else:
+            break
+    if decline_start == n:
+        decline_start = n - 1
+
     mature_start = min(max(peak_idx, growth_start + 1), decline_start - 1)
     growth_anchor = growth_start
     mature_anchor = mature_start
@@ -522,7 +545,7 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     # -------------------------
     # 6. 비시즌 반영
     # -------------------------
-    off_ranges = find_off_season_ranges(df)
+    off_ranges = find_off_season_ranges(df, intro_end=intro_end, decline_start=decline_start)
     for start_idx, end_idx in off_ranges:
         for i in range(start_idx, end_idx + 1):
             df.loc[i, "plc_stage_final"] = "비시즌"
@@ -566,7 +589,7 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
                 df.loc[i, "plc_stage_final"] = "쇠퇴"
 
         # 규칙에 맞는 5주 구간이 있으면 다시 1구간만 적용
-        recalculated_off = find_off_season_ranges(df)
+        recalculated_off = find_off_season_ranges(df, intro_end=intro_end, decline_start=decline_start)
         for start_idx, end_idx in recalculated_off:
             for i in range(start_idx, end_idx + 1):
                 if i < decline_start:
@@ -1047,6 +1070,7 @@ st.markdown(
 **비시즌**
 - 저조한 판매가 5주 이상 지속되는 구간
 - 5주 이동평균이 전체 평균의 60% 이하
+- 도입/쇠퇴 구간을 제외한 중간 구간에서만
 - 후보 중 5주 평균이 가장 낮은 연속 5주 1구간만 비시즌으로 지정
 
 **변곡점(최고점)**
