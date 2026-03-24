@@ -19,17 +19,6 @@ GROWTH_MAX_RATIO = 0.85
 MATURE_RATIO = 0.85
 DECLINE_RATIO = 0.70
 HIGH_DISCOUNT_RATIO = 0.30
-# 비시즌 관련 수치
-OFF_SEASON_BASE_RATIO = 0.50  # 평균/중간값의 50% 이하
-OFF_SEASON_MIN_WEEKS = 6  # 너무 짧은 구간 제외, 길게 잡기
-OFF_SEASON_MEDIAN_RATIO = 0.60          # 전체 판매량 중간값의 60%
-OFF_SEASON_MA_WINDOW = 3                # 3주 이동평균
-OFF_SEASON_SLOPE_WINDOW = 3             # 3주 이상 완만
-OFF_SEASON_SLOPE_LIMIT_RATIO = 0.02     # peak의 2% 이하이면 완만
-OFF_SEASON_RECOVERY_RATIO = 0.60
-OFF_SEASON_PEAK_BUFFER = 2
-OFF_SEASON_SLOPE_LIMIT_RATIO = 0.03  # 최고점 대비 주차당 허용 기울기
-OFF_SEASON_MAX_RATIO_TO_PEAK = 0.35  # 최고점 대비 35% 이하만 비시즌 후보
 
 ROLLING_WINDOW = 3  # 최근 흐름 판단용
 LOCAL_PEAK_WINDOW = 1  # 앞/뒤 1주 비교
@@ -40,7 +29,6 @@ PLC_LINE_COLOR_MAP = {
     "성숙": "#ff7f0e",  # 주황
     "쇠퇴": "#d62728",  # 빨강
     "변곡점(최고점)": "#8c564b",  # 갈색
-    "비시즌": "#7f7f7f",  # 회색
 }
 
 # =========================
@@ -285,76 +273,6 @@ def get_segment_slope(series: pd.Series) -> float:
     return float(np.polyfit(x, y, 1)[0])
 
 
-def get_off_season_threshold(df: pd.DataFrame) -> float:
-    """
-    비시즌 기준값:
-    전체 판매량 중간값의 60%
-    """
-    base_series = df["qty"].dropna()
-
-    if base_series.empty:
-        return 0.0
-
-    median_val = float(base_series.median())
-    return median_val * OFF_SEASON_MEDIAN_RATIO
-
-
-def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int, decline_start: int):
-    """
-    수정된 비시즌 판정 로직:
-    1. 최저점 포함 조건 삭제
-    2. 최고점 대비 20% 이하인 주차들을 후보로 선정
-    3. 후보 주차들 중 '6주 연속'되는 구간을 추출
-    4. 추출된 구간 중 '6주 판매량 평균'이 가장 낮은 구간을 최종 비시즌으로 선정
-    """
-    if df.empty: return []
-
-    qty_series = df["qty"].fillna(0)
-    max_qty = qty_series.max()
-    if max_qty <= 0: return []
-
-    # 비시즌 판단 기준 설정
-    OFF_THRESHOLD_RATIO = 0.20  # 최고점 대비 20% 이하
-    MIN_OFF_SEASON_WEEKS = 6    # 최소 6주 지속
-
-    # 1. 후보 주차 찾기 (바닥권 주차들)
-    candidate_idx = []
-    for i, qty in enumerate(qty_series):
-        if (qty / max_qty) <= OFF_THRESHOLD_RATIO:
-            candidate_idx.append(i)
-
-    if not candidate_idx: return []
-
-    # 2. 연속된 구간 묶기
-    groups = []
-    current_group = [candidate_idx[0]]
-    for i in range(1, len(candidate_idx)):
-        if candidate_idx[i] == candidate_idx[i-1] + 1:
-            current_group.append(candidate_idx[i])
-        else:
-            if len(current_group) >= MIN_OFF_SEASON_WEEKS:
-                groups.append(current_group)
-            current_group = [candidate_idx[i]]
-    if len(current_group) >= MIN_OFF_SEASON_WEEKS:
-        groups.append(current_group)
-
-    if not groups: return []
-
-    # 3. 각 구간의 '평균 판매량' 계산하여 가장 낮은 구간 찾기
-    group_stats = []
-    for g in groups:
-        avg_qty = qty_series.iloc[g].mean()
-        group_stats.append({
-            'range': (g[0], g[-1]),
-            'avg_qty': avg_qty,
-            'length': len(g)
-        })
-
-    # 평균 판매량이 가장 낮은(가장 바닥인) 구간 선택
-    best_group = sorted(group_stats, key=lambda x: x['avg_qty'])[0]
-    
-    return [best_group['range']]
-
 # =========================
 # 5. 핵심 PLC 로직
 # =========================
@@ -462,12 +380,11 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     PLC 단계 흐름을 보정한다.
 
     기본 흐름:
-    도입 -> 성장 -> 비시즌 -> 성장 -> 성숙 -> 쇠퇴
+    도입 -> 성장 -> 성숙 -> 쇠퇴
 
     규칙:
     - 도입은 맨 앞 최대 INTRO_WEEKS까지만 허용
     - 쇠퇴는 맨 뒤 1개 연속 구간만 허용
-    - 비시즌은 peak 이전의 낮은 판매 구간 중 회복이 있는 경우만 허용
     """
     df = item_df.copy().reset_index(drop=True)
 
@@ -533,45 +450,13 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     df["plc_stage_final"] = df["plc_stage_raw"]
 
     # -------------------------
-    # 6. 비시즌 표시
+    # 6. 최종 흐름 정리
     # -------------------------
-    off_ranges = find_off_season_ranges(df, intro_end, peak_idx, decline_start)
+    for i in range(intro_end + 1, peak_idx):
+        df.loc[i, "plc_stage_final"] = "성장"
 
-    for start_idx, end_idx in off_ranges:
-        for i in range(start_idx, end_idx + 1):
-            df.loc[i, "plc_stage_final"] = "비시즌"
-
-    # -------------------------
-    # 7. 최종 흐름 정리
-    # -------------------------
-    off_idx = df.index[df["plc_stage_final"] == "비시즌"].tolist()
-
-    if off_idx:
-        first_off = min(off_idx)
-        last_off = max(off_idx)
-
-        # 도입 뒤 ~ 비시즌 전 = 성장
-        for i in range(intro_end + 1, first_off):
-            if df.loc[i, "plc_stage_final"] not in ["도입", "비시즌"]:
-                df.loc[i, "plc_stage_final"] = "성장"
-
-        # 비시즌 뒤 ~ peak 전 = 성장
-        for i in range(last_off + 1, peak_idx):
-            if df.loc[i, "plc_stage_final"] != "비시즌":
-                df.loc[i, "plc_stage_final"] = "성장"
-
-        # peak 이후 ~ 쇠퇴 전 = 성숙
-        for i in range(peak_idx + 1, decline_start):
-            if df.loc[i, "plc_stage_final"] != "쇠퇴":
-                df.loc[i, "plc_stage_final"] = "성숙"
-
-    else:
-        # 비시즌 없으면 기존 구조 유지
-        for i in range(intro_end + 1, peak_idx):
-            df.loc[i, "plc_stage_final"] = "성장"
-
-        for i in range(peak_idx + 1, decline_start):
-            df.loc[i, "plc_stage_final"] = "성숙"
+    for i in range(peak_idx + 1, decline_start):
+        df.loc[i, "plc_stage_final"] = "성숙"
 
     # peak 주차는 성숙으로 두고, 마커만 별도로 표시
     df.loc[peak_idx, "plc_stage_final"] = "성숙"
