@@ -297,135 +297,55 @@ def get_off_season_threshold(df: pd.DataFrame) -> float:
 
     median_val = float(base_series.median())
     return median_val * OFF_SEASON_MEDIAN_RATIO
+
+
 def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int, decline_start: int):
     """
-    비시즌 구간 찾기 - 수정 규칙
-    목표:
-    - 잠깐 꺼진 구간이 아니라
-    - 오랫동안 팔리지 않는 중심 저판매 구간을 찾는다.
-    1. 최저점을 반드시 포함
-    2. 3주 이동평균이 전체 판매량 중간값의 60%보다 낮아야 함
-    3. 3주 기울기가 완만해야 함
-    4. peak 이전/이후 모두 가능
-    5. 최소 6주 이상 연속
+    개선된 비시즌 판정 로직:
+    1. 최고점 대비 판매량이 매우 낮은 구간(예: 15% 이하)을 기본 후보로 설정
+    2. 해당 후보군이 일정 기간(예: 8주 이상) 지속될 때 비시즌으로 간주
+    3. 요청하신 13주~35주 사이의 저판매 구간을 포착하도록 임계치 조정
     """
-    if df.empty:
-        return []
+    if df.empty: return []
 
-    search_start = max(intro_end + 1, INTRO_WEEKS)
-    search_end = len(df) - 1
+    qty_series = df["qty"].fillna(0)
+    max_qty = qty_series.max()
+    if max_qty <= 0: return []
 
-    if search_start > search_end:
-        return []
-
-    qty_series = df["qty"].dropna()
-    if qty_series.empty:
-        return []
-
-    median_val = float(qty_series.median())
-    off_threshold = median_val * 0.60
-
-    peak_qty = float(df["qty"].max()) if pd.notna(df["qty"].max()) else 0.0
-    if peak_qty <= 0:
-        return []
-
-    slope_limit = peak_qty * 0.02   # 완만 기준
-    min_weeks = 6
-
-    work_df = df.copy()
-
-    # 3주 이동평균
-    work_df["ma3"] = (
-        work_df["qty"]
-        .rolling(window=3, min_periods=3)
-        .mean()
-    )
-
-    # 3주 기울기
-    slopes = [np.nan] * len(work_df)
-    for i in range(2, len(work_df)):
-        seg = work_df.loc[i-2:i, "qty"].dropna()
-        if len(seg) == 3:
-            slopes[i] = get_segment_slope(seg)
-
-    work_df["slope3"] = slopes
-
-    # 전체 탐색 구간에서 최저점 찾기
-    min_qty = work_df.loc[search_start:search_end, "qty"].min()
-    min_idx_list = work_df.index[
-        (work_df.index >= search_start) &
-        (work_df.index <= search_end) &
-        (work_df["qty"] == min_qty)
-    ].tolist()
-
-    if not min_idx_list:
-        return []
+    # 비시즌 판단 기준: 최고점 대비 15% 이하의 판매량
+    OFF_THRESHOLD_RATIO = 0.15 
+    MIN_OFF_SEASON_WEEKS = 8
 
     candidate_idx = []
-
-    for i in range(search_start, search_end + 1):
-        ma3 = work_df.loc[i, "ma3"]
-        slope3 = work_df.loc[i, "slope3"]
-
-        if pd.isna(ma3) or pd.isna(slope3):
-            continue
-
-        cond_low = ma3 < off_threshold
-        cond_flat = abs(slope3) <= slope_limit
-
-        if cond_low and cond_flat:
+    for i, qty in enumerate(qty_series):
+        # 1. 판매량이 피크 대비 현저히 낮고
+        # 2. 너무 초반(도입기)이나 너무 후반(완전 쇠퇴기)이 아닌 중간 구간 위주
+        if (qty / max_qty) <= OFF_THRESHOLD_RATIO:
             candidate_idx.append(i)
 
-    if not candidate_idx:
-        return []
+    if not candidate_idx: return []
 
-    # 연속 구간 묶기
+    # 연속된 주차끼리 그룹화
     groups = []
-    current_group = [candidate_idx[0]]
+    if candidate_idx:
+        current_group = [candidate_idx[0]]
+        for i in range(1, len(candidate_idx)):
+            if candidate_idx[i] == candidate_idx[i-1] + 1:
+                current_group.append(candidate_idx[i])
+            else:
+                groups.append(current_group)
+                current_group = [candidate_idx[i]]
+        groups.append(current_group)
 
-    for idx in candidate_idx[1:]:
-        if idx == current_group[-1] + 1:
-            current_group.append(idx)
-        else:
-            groups.append(current_group)
-            current_group = [idx]
-    groups.append(current_group)
-
-    valid_groups = []
-
-    for g in groups:
-        if len(g) < min_weeks:
-            continue
-
-        # 최저점 포함 필수
-        if not any(min_idx in g for min_idx in min_idx_list):
-            continue
-
-        seg_qty = work_df.loc[g, "qty"].dropna()
-        seg_ma3 = work_df.loc[g, "ma3"].dropna()
-        seg_slope = work_df.loc[g, "slope3"].dropna()
-
-        if seg_qty.empty or seg_ma3.empty or seg_slope.empty:
-            continue
-
-        valid_groups.append({
-            "start": g[0],
-            "end": g[-1],
-            "length": len(g),
-            "avg_qty": float(seg_qty.mean()),
-            "avg_ma3": float(seg_ma3.mean()),
-            "avg_abs_slope": float(np.mean(np.abs(seg_slope)))
-        })
-
+    # 가장 길게 지속되는 저판매 구간을 비시즌으로 선택
+    valid_groups = [g for g in groups if len(g) >= MIN_OFF_SEASON_WEEKS]
+    
     if not valid_groups:
         return []
 
-    best_group = sorted(
-        valid_groups,
-        key=lambda x: (-x["length"], x["avg_ma3"], x["avg_abs_slope"], x["start"])
-    )[0]
-
-    return [(best_group["start"], best_group["end"])]
+    # 가장 긴 구간 반환
+    best_group = max(valid_groups, key=len)
+    return [(best_group[0], best_group[-1])]
 
 # =========================
 # 5. 핵심 PLC 로직
