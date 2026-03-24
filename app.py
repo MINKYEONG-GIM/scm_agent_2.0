@@ -388,7 +388,7 @@ def find_significant_peaks(
 
     # 후보가 하나도 없으면 최고점 1개만 남김
     if not candidate_peaks:
-        return [int(np.argmax(values))]
+        return []
 
     # 2차: peak 간 거리 정리
     filtered = []
@@ -427,7 +427,7 @@ def classify_monthly_shape(monthly_df: pd.DataFrame) -> str:
     peaks = find_significant_peaks(
         y_smooth,
         min_peak_ratio=0.45,
-        min_prominence_ratio=0.15,
+        min_prominence_ratio=0.1,
         min_distance=2
     )
 
