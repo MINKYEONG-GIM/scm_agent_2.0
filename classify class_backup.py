@@ -1,6 +1,8 @@
 import os
 import json
 import re
+import urllib.error
+import urllib.request
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -13,21 +15,20 @@ from typing import List, Optional, Tuple
 # =========================
 # 1. 설정값 / 상수
 # =========================
-# 도입: 최대 4주(5주 이상 불가), 전주대비 급상승 시 도입 종료
-INTRO_MAX_WEEKS = 4
-INTRO_MAX_WOW_RATIO = 0.35  # 전주 대비 증가율이 이 값 초과면 도입에서 제외(급상승)
+# 도입: 시작 무조건 도입, 최대 5주, 전주대비 급상승 시 도입 종료
+INTRO_MAX_WEEKS = 5
+INTRO_MAX_WOW_RATIO = 0.30  # 전주 대비 증가율이 이 값 초과면 도입에서 제외(급상승)
 
 # 성장: 연속 3주 동안 전주대비 증가율이 계속 커지는 패턴(가속)
 GROWTH_ACCEL_MIN_STREAK = 3
 
-# 도입·성장·성숙·쇠퇴 공통 최소 주수 (각 3주 이상)
-MIN_PHASE_WEEKS = 3
-
-# 비시즌
-OFF_SEASON_WINDOW = 5
-OFF_SEASON_RATIO_TO_MEAN = 0.60  # 5주 이동평균 <= 전체평균 * 이 값
-OFF_SEASON_EACH_WEEK_MAX_TO_MEAN = 0.50  # 후보 5주 각각 <= 전체평균 * 이 값
-OFF_SEASON_MAX_WOW_STDDEV = 0.25  # 5주간 전주대비 증가율의 표준편차 상한(작을수록 기울기 변화 작음)
+# 비시즌 (연속 5주 이상, 1구간만 선택)
+OFF_SEASON_MIN_WEEKS = 5
+OFF_SEASON_RATIO_TO_MEAN = 0.60  # ma5 <= 전체평균 * 이 값
+OFF_SEASON_EACH_WEEK_MAX_TO_MEAN = 0.50  # 매주 판매량 <= 전체평균 * 이 값
+OFF_SEASON_SLOPE_FRAC = 0.15  # |전주대비 증가량| = |q[i]-q[i-1]| <= 평균 * 이 값 (완만)
+MATURE_SLOPE_FRAC = 0.20  # 성숙(plateau): |q[i]-q[i-1]| <= 평균 * 이 값
+OFF_SEASON_WINDOW = 5  # ma5 윈도우
 
 NORMALTEST_MIN_N = 8  # 정규성 검정 최소 표본
 
@@ -39,6 +40,30 @@ PLC_LINE_COLOR_MAP = {
     "변곡점(최고점)": "#8c564b",  # 갈색
     "비시즌": "#7f7f7f",  # 회색
 }
+
+OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+
+
+def get_gpt_gpi() -> Optional[str]:
+    """
+    Streamlit secrets의 gpt_gpi(또는 OPENAI_API_KEY) 또는 환경변수.
+    secrets.toml 예: gpt_gpi = "sk-..."
+    """
+    try:
+        if hasattr(st, "secrets"):
+            sec = st.secrets
+            if "gpt_gpi" in sec:
+                v = sec["gpt_gpi"]
+                if v is not None and str(v).strip():
+                    return str(v).strip()
+            if "OPENAI_API_KEY" in sec:
+                v = sec["OPENAI_API_KEY"]
+                if v is not None and str(v).strip():
+                    return str(v).strip()
+    except Exception:
+        pass
+    return (os.getenv("gpt_gpi") or os.getenv("OPENAI_API_KEY") or "").strip() or None
+
 
 # =========================
 # 2. 유틸 함수
@@ -332,171 +357,208 @@ def sales_look_normal(q: np.ndarray) -> bool:
         return abs(s) < 0.75 and abs(k) < 1.2
 
 
-def find_off_season_ranges(
-    df: pd.DataFrame,
+def find_off_season_segment(
+    q: np.ndarray,
     intro_end: int,
-    decline_start: int,
-    wow: np.ndarray,
-) -> List[Tuple[int, int]]:
+    peak_idx: int,
+) -> Optional[Tuple[int, int]]:
     """
-    비시즌 (선택, 중간 구간만):
-    - 판매량 분포가 정규에 가깝면 비시즌 없음
-    - 연속 5주 후보: 5주 이동평균 <= 전체평균*60%, 매주 판매량 <= 전체평균*50%
-    - 5주간 전주대비 증가율(wow) 표준편차가 작음(기울기 변화 크지 않음)
-    - 후보 중 5주 평균이 가장 낮은 연속 5주 1구간만 선택
+    비시즌 (선택, 피크 직전 중간 저점 1구간만):
+    - 판매량이 정규에 가깝지 않을 때만
+    - 연속 OFF_SEASON_MIN_WEEKS주 이상
+    - 매주 판매량 <= 전체평균 * OFF_SEASON_EACH_WEEK_MAX_TO_MEAN
+    - ma5 <= 전체평균 * OFF_SEASON_RATIO_TO_MEAN
+    - |q[i]-q[i-1]| <= 전체평균 * OFF_SEASON_SLOPE_FRAC (완만)
+    - 인덱스는 도입 이후 ~ peak_idx-2 까지만 (피크 앞 성장·성숙 공간 확보)
+    - 후보가 여러 개면 구간 평균 판매량이 가장 낮은 연속 구간 1개
     """
-    if df.empty or "qty" not in df.columns:
-        return []
+    n = len(q)
+    if n < OFF_SEASON_MIN_WEEKS or peak_idx < 2:
+        return None
+    if sales_look_normal(q):
+        return None
+    avg = float(np.mean(q))
+    if avg <= 1e-9:
+        return None
 
-    qty_series = df["qty"].fillna(0).astype(float).reset_index(drop=True)
-    n = len(qty_series)
-    if n < OFF_SEASON_WINDOW:
-        return []
+    ma5 = pd.Series(q).rolling(OFF_SEASON_WINDOW, min_periods=1).mean().values
+    cap_q = avg * OFF_SEASON_EACH_WEEK_MAX_TO_MEAN
+    cap_ma = avg * OFF_SEASON_RATIO_TO_MEAN
+    cap_dq = avg * OFF_SEASON_SLOPE_FRAC
 
-    q_arr = qty_series.values.astype(float)
-    if sales_look_normal(q_arr):
-        return []
+    hi = peak_idx - 1
+    if hi <= intro_end + 1:
+        return None
 
-    overall_mean = float(qty_series.mean())
-    if overall_mean <= 0:
-        return []
-
-    rolling_avg = qty_series.rolling(window=OFF_SEASON_WINDOW).mean()
-    ma_threshold = overall_mean * OFF_SEASON_RATIO_TO_MEAN
-    each_cap = overall_mean * OFF_SEASON_EACH_WEEK_MAX_TO_MEAN
-
-    search_start = max(intro_end + 1, OFF_SEASON_WINDOW - 1)
-    search_end = min(decline_start - 1, n - 1)
-    if search_end < search_start:
-        return []
-
-    valid_window_ends: List[int] = []
-    for end_idx in range(search_start, search_end + 1):
-        start_idx = end_idx - OFF_SEASON_WINDOW + 1
-        if start_idx <= intro_end or end_idx >= decline_start:
+    mask = np.zeros(n, dtype=bool)
+    for i in range(intro_end + 1, hi):
+        if q[i] > cap_q + 1e-9:
             continue
-        if pd.isna(rolling_avg.iloc[end_idx]):
+        if ma5[i] > cap_ma + 1e-9:
             continue
-        if float(rolling_avg.iloc[end_idx]) > ma_threshold:
-            continue
-        window_q = q_arr[start_idx : end_idx + 1]
-        if np.any(window_q > each_cap + 1e-9):
-            continue
-        wseg = wow[start_idx : end_idx + 1]
-        wfinite = wseg[~np.isnan(wseg) & ~np.isinf(wseg)]
-        if len(wfinite) < 3:
-            continue
-        if float(np.std(wfinite)) > OFF_SEASON_MAX_WOW_STDDEV:
-            continue
-        valid_window_ends.append(end_idx)
+        if i > 0:
+            if abs(q[i] - q[i - 1]) > cap_dq + 1e-9:
+                continue
+        mask[i] = True
 
-    if not valid_window_ends:
-        return []
+    runs: List[Tuple[int, int]] = []
+    i = 0
+    while i < n:
+        if not mask[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and mask[j]:
+            j += 1
+        if j - i >= OFF_SEASON_MIN_WEEKS:
+            runs.append((i, j - 1))
+        i = j
 
-    best_end = min(valid_window_ends, key=lambda i: float(rolling_avg.iloc[i]))
-    best_start = best_end - OFF_SEASON_WINDOW + 1
-    return [(best_start, best_end)]
+    if not runs:
+        return None
+    return min(runs, key=lambda lr: float(np.mean(q[lr[0] : lr[1] + 1])))
 
 
-# =========================
-# 5. 핵심 PLC 로직
-# =========================
-def _solve_phase_boundaries_min_weeks(
-    n: int,
+def _intro_end_from_wow(wow: np.ndarray, n: int) -> int:
+    """시작은 도입, 최대 INTRO_MAX_WEEKS주, 급상승(INTRO_MAX_WOW_RATIO) 시 직전 주까지 도입."""
+    if n <= 0:
+        return -1
+    end = 0
+    last_intro_idx = min(n - 1, INTRO_MAX_WEEKS - 1)
+    for i in range(1, last_intro_idx + 1):
+        w = wow[i]
+        if np.isfinite(w) and w >= INTRO_MAX_WOW_RATIO:
+            break
+        end = i
+    return end
+
+
+def _enforce_core_stages(
+    stages: List[str],
     q: np.ndarray,
     wow: np.ndarray,
     peak_idx: int,
-    mean_all: float,
-    min_weeks: int,
-    enforce_intro_wow: bool = True,
-) -> Optional[Tuple[int, int, int]]:
-    """
-    intro_end, mature_start, decline_start 를 찾는다.
-    - 도입 길이 = intro_end+1 >= min_weeks
-    - 성장 길이 = mature_start - intro_end - 1 >= min_weeks
-    - 성숙 길이 = decline_start - mature_start >= min_weeks
-    - 쇠퇴 길이 = n - decline_start >= min_weeks
-    - 피크는 성숙 구간 [mature_start, decline_start) 안
-    - enforce_intro_wow 이면 도입 구간 전주대비 급상승 규칙 적용
-    """
-    P = min_weeks
-    if n < 4 * P:
-        return None
-
-    best: Optional[Tuple[int, int, int]] = None
-    best_key = (-1, -1)
-
-    intro_hi = min(INTRO_MAX_WEEKS - 1, n - 3 * P - 1)
-    intro_lo = P - 1
-    if intro_lo > intro_hi:
-        return None
-
-    for intro_end in range(intro_lo, intro_hi + 1):
-        if enforce_intro_wow:
-            ok_intro = True
-            for i in range(1, intro_end + 1):
-                wi = wow[i]
-                if np.isnan(wi) or wi > INTRO_MAX_WOW_RATIO:
-                    ok_intro = False
-                    break
-            if not ok_intro:
-                continue
-
-        g0 = intro_end + 1
-        mature_lo = g0 + P
-        mature_hi = n - 2 * P
-        if mature_lo > mature_hi:
-            continue
-
-        for mature_start in range(mature_lo, mature_hi + 1):
-            decline_lo = mature_start + P
-            decline_hi = n - P
-            if decline_lo > decline_hi:
-                continue
-            for decline_start in range(decline_lo, decline_hi + 1):
-                if not (mature_start <= peak_idx < decline_start):
-                    continue
-                L = mature_start
-                R = decline_start - 1
-                above = int(np.sum(q[L : R + 1] > mean_all + 1e-9))
-                key = (above, R - L + 1)
-                if key > best_key:
-                    best_key = key
-                    best = (intro_end, mature_start, decline_start)
-
-    return best
-
-
-def _fallback_phase_boundaries_short_series(
+    intro_end: int,
     n: int,
-    peak_idx: int,
-) -> Tuple[int, int, int]:
-    """주차가 부족해 3주씩 불가능할 때, 피크가 성숙 구간에 오도록 길이 (l0..l3) 탐색."""
-    l0_max = min(INTRO_MAX_WEEKS, max(1, n - 3))
-    for l0 in range(1, l0_max + 1):
-        for l1 in range(1, n - l0 - 1):
-            for l2 in range(1, n - l0 - l1):
-                l3 = n - l0 - l1 - l2
-                if l3 < 1:
-                    continue
-                m0 = l0 + l1
-                m1 = m0 + l2
-                if m0 <= peak_idx < m1:
-                    return l0 - 1, m0, m1
-    return 0, max(1, min(peak_idx, n - 2)), n - 1
+) -> None:
+    """도입·성장·성숙·쇠퇴를 가능한 한 반드시 1주 이상 보장(비시즌은 선택)."""
+    if n <= 0:
+        return
+
+    # 1) 도입은 시작 고정
+    stages[0] = "도입"
+
+    # 2) 성숙은 피크 주차(가능하면 앞뒤 1주 포함)
+    peak_lo = max(0, peak_idx - 1)
+    peak_hi = min(n - 1, peak_idx + 1)
+    for i in range(peak_lo, peak_hi + 1):
+        stages[i] = "성숙"
+
+    # 3) 쇠퇴가 없으면 마지막 주를 쇠퇴로 강제
+    if n >= 2 and "쇠퇴" not in set(stages):
+        stages[n - 1] = "쇠퇴"
+
+    # 4) 성장이 없으면 도입 끝 이후~피크 이전 우선, 없으면 도입/성숙/쇠퇴가 아닌 임의 주차에 배치
+    if "성장" not in set(stages):
+        growth_idx: Optional[int] = None
+        for i in range(max(1, intro_end + 1), peak_idx):
+            if stages[i] not in {"도입", "성숙", "쇠퇴"}:
+                growth_idx = i
+                break
+        if growth_idx is None:
+            for i in range(1, n):
+                if stages[i] not in {"도입", "성숙", "쇠퇴"}:
+                    growth_idx = i
+                    break
+        if growth_idx is None and n >= 3:
+            growth_idx = 1 if peak_idx != 1 else 2
+        if growth_idx is not None and 0 <= growth_idx < n:
+            stages[growth_idx] = "성장"
+
+    # 5) 성숙/쇠퇴 최종 재보장
+    if "성숙" not in set(stages):
+        stages[min(max(peak_idx, 0), n - 1)] = "성숙"
+    if n >= 2 and "쇠퇴" not in set(stages):
+        stages[n - 1] = "쇠퇴"
 
 
-def assign_plc_stages(item_df: pd.DataFrame) -> pd.DataFrame:
+def classify_plc_with_openai(
+    item_df: pd.DataFrame,
+    api_key: str,
+    model: str = "gpt-4o-mini",
+) -> Optional[List[str]]:
+    """OpenAI Chat Completions로 주차별 PLC 라벨 요청. 성공 시 길이 n 리스트, 실패 시 None."""
+    df = item_df.sort_values("sort_key").reset_index(drop=True)
+    n = len(df)
+    if n == 0:
+        return None
+    series = [
+        {"year_week": str(df.loc[i, "year_week"]), "qty": float(df.loc[i, "qty"] or 0)}
+        for i in range(n)
+    ]
+    rules = (
+        "도입: 시계열 시작은 무조건 도입, 최대 5주, 전주대비 증가율 30% 이상이면 급상승으로 도입 종료. "
+        "성장: 전주대비 증가율이 3주 이상 커지는 가속 구간, 평균 돌파·급상승 구간. "
+        "성숙(plateau): 평균 이상에서 주간 변화가 완만하고 큰 상승·하락 없음; peak 전후 최소 각 1주는 성숙. "
+        "쇠퇴: peak 이후(peak 직다음 주는 성숙으로 둘 수 있음) 감소·평균 이하 추세. "
+        "비시즌: 연속 5주 이상, 매주<=전체평균의 50%, 5주이동평균<=전체평균의 60%, 변화 완만; "
+        "가능하면 피크 전 가장 낮은 바닥 1구간만. "
+        "허용 stage 문자열: 도입, 성장, 성숙, 쇠퇴, 비시즌 만 사용."
+    )
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "제품생명주기(PLC) 분류기. 입력 series 순서와 동일한 길이의 stages 배열만 JSON으로 반환. "
+                    '형식: {"stages":["도입",...]}'
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps({"rules_ko": rules, "series": series}, ensure_ascii=False),
+            },
+        ],
+        "temperature": 0.2,
+    }
+    req = urllib.request.Request(
+        OPENAI_CHAT_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        text = data["choices"][0]["message"]["content"]
+        m = re.search(r"\{[\s\S]*\}", text)
+        if not m:
+            return None
+        obj = json.loads(m.group(0))
+        stages = obj.get("stages")
+        if not isinstance(stages, list) or len(stages) != n:
+            return None
+        return [str(s) for s in stages]
+    except (urllib.error.URLError, json.JSONDecodeError, KeyError, IndexError, TypeError):
+        return None
+
+
+def classify_plc(
+    item_df: pd.DataFrame,
+    *,
+    use_openai: bool = False,
+    openai_model: str = "gpt-4o-mini",
+) -> pd.DataFrame:
     """
-    규칙 기반 PLC 배치 (전주대비 증가율 = recent_slope).
+    PLC 단계 분류 (전주대비 증가율·증가량·이동평균·피크·비시즌 1구간 반영).
 
-    - 초반 무조건 도입, 도입은 최대 4주·급상승(전주대비 증가율 상한) 시 종료
-    - 도입·성장·성숙·쇠퇴는 주차 수가 충분할 때(n>=12) 각각 최소 3주
-    - 성장: 피크 직전 구간(타임라인). 구간 내 일부 주는 증가율 가속(3주 연속) 패턴으로 표시 가능
-    - 성숙: 피크 포함, 피크 앞뒤 최소 1주(가능 시), 가능하면 구간 전체가 평균 초과
-    - 쇠퇴: 성숙 이후(마지막 주는 쇠퇴로 고정 when n>=2)
-    - 피크: 최대 판매량, 동률 시 전주대비 증가율이 더 큰 주차
-    - 비시즌: 선택, find_off_season_ranges 조건 충족 시에만 중간에 5주
+    - 도입: 시작 고정, 최대 5주, 급상승(전주대비 증가율 >= INTRO_MAX_WOW_RATIO) 전까지
+    - 성장: 가속 마스크(growth_accel) 우선, 그 외 피크 이전·비시즌·도입 제외 구간은 성장 기본
+    - 성숙: 평균 이상 + 주간 변화량 <= 평균*MATURE_SLOPE_FRAC; 피크 앞뒤 1주(peak±1)는 항상 성숙
+    - 쇠퇴: peak_idx+2 ~ 끝 (peak 직후 1주는 성숙 유지)
+    - 비시즌: find_off_season_segment (5주 이상·1구간)
+    - use_openai=True 이고 secrets gpt_gpi 가 있으면 API 결과로 덮어쓰기 시도, 실패 시 규칙 기반
     """
     df = item_df.sort_values("sort_key").reset_index(drop=True).copy()
     q = df["qty"].fillna(0).values.astype(float)
@@ -515,6 +577,27 @@ def assign_plc_stages(item_df: pd.DataFrame) -> pd.DataFrame:
     peak_qty = float(np.max(q))
     df["peak_qty"] = peak_qty
     df["ratio_to_peak"] = np.where(peak_qty > 0, q / peak_qty, np.nan)
+    peak_idx = pick_peak_idx(q, wow)
+    avg = float(np.mean(q))
+
+    if use_openai:
+        key = get_gpt_gpi()
+        if key:
+            llm = classify_plc_with_openai(df, key, model=openai_model)
+            if llm:
+                df["plc_stage"] = llm
+                df["is_peak_week"] = False
+                df.loc[peak_idx, "is_peak_week"] = True
+                allowed = {"도입", "성장", "성숙", "쇠퇴", "비시즌"}
+                for i in range(n):
+                    if df.loc[i, "plc_stage"] not in allowed:
+                        df.loc[i, "plc_stage"] = "성장"
+                if str(df.loc[peak_idx, "plc_stage"]) != "성숙":
+                    df.loc[peak_idx, "plc_stage"] = "성숙"
+                enforced = df["plc_stage"].astype(str).tolist()
+                _enforce_core_stages(enforced, q, wow, peak_idx, _intro_end_from_wow(wow, n), n)
+                df["plc_stage"] = enforced
+                return df
 
     if n < 4:
         stages = ["도입"] * n
@@ -522,88 +605,96 @@ def assign_plc_stages(item_df: pd.DataFrame) -> pd.DataFrame:
             stages[1] = "성장"
         if n >= 3:
             stages[2] = "성숙"
+        # 짧은 시계열도 가능한 범위에서 필수 단계를 최대한 보정
+        _enforce_core_stages(stages, q, wow, peak_idx, 0, n)
         df["plc_stage"] = stages
         df["is_peak_week"] = False
-        pi = pick_peak_idx(q, wow)
-        df.loc[pi, "is_peak_week"] = True
+        df.loc[peak_idx, "is_peak_week"] = True
         return df
 
-    peak_idx = pick_peak_idx(q, wow)
-    mean_all = float(np.mean(q))
+    intro_end = _intro_end_from_wow(wow, n)
+    off_seg = find_off_season_segment(q, intro_end, peak_idx)
 
-    triple = _solve_phase_boundaries_min_weeks(
-        n, q, wow, peak_idx, mean_all, MIN_PHASE_WEEKS, enforce_intro_wow=True
-    )
-    if triple is None:
-        triple = _solve_phase_boundaries_min_weeks(
-            n, q, wow, peak_idx, mean_all, MIN_PHASE_WEEKS, enforce_intro_wow=False
-        )
-    if triple is not None:
-        intro_end, mature_start, decline_start = triple
-    else:
-        intro_end, mature_start, decline_start = _fallback_phase_boundaries_short_series(
-            n, peak_idx
-        )
-
-    growth_start = intro_end + 1
-    decline_start = min(decline_start, n)
+    slope_abs = np.zeros(n)
+    slope_abs[1:] = np.abs(q[1:] - q[:-1])
+    mature_cap = avg * MATURE_SLOPE_FRAC
 
     stages = [""] * n
-    for i in range(0, intro_end + 1):
-        stages[i] = "도입"
-    for i in range(growth_start, mature_start):
-        stages[i] = "성장"
-    for i in range(mature_start, decline_start):
-        stages[i] = "성숙"
-    for i in range(decline_start, n):
+
+    for i in range(peak_idx + 2, n):
         stages[i] = "쇠퇴"
 
-    if n >= 2:
-        stages[-1] = "쇠퇴"
+    if off_seg is not None:
+        s_off, e_off = off_seg
+        for j in range(s_off, e_off + 1):
+            stages[j] = "비시즌"
 
-    df["plc_stage_final"] = stages
+    for i in range(0, intro_end + 1):
+        stages[i] = "도입"
+
+    for i in range(max(0, peak_idx - 1), min(n, peak_idx + 2)):
+        stages[i] = "성숙"
+
+    growth_accel = df["growth_accel"].values
+
+    for i in range(n):
+        if stages[i]:
+            continue
+        if i <= intro_end:
+            continue
+        if i >= peak_idx + 2:
+            continue
+        if max(0, peak_idx - 1) <= i <= min(n - 1, peak_idx + 1):
+            continue
+
+        if growth_accel[i]:
+            stages[i] = "성장"
+        elif i > 0 and q[i] >= avg - 1e-9 and slope_abs[i] <= mature_cap + 1e-9:
+            stages[i] = "성숙"
+        else:
+            stages[i] = "성장"
+
+    for i in range(max(0, peak_idx - 1), min(n, peak_idx + 2)):
+        stages[i] = "성숙"
+
+    _enforce_core_stages(stages, q, wow, peak_idx, intro_end, n)
+    # 최종 세이프가드: n>=4 인 경우 도입/성장/성숙/쇠퇴 4단계를 반드시 포함
+    if n >= 4:
+        need = {"도입", "성장", "성숙", "쇠퇴"}
+        present = set(stages)
+        if "도입" not in present:
+            stages[0] = "도입"
+        if "성숙" not in present:
+            stages[min(max(peak_idx, 0), n - 1)] = "성숙"
+        if "쇠퇴" not in set(stages):
+            stages[n - 1] = "쇠퇴"
+        if "성장" not in set(stages):
+            gidx = min(max(intro_end + 1, 1), n - 2)
+            if stages[gidx] in {"도입", "성숙", "쇠퇴"}:
+                for k in range(1, n - 1):
+                    if stages[k] not in {"도입", "성숙", "쇠퇴"}:
+                        gidx = k
+                        break
+            stages[gidx] = "성장"
+        # 한 번 더 확인
+        if not need.issubset(set(stages)):
+            # 극단 케이스 대비 고정 배치
+            stages[0] = "도입"
+            stages[1] = "성장"
+            stages[min(max(peak_idx, 2), n - 2)] = "성숙"
+            stages[n - 1] = "쇠퇴"
+
+    df["plc_stage"] = stages
     df["is_peak_week"] = False
     df.loc[peak_idx, "is_peak_week"] = True
-
-    off_ranges = find_off_season_ranges(df, intro_end, decline_start, wow)
-    for s_idx, e_idx in off_ranges:
-        for j in range(s_idx, e_idx + 1):
-            if j >= decline_start:
-                continue
-            df.loc[j, "plc_stage_final"] = "비시즌"
-
-    df.loc[:intro_end, "plc_stage_final"] = "도입"
-    df.loc[growth_start, "plc_stage_final"] = "성장"
-    df.loc[peak_idx, "plc_stage_final"] = "성숙"
-    if peak_idx + 1 < decline_start:
-        df.loc[peak_idx + 1, "plc_stage_final"] = "성숙"
-    df.loc[decline_start:, "plc_stage_final"] = "쇠퇴"
-
-    off_idx = df.index[df["plc_stage_final"] == "비시즌"].tolist()
-    if off_idx and len(off_idx) != OFF_SEASON_WINDOW:
-        for j in off_idx:
-            if j <= intro_end:
-                df.loc[j, "plc_stage_final"] = "도입"
-            elif j < mature_start:
-                df.loc[j, "plc_stage_final"] = "성장"
-            elif j < decline_start:
-                df.loc[j, "plc_stage_final"] = "성숙"
-            else:
-                df.loc[j, "plc_stage_final"] = "쇠퇴"
-        off_ranges = find_off_season_ranges(df, intro_end, decline_start, wow)
-        for s_idx, e_idx in off_ranges:
-            for j in range(s_idx, e_idx + 1):
-                if j < decline_start:
-                    df.loc[j, "plc_stage_final"] = "비시즌"
-        df.loc[:intro_end, "plc_stage_final"] = "도입"
-        df.loc[growth_start, "plc_stage_final"] = "성장"
-        df.loc[peak_idx, "plc_stage_final"] = "성숙"
-        if peak_idx + 1 < decline_start:
-            df.loc[peak_idx + 1, "plc_stage_final"] = "성숙"
-        df.loc[decline_start:, "plc_stage_final"] = "쇠퇴"
-
-    df["plc_stage"] = df["plc_stage_final"]
     return df
+
+
+def assign_plc_stages(item_df: pd.DataFrame) -> pd.DataFrame:
+    """세션 옵션에 따라 classify_plc 호출 (Streamlit session_state)."""
+    use_gpt = bool(st.session_state.get("use_gpt_plc", False))
+    model = str(st.session_state.get("openai_plc_model", "gpt-4o-mini"))
+    return classify_plc(item_df, use_openai=use_gpt, openai_model=model)
 
 
 def build_item_plc(item_df: pd.DataFrame) -> pd.DataFrame:
@@ -676,9 +767,10 @@ def make_stage_reason(row: pd.Series) -> str:
     elif stage == "비시즌":
         return (
             f"판매량 분포가 정규에 가깝지 않을 때만 비시즌을 둡니다. "
-            f"5주 이동평균이 전체 평균의 {OFF_SEASON_RATIO_TO_MEAN:.0%} 이하이고, "
-            f"해당 5주 각각이 평균의 {OFF_SEASON_EACH_WEEK_MAX_TO_MEAN:.0%} 이하이며, "
-            f"전주 대비 증가율의 변동이 작은 연속 5주 중 5주 평균이 가장 낮은 1구간을 택합니다."
+            f"연속 {OFF_SEASON_MIN_WEEKS}주 이상, 매주 판매량이 평균의 {OFF_SEASON_EACH_WEEK_MAX_TO_MEAN:.0%} 이하이고, "
+            f"5주 이동평균이 평균의 {OFF_SEASON_RATIO_TO_MEAN:.0%} 이하이며, "
+            f"주간 증가량(절대값)이 평균의 {OFF_SEASON_SLOPE_FRAC:.0%} 이하로 완만한 구간 중 "
+            f"평균 판매량이 가장 낮은 연속 구간 1개만 지정합니다."
         )
     elif stage == "변곡점(최고점)":
         return (
@@ -920,6 +1012,20 @@ st.set_page_config(
 st.title("아이템별 PLC 포인트 분석")
 st.caption("구글시트 기반으로 아이템별 주차 판매 흐름을 분석하고 PLC 단계를 자동 분류합니다.")
 
+with st.sidebar:
+    st.subheader("PLC 분류 옵션")
+    st.checkbox(
+        "OpenAI로 PLC 분류 (secrets: gpt_gpi)",
+        value=False,
+        key="use_gpt_plc",
+        help="켜면 classify_plc()가 규칙 대신 API 응답을 우선 사용합니다. 실패 시 규칙 기반으로 폴백합니다.",
+    )
+    st.text_input("OpenAI 모델명", value="gpt-4o-mini", key="openai_plc_model")
+    if get_gpt_gpi():
+        st.caption("gpt_gpi 키가 로드되었습니다.")
+    else:
+        st.caption("gpt_gpi 미설정 시 GPT 옵션은 폴백만 동작합니다.")
+
 try:
     raw_df = load_sheet_data()
     st.success("구글시트 데이터를 불러왔습니다.")
@@ -1043,12 +1149,12 @@ st.markdown(
 **공통**
 - 기울기(변화율)는 **전주 대비 증가율** `(이번주−전주)/전주` 로 계산합니다.
 - 초반은 무조건 **도입**, **도입·성장·성숙·쇠퇴**는 모든 아이템에 최소 1주씩 존재하도록 맞춥니다.
-- 주차 수가 충분할 때(**총 12주 이상**) **도입·성장·성숙·쇠퇴**는 각각 **최소 3주**가 되도록 경계를 잡습니다. 그보다 짧으면 피크가 성숙에 들어가도록 가능한 범위에서 나눕니다.
+- **도입·성장·성숙·쇠퇴**는 데이터가 짧지 않을 때 각각 최소 1주는 존재하도록 후처리 보정합니다.
 - **비시즌**은 필수가 아니며, 아래 조건을 만족할 때만 중간에 표시합니다.
 
 **도입**
 - 시작 주차는 항상 도입입니다.
-- 도입 구간은 **5주 이상이 될 수 없습니다**(최대 4주).
+- 도입 구간은 **최대 5주**입니다.
 - 전주 대비 증가율이 **급상승**이면(상한 초과) 도입을 끝냅니다.
 
 **성장**
@@ -1067,9 +1173,8 @@ st.markdown(
 
 **비시즌** (선택)
 - 판매량이 **정규분포에 가깝다**고 판단되면 비시즌을 두지 않습니다(Shapiro 검정, 없으면 왜도·첨도 휴리스틱).
-- **연속 5주** 후보: 5주 이동평균 ≤ 전체평균×60%, **각 주** 판매량 ≤ 전체평균×50%.
-- 5주간 전주 대비 증가율의 **표준편차가 작을 것**(기울기 변화가 크지 않음).
-- 도입·쇠퇴 구간을 제외한 **중간**에서만 탐색하고, 후보 중 **5주 평균이 가장 낮은 연속 5주 1구간**만 지정합니다.
+- **연속 5주 이상** 후보: 5주 이동평균 ≤ 전체평균×60%, **각 주** 판매량 ≤ 전체평균×50%, **주간 증가량(절대값)** ≤ 전체평균×15%(완만).
+- 피크 직전(피크·앞뒤 성숙 공간 확보) **중간**에서만 탐색하고, 후보 중 **구간 평균 판매량이 가장 낮은 연속 구간 1개**만 지정합니다.
 """
 )
 
