@@ -301,10 +301,11 @@ def get_off_season_threshold(df: pd.DataFrame) -> float:
 
 def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int, decline_start: int):
     """
-    개선된 비시즌 판정 로직:
-    1. 최고점 대비 판매량이 매우 낮은 구간(예: 15% 이하)을 기본 후보로 설정
-    2. 해당 후보군이 일정 기간(예: 8주 이상) 지속될 때 비시즌으로 간주
-    3. 요청하신 13주~35주 사이의 저판매 구간을 포착하도록 임계치 조정
+    수정된 비시즌 판정 로직:
+    1. 최저점 포함 조건 삭제
+    2. 최고점 대비 20% 이하인 주차들을 후보로 선정
+    3. 후보 주차들 중 '6주 연속'되는 구간을 추출
+    4. 추출된 구간 중 '6주 판매량 평균'이 가장 낮은 구간을 최종 비시즌으로 선정
     """
     if df.empty: return []
 
@@ -312,40 +313,47 @@ def find_off_season_ranges(df: pd.DataFrame, intro_end: int, peak_idx: int, decl
     max_qty = qty_series.max()
     if max_qty <= 0: return []
 
-    # 비시즌 판단 기준: 최고점 대비 15% 이하의 판매량
-    OFF_THRESHOLD_RATIO = 0.15 
-    MIN_OFF_SEASON_WEEKS = 8
+    # 비시즌 판단 기준 설정
+    OFF_THRESHOLD_RATIO = 0.20  # 최고점 대비 20% 이하
+    MIN_OFF_SEASON_WEEKS = 6    # 최소 6주 지속
 
+    # 1. 후보 주차 찾기 (바닥권 주차들)
     candidate_idx = []
     for i, qty in enumerate(qty_series):
-        # 1. 판매량이 피크 대비 현저히 낮고
-        # 2. 너무 초반(도입기)이나 너무 후반(완전 쇠퇴기)이 아닌 중간 구간 위주
         if (qty / max_qty) <= OFF_THRESHOLD_RATIO:
             candidate_idx.append(i)
 
     if not candidate_idx: return []
 
-    # 연속된 주차끼리 그룹화
+    # 2. 연속된 구간 묶기
     groups = []
-    if candidate_idx:
-        current_group = [candidate_idx[0]]
-        for i in range(1, len(candidate_idx)):
-            if candidate_idx[i] == candidate_idx[i-1] + 1:
-                current_group.append(candidate_idx[i])
-            else:
+    current_group = [candidate_idx[0]]
+    for i in range(1, len(candidate_idx)):
+        if candidate_idx[i] == candidate_idx[i-1] + 1:
+            current_group.append(candidate_idx[i])
+        else:
+            if len(current_group) >= MIN_OFF_SEASON_WEEKS:
                 groups.append(current_group)
-                current_group = [candidate_idx[i]]
+            current_group = [candidate_idx[i]]
+    if len(current_group) >= MIN_OFF_SEASON_WEEKS:
         groups.append(current_group)
 
-    # 가장 길게 지속되는 저판매 구간을 비시즌으로 선택
-    valid_groups = [g for g in groups if len(g) >= MIN_OFF_SEASON_WEEKS]
-    
-    if not valid_groups:
-        return []
+    if not groups: return []
 
-    # 가장 긴 구간 반환
-    best_group = max(valid_groups, key=len)
-    return [(best_group[0], best_group[-1])]
+    # 3. 각 구간의 '평균 판매량' 계산하여 가장 낮은 구간 찾기
+    group_stats = []
+    for g in groups:
+        avg_qty = qty_series.iloc[g].mean()
+        group_stats.append({
+            'range': (g[0], g[-1]),
+            'avg_qty': avg_qty,
+            'length': len(g)
+        })
+
+    # 평균 판매량이 가장 낮은(가장 바닥인) 구간 선택
+    best_group = sorted(group_stats, key=lambda x: x['avg_qty'])[0]
+    
+    return [best_group['range']]
 
 # =========================
 # 5. 핵심 PLC 로직
