@@ -426,7 +426,7 @@ def classify_monthly_shape(monthly_df: pd.DataFrame) -> str:
     # 2) 의미 있는 peak만 탐지
     peaks = find_significant_peaks(
         y_smooth,
-        min_peak_ratio=0.6,
+        min_peak_ratio=0.45,
         min_prominence_ratio=0.15,
         min_distance=2
     )
