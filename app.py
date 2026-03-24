@@ -19,6 +19,9 @@ GROWTH_MAX_RATIO = 0.85
 MATURE_RATIO = 0.85
 DECLINE_RATIO = 0.70
 HIGH_DISCOUNT_RATIO = 0.30
+OFF_SEASON_WINDOW = 5
+OFF_SEASON_RATIO_TO_MEAN = 0.60
+OFF_SEASON_MIN_WEEKS = 5
 
 ROLLING_WINDOW = 3  # 최근 흐름 판단용
 LOCAL_PEAK_WINDOW = 1  # 앞/뒤 1주 비교
@@ -29,6 +32,7 @@ PLC_LINE_COLOR_MAP = {
     "성숙": "#ff7f0e",  # 주황
     "쇠퇴": "#d62728",  # 빨강
     "변곡점(최고점)": "#8c564b",  # 갈색
+    "비시즌": "#7f7f7f",  # 회색
 }
 
 # =========================
@@ -273,6 +277,40 @@ def get_segment_slope(series: pd.Series) -> float:
     return float(np.polyfit(x, y, 1)[0])
 
 
+def find_off_season_ranges(df: pd.DataFrame) -> List[Tuple[int, int]]:
+    """
+    비시즌 정의:
+    - 5주 이동평균이 전체 평균의 60% 이하인 구간만 후보
+    - 후보 중 '가장 낮은 5주 평균' 1개 구간을 비시즌으로 선택
+    """
+    if df.empty or "qty" not in df.columns:
+        return []
+
+    qty_series = df["qty"].fillna(0).astype(float).reset_index(drop=True)
+    n = len(qty_series)
+    if n < OFF_SEASON_MIN_WEEKS:
+        return []
+
+    overall_mean = float(qty_series.mean())
+    if overall_mean <= 0:
+        return []
+
+    rolling_avg = qty_series.rolling(window=OFF_SEASON_WINDOW).mean()
+    threshold = overall_mean * OFF_SEASON_RATIO_TO_MEAN
+
+    valid_window_ends = [
+        i for i in range(OFF_SEASON_WINDOW - 1, n)
+        if pd.notna(rolling_avg.iloc[i]) and float(rolling_avg.iloc[i]) <= threshold
+    ]
+    if not valid_window_ends:
+        return []
+
+    best_end = min(valid_window_ends, key=lambda i: float(rolling_avg.iloc[i]))
+    best_start = best_end - OFF_SEASON_WINDOW + 1
+
+    return [(best_start, best_end)]
+
+
 # =========================
 # 5. 핵심 PLC 로직
 # =========================
@@ -380,11 +418,13 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     PLC 단계 흐름을 보정한다.
 
     기본 흐름:
-    도입 -> 성장 -> 성숙 -> 쇠퇴
+    도입 -> 성장 -> 비시즌 -> 성장/성숙 -> 쇠퇴
 
     규칙:
     - 도입은 맨 앞 최대 INTRO_WEEKS까지만 허용
     - 쇠퇴는 맨 뒤 1개 연속 구간만 허용
+    - 비시즌은 5주 이동평균이 전체 평균의 60% 이하인 후보 중
+      가장 낮은 5주 평균 1개 구간으로 지정
     """
     df = item_df.copy().reset_index(drop=True)
 
@@ -450,13 +490,23 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     df["plc_stage_final"] = df["plc_stage_raw"]
 
     # -------------------------
-    # 6. 최종 흐름 정리
+    # 6. 비시즌 반영
+    # -------------------------
+    off_ranges = find_off_season_ranges(df)
+    for start_idx, end_idx in off_ranges:
+        for i in range(start_idx, end_idx + 1):
+            df.loc[i, "plc_stage_final"] = "비시즌"
+
+    # -------------------------
+    # 7. 최종 흐름 정리
     # -------------------------
     for i in range(intro_end + 1, peak_idx):
-        df.loc[i, "plc_stage_final"] = "성장"
+        if df.loc[i, "plc_stage_final"] != "비시즌":
+            df.loc[i, "plc_stage_final"] = "성장"
 
     for i in range(peak_idx + 1, decline_start):
-        df.loc[i, "plc_stage_final"] = "성숙"
+        if df.loc[i, "plc_stage_final"] != "비시즌":
+            df.loc[i, "plc_stage_final"] = "성숙"
 
     # peak 주차는 성숙으로 두고, 마커만 별도로 표시
     df.loc[peak_idx, "plc_stage_final"] = "성숙"
@@ -555,6 +605,12 @@ def make_stage_reason(row: pd.Series) -> str:
             f"최고점 부근의 유지 구간으로 판단했습니다. "
             f"현재 판매수량은 {qty:.0f}, 최고점 대비 {ratio_pct} 수준입니다. "
             f"잘 팔리는 수준이 유지되고 있어 성숙 단계로 분류했습니다."
+        )
+    elif stage == "비시즌":
+        return (
+            f"저조한 판매가 지속되는 비시즌으로 판단했습니다. "
+            f"5주 이동평균이 전체 평균의 60% 이하인 구간 중 "
+            f"가장 낮은 5주를 비시즌으로 표시했습니다."
         )
     elif stage == "변곡점(최고점)":
         return (
@@ -910,6 +966,11 @@ st.markdown(
 - 최고점 부근
 - 최고 판매량 대비 85% 이상
 - 최근 증감률이 크지 않음
+
+**비시즌**
+- 저조한 판매가 5주 이상 지속되는 구간
+- 5주 이동평균이 전체 평균의 60% 이하
+- 후보 중 5주 평균 판매량이 가장 낮은 5주를 비시즌으로 지정
 
 **변곡점(최고점)**
 - 전체 기간 중 가장 높은 판매량 주차
