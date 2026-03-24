@@ -441,32 +441,45 @@ def _enforce_core_stages(
     intro_end: int,
     n: int,
 ) -> None:
-    """도입·성장·성숙·쇠퇴가 최소 1주씩 존재하도록 보정(비시즌은 선택)."""
-    present = set(stages)
-    need = {"도입", "성장", "성숙", "쇠퇴"}
-    if need.issubset(present):
+    """도입·성장·성숙·쇠퇴를 가능한 한 반드시 1주 이상 보장(비시즌은 선택)."""
+    if n <= 0:
         return
 
-    if "도입" not in present and n > 0:
-        stages[0] = "도입"
+    # 1) 도입은 시작 고정
+    stages[0] = "도입"
 
+    # 2) 성숙은 피크 주차(가능하면 앞뒤 1주 포함)
     peak_lo = max(0, peak_idx - 1)
     peak_hi = min(n - 1, peak_idx + 1)
     for i in range(peak_lo, peak_hi + 1):
         stages[i] = "성숙"
 
-    if "성장" not in present:
-        lo = min(intro_end + 1, n - 1)
-        hi = max(peak_idx - 1, lo + 1)
-        if lo < hi:
-            j = min(lo + 1, hi - 1)
-            if intro_end < j < peak_idx:
-                stages[j] = "성장"
+    # 3) 쇠퇴가 없으면 마지막 주를 쇠퇴로 강제
+    if n >= 2 and "쇠퇴" not in set(stages):
+        stages[n - 1] = "쇠퇴"
 
-    if "쇠퇴" not in present and peak_idx + 2 < n:
-        stages[-1] = "쇠퇴"
-        for i in range(peak_idx + 2, n):
-            stages[i] = "쇠퇴"
+    # 4) 성장이 없으면 도입 끝 이후~피크 이전 우선, 없으면 도입/성숙/쇠퇴가 아닌 임의 주차에 배치
+    if "성장" not in set(stages):
+        growth_idx: Optional[int] = None
+        for i in range(max(1, intro_end + 1), peak_idx):
+            if stages[i] not in {"도입", "성숙", "쇠퇴"}:
+                growth_idx = i
+                break
+        if growth_idx is None:
+            for i in range(1, n):
+                if stages[i] not in {"도입", "성숙", "쇠퇴"}:
+                    growth_idx = i
+                    break
+        if growth_idx is None and n >= 3:
+            growth_idx = 1 if peak_idx != 1 else 2
+        if growth_idx is not None and 0 <= growth_idx < n:
+            stages[growth_idx] = "성장"
+
+    # 5) 성숙/쇠퇴 최종 재보장
+    if "성숙" not in set(stages):
+        stages[min(max(peak_idx, 0), n - 1)] = "성숙"
+    if n >= 2 and "쇠퇴" not in set(stages):
+        stages[n - 1] = "쇠퇴"
 
 
 def classify_plc_with_openai(
@@ -581,6 +594,9 @@ def classify_plc(
                         df.loc[i, "plc_stage"] = "성장"
                 if str(df.loc[peak_idx, "plc_stage"]) != "성숙":
                     df.loc[peak_idx, "plc_stage"] = "성숙"
+                enforced = df["plc_stage"].astype(str).tolist()
+                _enforce_core_stages(enforced, q, wow, peak_idx, _intro_end_from_wow(wow, n), n)
+                df["plc_stage"] = enforced
                 return df
 
     if n < 4:
