@@ -93,6 +93,29 @@ def calc_discount_rate(gross_sales: pd.Series, full_price_sales: pd.Series) -> p
     return discount.clip(lower=0, upper=1)
 
 
+def make_unique_headers(headers: List[str]) -> List[str]:
+    """
+    헤더 중복을 방지하기 위해 동일한 이름에 suffix를 붙인다.
+    예: 다운, 다운 -> 다운, 다운_2
+    """
+    counts = {}
+    unique = []
+
+    for idx, h in enumerate(headers):
+        name = str(h).strip()
+        if name == "":
+            name = f"unnamed_{idx + 1}"
+
+        if name not in counts:
+            counts[name] = 1
+            unique.append(name)
+        else:
+            counts[name] += 1
+            unique.append(f"{name}_{counts[name]}")
+
+    return unique
+
+
 # =========================
 # 3. 데이터 전처리 유틸
 # =========================
@@ -813,8 +836,28 @@ def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
             f"워크시트 '{worksheet_name}'를 찾지 못했습니다. 사용 가능한 워크시트: {available}"
         ) from e
 
-    values = ws.get_all_records()
-    return pd.DataFrame(values)
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame()
+
+    raw_headers = values[0]
+    headers = make_unique_headers([str(h) for h in raw_headers])
+
+    rows = values[1:] if len(values) > 1 else []
+    if not rows:
+        return pd.DataFrame(columns=headers)
+
+    max_cols = len(headers)
+    normalized_rows = []
+    for row in rows:
+        row = list(row)
+        if len(row) < max_cols:
+            row = row + [""] * (max_cols - len(row))
+        elif len(row) > max_cols:
+            row = row[:max_cols]
+        normalized_rows.append(row)
+
+    return pd.DataFrame(normalized_rows, columns=headers)
 
 
 @st.cache_data(ttl=300)
