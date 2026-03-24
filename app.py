@@ -13,18 +13,23 @@ from typing import List, Optional, Tuple
 # =========================
 # 1. 설정값 / 상수
 # =========================
-INTRO_WEEKS = 3
-GROWTH_MIN_RATIO = 0.35
-GROWTH_MAX_RATIO = 0.85
-MATURE_RATIO = 0.85
-DECLINE_RATIO = 0.70
-HIGH_DISCOUNT_RATIO = 0.30
-OFF_SEASON_WINDOW = 5
-OFF_SEASON_RATIO_TO_MEAN = 0.60
-OFF_SEASON_MIN_WEEKS = 5
+# 도입: 최대 4주(5주 이상 불가), 전주대비 급상승 시 도입 종료
+INTRO_MAX_WEEKS = 4
+INTRO_MAX_WOW_RATIO = 0.35  # 전주 대비 증가율이 이 값 초과면 도입에서 제외(급상승)
 
-ROLLING_WINDOW = 3  # 최근 흐름 판단용
-LOCAL_PEAK_WINDOW = 1  # 앞/뒤 1주 비교
+# 성장: 연속 3주 동안 전주대비 증가율이 계속 커지는 패턴(가속)
+GROWTH_ACCEL_MIN_STREAK = 3
+
+# 성숙: 4주 이상, 피크 전후 최소 1주씩 포함, 구간 내 매주 평균 초과
+MATURE_MIN_WEEKS = 4
+
+# 비시즌
+OFF_SEASON_WINDOW = 5
+OFF_SEASON_RATIO_TO_MEAN = 0.60  # 5주 이동평균 <= 전체평균 * 이 값
+OFF_SEASON_EACH_WEEK_MAX_TO_MEAN = 0.50  # 후보 5주 각각 <= 전체평균 * 이 값
+OFF_SEASON_MAX_WOW_STDDEV = 0.25  # 5주간 전주대비 증가율의 표준편차 상한(작을수록 기울기 변화 작음)
+
+NORMALTEST_MIN_N = 8  # 정규성 검정 최소 표본
 
 PLC_LINE_COLOR_MAP = {
     "도입": "#1f77b4",  # 파랑
@@ -252,70 +257,104 @@ def prepare_data(raw_df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # 4. 분석 보조 유틸
 # =========================
-def is_local_peak(series: pd.Series, idx: int, window: int = 1) -> bool:
+def week_over_week_rate(qty: np.ndarray) -> np.ndarray:
     """
-    주변 주차보다 뚜렷하게 높은 local peak 판단
+    전주 대비 증가율: (q[t] - q[t-1]) / max(q[t-1], eps)
+    첫 주차는 NaN
     """
-    current = series.iloc[idx]
-    start = max(0, idx - window)
-    end = min(len(series), idx + window + 1)
+    q = np.asarray(qty, dtype=float)
+    n = len(q)
+    w = np.full(n, np.nan)
+    eps = 1e-9
+    for i in range(1, n):
+        prev = q[i - 1]
+        if prev <= eps:
+            w[i] = np.inf if q[i] > eps else 0.0
+        else:
+            w[i] = (q[i] - prev) / prev
+    return w
 
-    neighbors = series.iloc[start:end].copy()
-    neighbors = neighbors.drop(series.index[idx], errors="ignore")
 
-    if len(neighbors) == 0:
+def growth_rate_accelerating_mask(wow: np.ndarray) -> np.ndarray:
+    """
+    연속 GROWTH_ACCEL_MIN_STREAK주 동안 전주대비 증가율이 단조 증가하는 구간 마스크.
+    """
+    n = len(wow)
+    k = GROWTH_ACCEL_MIN_STREAK
+    mask = np.zeros(n, dtype=bool)
+    if k < 2 or n < k:
+        return mask
+    for i in range(k - 1, n):
+        vals = [wow[i - k + 1 + j] for j in range(k)]
+        if any(np.isnan(v) for v in vals):
+            continue
+        if all(vals[j] < vals[j + 1] for j in range(k - 1)):
+            mask[i - k + 1 : i + 1] = True
+    return mask
+
+
+def pick_peak_idx(q: np.ndarray, wow: np.ndarray) -> int:
+    """
+    피크: 최대 판매량 주차. 동률이면 전주대비 증가율(wow)이 더 큰(급한) 주차.
+    """
+    n = len(q)
+    max_q = float(np.max(q))
+    cands = [i for i in range(n) if float(q[i]) >= max_q - 1e-9]
+    best = cands[0]
+    best_wow = -np.inf
+    for c in cands:
+        wv = wow[c]
+        if np.isnan(wv) or np.isinf(wv):
+            wv = -np.inf
+        if wv > best_wow:
+            best_wow = wv
+            best = c
+    return best
+
+
+def sales_look_normal(q: np.ndarray) -> bool:
+    """
+    정규분포에 가깝다고 보면 비시즌 없음.
+    scipy 있으면 Shapiro, 없으면 왜도/첨도 휴리스틱.
+    """
+    x = np.asarray(q, dtype=float)
+    x = x[~np.isnan(x)]
+    if len(x) < NORMALTEST_MIN_N:
         return False
+    try:
+        from scipy.stats import shapiro
 
-    return current > neighbors.max()
-
-
-def get_recent_slope(values: pd.Series, window: int = 3) -> float:
-    """
-    최근 흐름 단순 기울기
-    예: 최근 3개 값 기준으로 증가/감소 판단
-    """
-    s = values.dropna()
-    if len(s) < 2:
-        return 0.0
-
-    s = s.iloc[-window:]
-    x = np.arange(len(s))
-    y = s.values.astype(float)
-
-    if len(y) < 2:
-        return 0.0
-
-    slope = np.polyfit(x, y, 1)[0]
-    return float(slope)
-
-
-def get_segment_slope(series: pd.Series) -> float:
-    s = series.dropna().astype(float)
-
-    if len(s) < 2:
-        return 0.0
-
-    x = np.arange(len(s))
-    y = s.values
-    return float(np.polyfit(x, y, 1)[0])
+        _, p = shapiro(x)
+        return bool(p > 0.05)
+    except Exception:
+        s = float(pd.Series(x).skew())
+        k = float(pd.Series(x).kurtosis())
+        return abs(s) < 0.75 and abs(k) < 1.2
 
 
 def find_off_season_ranges(
     df: pd.DataFrame,
     intro_end: int,
-    decline_start: int
+    decline_start: int,
+    wow: np.ndarray,
 ) -> List[Tuple[int, int]]:
     """
-    비시즌 정의:
-    - 5주 이동평균이 전체 평균의 60% 이하인 구간만 후보
-    - 후보 중 5주 평균이 가장 낮은 '연속 5주 1구간'만 비시즌으로 선택
+    비시즌 (선택, 중간 구간만):
+    - 판매량 분포가 정규에 가깝면 비시즌 없음
+    - 연속 5주 후보: 5주 이동평균 <= 전체평균*60%, 매주 판매량 <= 전체평균*50%
+    - 5주간 전주대비 증가율(wow) 표준편차가 작음(기울기 변화 크지 않음)
+    - 후보 중 5주 평균이 가장 낮은 연속 5주 1구간만 선택
     """
     if df.empty or "qty" not in df.columns:
         return []
 
     qty_series = df["qty"].fillna(0).astype(float).reset_index(drop=True)
     n = len(qty_series)
-    if n < OFF_SEASON_MIN_WEEKS:
+    if n < OFF_SEASON_WINDOW:
+        return []
+
+    q_arr = qty_series.values.astype(float)
+    if sales_look_normal(q_arr):
         return []
 
     overall_mean = float(qty_series.mean())
@@ -323,25 +362,37 @@ def find_off_season_ranges(
         return []
 
     rolling_avg = qty_series.rolling(window=OFF_SEASON_WINDOW).mean()
-    threshold = overall_mean * OFF_SEASON_RATIO_TO_MEAN
+    ma_threshold = overall_mean * OFF_SEASON_RATIO_TO_MEAN
+    each_cap = overall_mean * OFF_SEASON_EACH_WEEK_MAX_TO_MEAN
 
-    # 도입/쇠퇴 구간을 제외한 중간 구간에서만 비시즌 후보를 찾는다.
-    # (비시즌이 앞/뒤에 길게 찍히는 문제 방지)
-    search_start = max(intro_end + OFF_SEASON_WINDOW, OFF_SEASON_WINDOW - 1)
-    search_end = max(search_start - 1, decline_start - 1)
+    search_start = max(intro_end + 1, OFF_SEASON_WINDOW - 1)
+    search_end = min(decline_start - 1, n - 1)
     if search_end < search_start:
         return []
 
-    valid_window_ends = []
-    for i in range(search_start, search_end + 1):
-        if pd.isna(rolling_avg.iloc[i]):
+    valid_window_ends: List[int] = []
+    for end_idx in range(search_start, search_end + 1):
+        start_idx = end_idx - OFF_SEASON_WINDOW + 1
+        if start_idx <= intro_end or end_idx >= decline_start:
             continue
-        if float(rolling_avg.iloc[i]) <= threshold:
-            valid_window_ends.append(i)
+        if pd.isna(rolling_avg.iloc[end_idx]):
+            continue
+        if float(rolling_avg.iloc[end_idx]) > ma_threshold:
+            continue
+        window_q = q_arr[start_idx : end_idx + 1]
+        if np.any(window_q > each_cap + 1e-9):
+            continue
+        wseg = wow[start_idx : end_idx + 1]
+        wfinite = wseg[~np.isnan(wseg) & ~np.isinf(wseg)]
+        if len(wfinite) < 3:
+            continue
+        if float(np.std(wfinite)) > OFF_SEASON_MAX_WOW_STDDEV:
+            continue
+        valid_window_ends.append(end_idx)
+
     if not valid_window_ends:
         return []
 
-    # 최종 비시즌은 정확히 연속 5주 1구간
     best_end = min(valid_window_ends, key=lambda i: float(rolling_avg.iloc[i]))
     best_start = best_end - OFF_SEASON_WINDOW + 1
     return [(best_start, best_end)]
@@ -350,253 +401,193 @@ def find_off_season_ranges(
 # =========================
 # 5. 핵심 PLC 로직
 # =========================
-def classify_plc_stage(
-    idx: int,
-    qty_series: pd.Series,
-    discount_series: Optional[pd.Series] = None
-) -> str:
+def _find_mature_bounds(
+    q: np.ndarray,
+    n: int,
+    peak_idx: int,
+    intro_end: int,
+    mean_all: float,
+    mature_min: int,
+    reserve_decline_weeks: int,
+) -> Tuple[int, int]:
     """
-    사용자가 제시한 기준에 맞춰 주차별 PLC 단계 분류
-    우선순위:
-    1) 변곡점(최고점)
-    2) 쇠퇴
-    3) 성숙
-    4) 성장
-    5) 도입
+    성숙 구간 [L,R]: 피크 포함, 피크 직전·직후 최소 1주씩(가능할 때),
+    길이 >= mature_min, R <= n-1-reserve 로 쇠퇴 구간 확보.
+    가능하면 구간 내 매주 판매량 > 전체 평균인 쪽을 우선.
     """
+    R_max = n - 1 - reserve_decline_weeks
+    if R_max < 0:
+        return 0, max(0, n - 1)
 
-    current_qty = qty_series.iloc[idx]
-    if pd.isna(current_qty):
-        return "판단불가"
+    L_cap = peak_idx - 1 if peak_idx >= 1 else peak_idx
+    R_min_need = peak_idx + 1 if peak_idx + 1 <= R_max else peak_idx
 
-    max_qty = qty_series.max()
-    if max_qty <= 0 or pd.isna(max_qty):
-        return "판단불가"
+    best: Optional[Tuple[int, int]] = None
+    best_score = (-1, -1)
 
-    ratio_to_peak = current_qty / max_qty
-    peak_idx = int(qty_series.values.argmax())
-    recent_series = qty_series.iloc[max(0, idx - ROLLING_WINDOW + 1): idx + 1]
-    recent_slope = get_recent_slope(recent_series, window=ROLLING_WINDOW)
+    for L in range(intro_end + 1, peak_idx + 1):
+        if peak_idx >= 1 and L > L_cap:
+            continue
+        low_r = max(L + mature_min - 1, R_min_need, peak_idx)
+        if low_r > R_max:
+            continue
+        for R in range(low_r, R_max + 1):
+            if not (L <= peak_idx <= R):
+                continue
+            seg = q[L : R + 1]
+            above = int(np.sum(seg > mean_all + 1e-9))
+            length = R - L + 1
+            score = (above, length)
+            if score > best_score:
+                best_score = score
+                best = (L, R)
 
-    discount = np.nan
-    if discount_series is not None and len(discount_series) > idx:
-        discount = discount_series.iloc[idx]
+    if best is not None:
+        return best
 
-    # 판매 시작 후 첫 3주 계산
-    non_zero_idx = np.where(qty_series.fillna(0).values > 0)[0]
-    if len(non_zero_idx) > 0:
-        start_idx = non_zero_idx[0]
-        weeks_since_start = idx - start_idx + 1
-    else:
-        start_idx = idx
-        weeks_since_start = 999
-
-    # local peak 여부
-    local_peak = is_local_peak(qty_series.fillna(0), idx, window=LOCAL_PEAK_WINDOW)
-
-    # 1) 최고점은 peak_idx 1개만 별도 표시
-    if idx == peak_idx:
-        return "변곡점(최고점)"
-
-    # 2) 쇠퇴
-    # - 최고점 이후
-    # - 최고점 대비 70% 미만
-    # - 최근 기울기 음수
-    # - 평균 할인율 30% 이상이면서 하락 중
-    if idx > peak_idx:
-        if (ratio_to_peak < DECLINE_RATIO and recent_slope < 0):
-            return "쇠퇴"
-
-        if (not pd.isna(discount)) and (discount >= HIGH_DISCOUNT_RATIO) and (recent_slope < 0):
-            return "쇠퇴"
-
-    # 3) 성숙
-    # - 최고점 부근
-    # - 최고 판매량 대비 85% 이상
-    # - 최근 증감률이 크지 않음
-    # 최근 기울기가 거의 0에 가까우면 유지라고 판단
-    if ratio_to_peak >= MATURE_RATIO:
-        if abs(recent_slope) <= max_qty * 0.05:
-            return "성숙"
-        # 피크 부근이면 기울기가 조금 있어도 성숙 처리 가능
-        return "성숙"
-
-    # 4) 성장
-    # - 최고점 이전
-    # - 35% 이상 ~ 85% 미만
-    # - 증가 중
-    if idx < peak_idx:
-        if (GROWTH_MIN_RATIO <= ratio_to_peak < GROWTH_MAX_RATIO) and (recent_slope > 0):
-            return "성장"
-
-    # 5) 도입
-    # - 판매 시작 후 첫 3주
-    # - 최고 판매량 대비 35% 미만
-    # - 완만 증가
-    if weeks_since_start <= INTRO_WEEKS:
-        return "도입"
-
-    if ratio_to_peak < GROWTH_MIN_RATIO and recent_slope >= 0:
-        return "도입"
-
-    # 남는 경우 보정
-    # 피크 이전이면 성장, 이후면 쇠퇴 쪽으로 보정
-    if idx < peak_idx:
-        return "성장"
-    elif idx > peak_idx:
-        return "쇠퇴"
-    else:
-        return "성숙"
+    L = max(intro_end + 1, peak_idx - 1 if peak_idx >= 1 else peak_idx)
+    need_r = peak_idx + 1 if peak_idx + 1 <= R_max else peak_idx
+    R = min(R_max, max(need_r, L + mature_min - 1, peak_idx))
+    if R < L:
+        R = min(R_max, L + mature_min - 1)
+    return L, R
 
 
-def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
+def assign_plc_stages(item_df: pd.DataFrame) -> pd.DataFrame:
     """
-    PLC 단계 흐름을 보정한다.
+    규칙 기반 PLC 배치 (전주대비 증가율 = recent_slope).
 
-    기본 흐름:
-    도입 -> 성장 -> 성숙 -> 쇠퇴 (필수)
-    비시즌은 선택적으로 중간에 표시
-
-    규칙:
-    - 초반은 무조건 도입
-    - 도입/성장/성숙/쇠퇴는 모든 아이템에 반드시 존재하도록 강제
-    - 비시즌은 필수가 아니며, 조건을 만족할 때만 선택적으로 반영
+    - 초반 무조건 도입, 도입은 최대 4주·급상승(전주대비 증가율 상한) 시 종료
+    - 성장: 피크 직전 구간(타임라인). 구간 내 일부 주는 증가율 가속(3주 연속) 패턴으로 표시 가능
+    - 성숙: 피크 포함 4주 이상, 피크 앞뒤 최소 1주, 가능 시 구간 전체가 평균 초과
+    - 쇠퇴: 성숙 이후(마지막 주는 쇠퇴로 고정 when n>=2)
+    - 피크: 최대 판매량, 동률 시 전주대비 증가율이 더 큰 주차
+    - 비시즌: 선택, find_off_season_ranges 조건 충족 시에만 중간에 5주
     """
-    df = item_df.copy().reset_index(drop=True)
+    df = item_df.sort_values("sort_key").reset_index(drop=True).copy()
+    q = df["qty"].fillna(0).values.astype(float)
+    n = len(q)
+    wow = week_over_week_rate(q)
+    df["recent_slope"] = wow
+    df["growth_accel"] = growth_rate_accelerating_mask(wow)
 
-    if df.empty:
+    if n == 0:
+        df["plc_stage"] = pd.Series(dtype=object)
+        df["peak_qty"] = np.nan
+        df["ratio_to_peak"] = np.nan
+        df["is_peak_week"] = False
         return df
 
-    peak_idx = int(df["qty"].fillna(0).values.argmax())
-    n = len(df)
+    peak_qty = float(np.max(q))
+    df["peak_qty"] = peak_qty
+    df["ratio_to_peak"] = np.where(peak_qty > 0, q / peak_qty, np.nan)
 
     if n < 4:
-        # 주차가 너무 짧은 경우 가능한 범위에서만 배치
-        df["plc_stage_final"] = df.get("plc_stage_raw", pd.Series(index=df.index, dtype="object"))
-        if n >= 1:
-            df.loc[0, "plc_stage_final"] = "도입"
+        stages = ["도입"] * n
         if n >= 2:
-            df.loc[1, "plc_stage_final"] = "성장"
+            stages[1] = "성장"
         if n >= 3:
-            df.loc[2, "plc_stage_final"] = "성숙"
-        if n >= 4:
-            df.loc[3:, "plc_stage_final"] = "쇠퇴"
-        df["plc_stage"] = df["plc_stage_final"]
+            stages[2] = "성숙"
+        df["plc_stage"] = stages
+        df["is_peak_week"] = False
+        pi = pick_peak_idx(q, wow)
+        df.loc[pi, "is_peak_week"] = True
         return df
 
-    # -------------------------
-    # 1. 도입 구간 확정
-    # -------------------------
-    # 초반 도입은 무조건 보장하되, 4단계가 모두 남도록 상한을 둔다.
-    intro_end = min(INTRO_WEEKS - 1, max(0, n - 4))
+    peak_idx = pick_peak_idx(q, wow)
+    mean_all = float(np.mean(q))
 
-    for i in range(intro_end + 1, n):
-        if df.loc[i, "plc_stage_raw"] == "도입":
-            df.loc[i, "plc_stage_raw"] = "성장" if i < peak_idx else "성숙"
-
-    # -------------------------
-    # 2. peak 이전 쇠퇴 금지
-    # -------------------------
-    for i in range(0, peak_idx):
-        if df.loc[i, "plc_stage_raw"] == "쇠퇴":
-            df.loc[i, "plc_stage_raw"] = "성장"
-
-    # -------------------------
-    # 3. 필수 단계 경계 강제 설정
-    # -------------------------
-    growth_start = intro_end + 1
-
-    # 기존 raw 분류에서 끝 연속 쇠퇴를 우선 존중하고, 없으면 마지막 1주를 쇠퇴로 강제
-    decline_start = n
-    for i in range(n - 1, -1, -1):
-        if df.loc[i, "plc_stage_raw"] == "쇠퇴":
-            decline_start = i
-        else:
+    max_intro_idx = min(INTRO_MAX_WEEKS - 1, max(0, n - 4))
+    intro_end = 0
+    for i in range(1, max_intro_idx + 1):
+        wi = wow[i]
+        if np.isnan(wi) or wi > INTRO_MAX_WOW_RATIO:
             break
-    if decline_start == n:
-        decline_start = n - 1
+        intro_end = i
 
-    mature_start = min(max(peak_idx, growth_start + 1), decline_start - 1)
-    growth_anchor = growth_start
-    mature_anchor = mature_start
+    if peak_idx <= intro_end:
+        intro_end = max(0, peak_idx - 1)
+        intro_end = min(intro_end, INTRO_MAX_WEEKS - 1, max(0, n - 4))
 
-    for i in range(0, decline_start):
-        if df.loc[i, "plc_stage_raw"] == "쇠퇴":
-            df.loc[i, "plc_stage_raw"] = "성숙" if i >= peak_idx else "성장"
+    reserve_decl = 1 if n >= 5 else 0
 
-    # -------------------------
-    # 4. peak 전후 기본 정리
-    # -------------------------
-    for i in range(n):
-        stage = df.loc[i, "plc_stage_raw"]
+    def _mature_eff(ie: int) -> int:
+        return min(MATURE_MIN_WEEKS, max(1, n - (ie + 1) - reserve_decl - 1))
 
-        if i < peak_idx:
-            if stage == "쇠퇴":
-                df.loc[i, "plc_stage_raw"] = "성장"
-        elif i > peak_idx:
-            if stage == "도입":
-                df.loc[i, "plc_stage_raw"] = "성숙"
+    L, R = _find_mature_bounds(
+        q, n, peak_idx, intro_end, mean_all, _mature_eff(intro_end), reserve_decl
+    )
 
-    # -------------------------
-    # 5. 최종 컬럼 준비
-    # -------------------------
-    df["plc_stage_final"] = df["plc_stage_raw"]
+    for _ in range(6):
+        if L > intro_end + 1:
+            break
+        if intro_end <= 0:
+            break
+        intro_end -= 1
+        intro_end = min(intro_end, INTRO_MAX_WEEKS - 1, max(0, n - 4))
+        L, R = _find_mature_bounds(
+            q, n, peak_idx, intro_end, mean_all, _mature_eff(intro_end), reserve_decl
+        )
 
-    # -------------------------
-    # 6. 비시즌 반영
-    # -------------------------
-    off_ranges = find_off_season_ranges(df, intro_end=intro_end, decline_start=decline_start)
-    for start_idx, end_idx in off_ranges:
-        for i in range(start_idx, end_idx + 1):
-            df.loc[i, "plc_stage_final"] = "비시즌"
+    growth_start = intro_end + 1
+    mature_start = L
+    decline_start = min(R + 1, n)
 
-    # -------------------------
-    # 7. 최종 흐름 정리
-    # -------------------------
+    stages = [""] * n
+    for i in range(0, intro_end + 1):
+        stages[i] = "도입"
     for i in range(growth_start, mature_start):
-        if df.loc[i, "plc_stage_final"] != "비시즌":
-            df.loc[i, "plc_stage_final"] = "성장"
-
+        stages[i] = "성장"
     for i in range(mature_start, decline_start):
-        if df.loc[i, "plc_stage_final"] != "비시즌":
-            df.loc[i, "plc_stage_final"] = "성숙"
-
-    # peak 주차는 성숙으로 두고, 마커만 별도로 표시
-    df.loc[peak_idx, "plc_stage_final"] = "성숙"
-
-    # 마지막 쇠퇴 구간 유지
+        stages[i] = "성숙"
     for i in range(decline_start, n):
-        df.loc[i, "plc_stage_final"] = "쇠퇴"
+        stages[i] = "쇠퇴"
 
-    # 비시즌은 선택 단계이므로, 필수 4단계 앵커는 마지막에 다시 보장
+    if n >= 2:
+        stages[-1] = "쇠퇴"
+
+    df["plc_stage_final"] = stages
+    df["is_peak_week"] = False
+    df.loc[peak_idx, "is_peak_week"] = True
+
+    off_ranges = find_off_season_ranges(df, intro_end, decline_start, wow)
+    for s_idx, e_idx in off_ranges:
+        for j in range(s_idx, e_idx + 1):
+            if j >= decline_start:
+                continue
+            df.loc[j, "plc_stage_final"] = "비시즌"
+
     df.loc[:intro_end, "plc_stage_final"] = "도입"
-    df.loc[growth_anchor, "plc_stage_final"] = "성장"
-    df.loc[mature_anchor, "plc_stage_final"] = "성숙"
+    df.loc[growth_start, "plc_stage_final"] = "성장"
+    df.loc[peak_idx, "plc_stage_final"] = "성숙"
+    if peak_idx + 1 < decline_start:
+        df.loc[peak_idx + 1, "plc_stage_final"] = "성숙"
     df.loc[decline_start:, "plc_stage_final"] = "쇠퇴"
 
-    # 안전장치: 비시즌은 0주 또는 연속 5주 1구간만 허용
-    final_off_idx = df.index[df["plc_stage_final"] == "비시즌"].tolist()
-    if final_off_idx and len(final_off_idx) != OFF_SEASON_WINDOW:
-        # 일단 비시즌을 제거하고 기본 흐름으로 복원
-        for i in final_off_idx:
-            if i <= intro_end:
-                df.loc[i, "plc_stage_final"] = "도입"
-            elif i < mature_start:
-                df.loc[i, "plc_stage_final"] = "성장"
-            elif i < decline_start:
-                df.loc[i, "plc_stage_final"] = "성숙"
+    off_idx = df.index[df["plc_stage_final"] == "비시즌"].tolist()
+    if off_idx and len(off_idx) != OFF_SEASON_WINDOW:
+        for j in off_idx:
+            if j <= intro_end:
+                df.loc[j, "plc_stage_final"] = "도입"
+            elif j < mature_start:
+                df.loc[j, "plc_stage_final"] = "성장"
+            elif j < decline_start:
+                df.loc[j, "plc_stage_final"] = "성숙"
             else:
-                df.loc[i, "plc_stage_final"] = "쇠퇴"
-
-        # 규칙에 맞는 5주 구간이 있으면 다시 1구간만 적용
-        recalculated_off = find_off_season_ranges(df, intro_end=intro_end, decline_start=decline_start)
-        for start_idx, end_idx in recalculated_off:
-            for i in range(start_idx, end_idx + 1):
-                if i < decline_start:
-                    df.loc[i, "plc_stage_final"] = "비시즌"
+                df.loc[j, "plc_stage_final"] = "쇠퇴"
+        off_ranges = find_off_season_ranges(df, intro_end, decline_start, wow)
+        for s_idx, e_idx in off_ranges:
+            for j in range(s_idx, e_idx + 1):
+                if j < decline_start:
+                    df.loc[j, "plc_stage_final"] = "비시즌"
+        df.loc[:intro_end, "plc_stage_final"] = "도입"
+        df.loc[growth_start, "plc_stage_final"] = "성장"
+        df.loc[peak_idx, "plc_stage_final"] = "성숙"
+        if peak_idx + 1 < decline_start:
+            df.loc[peak_idx + 1, "plc_stage_final"] = "성숙"
+        df.loc[decline_start:, "plc_stage_final"] = "쇠퇴"
 
     df["plc_stage"] = df["plc_stage_final"]
-
     return df
 
 
@@ -604,31 +595,11 @@ def build_item_plc(item_df: pd.DataFrame) -> pd.DataFrame:
     item_df = item_df.sort_values("sort_key").reset_index(drop=True).copy()
 
     qty_series = item_df["qty"].fillna(0)
-    discount_series = item_df["discount_rate"] if "discount_rate" in item_df.columns else pd.Series([np.nan] * len(item_df))
 
     item_df["peak_qty"] = qty_series.max()
     item_df["ratio_to_peak"] = np.where(item_df["peak_qty"] > 0, item_df["qty"] / item_df["peak_qty"], np.nan)
 
-    item_df["recent_slope"] = [
-        get_recent_slope(qty_series.iloc[max(0, i - ROLLING_WINDOW + 1): i + 1], window=ROLLING_WINDOW)
-        for i in range(len(item_df))
-    ]
-
-    item_df["plc_stage_raw"] = [
-        classify_plc_stage(i, qty_series, discount_series)
-        for i in range(len(item_df))
-    ]
-
-    peak_idx = int(qty_series.values.argmax()) if len(qty_series) > 0 else None
-    item_df["is_peak_week"] = False
-    if peak_idx is not None:
-        item_df.loc[peak_idx, "is_peak_week"] = True
-
-    # 변곡점(최고점)은 마커로만 표시하고,
-    # plc_stage는 4단계 체계로 정리
-    item_df["plc_stage_raw"] = item_df["plc_stage_raw"].replace("변곡점(최고점)", "성숙")
-
-    item_df = enforce_single_intro_decline(item_df)
+    item_df = assign_plc_stages(item_df)
 
     return item_df
 
@@ -660,48 +631,49 @@ def summarize_latest_status(all_plc_df: pd.DataFrame) -> pd.DataFrame:
 def make_stage_reason(row: pd.Series) -> str:
     stage = row.get("plc_stage", "")
     qty = row.get("qty", np.nan)
-    peak = row.get("peak_qty", np.nan)
     ratio = row.get("ratio_to_peak", np.nan)
     slope = row.get("recent_slope", np.nan)
-    discount = row.get("discount_rate", np.nan)
+    accel = row.get("growth_accel", False)
 
     ratio_pct = f"{ratio * 100:.1f}%" if pd.notna(ratio) else "-"
-    discount_pct = f"{discount * 100:.1f}%" if pd.notna(discount) else "-"
+    slope_pct = f"{slope * 100:.1f}%" if pd.notna(slope) and np.isfinite(slope) else "-"
 
     if stage == "도입":
         return (
-            f"판매 시작 초기 구간으로 판단했습니다. "
-            f"현재 판매수량은 {qty:.0f}, 최고점 대비 {ratio_pct} 수준입니다. "
-            f"최근 흐름은 완만한 증가로 보고 도입 단계로 분류했습니다."
+            f"시작 구간은 무조건 도입으로 두었습니다. "
+            f"도입은 최대 {INTRO_MAX_WEEKS}주이며, 전주 대비 증가율이 "
+            f"{INTRO_MAX_WOW_RATIO:.0%}을 넘는 급상승이 나오면 도입을 종료합니다. "
+            f"현재 판매수량 {qty:.0f}, 최고점 대비 {ratio_pct}, 전주 대비 증가율 {slope_pct}입니다."
         )
     elif stage == "성장":
+        accel_txt = "연속 3주 동안 전주 대비 증가율이 커지는 가속 패턴이 있습니다. " if accel else ""
         return (
-            f"최고점 이전 상승 구간으로 판단했습니다. "
-            f"현재 판매수량은 {qty:.0f}, 최고점 대비 {ratio_pct} 수준이며 "
-            f"최근 흐름이 증가 중이어서 성장 단계로 분류했습니다."
+            f"피크 이전 성장 구간입니다. {accel_txt}"
+            f"성장기 판단에는 전주 대비 증가율(증가량이 아닌 비율) 추이를 사용합니다. "
+            f"현재 판매수량 {qty:.0f}, 최고점 대비 {ratio_pct}, 전주 대비 증가율 {slope_pct}입니다."
         )
     elif stage == "성숙":
         return (
-            f"최고점 부근의 유지 구간으로 판단했습니다. "
-            f"현재 판매수량은 {qty:.0f}, 최고점 대비 {ratio_pct} 수준입니다. "
-            f"잘 팔리는 수준이 유지되고 있어 성숙 단계로 분류했습니다."
+            f"피크를 포함하는 성숙 구간입니다. 피크 전·후 최소 1주씩 포함하고, "
+            f"가능하면 구간 내 매주 판매량이 전체 평균보다 높은 후보를 고릅니다. "
+            f"현재 판매수량 {qty:.0f}, 최고점 대비 {ratio_pct}입니다."
         )
     elif stage == "비시즌":
         return (
-            f"저조한 판매가 지속되는 비시즌으로 판단했습니다. "
-            f"5주 이동평균이 전체 평균의 60% 이하인 구간 중 "
-            f"가장 낮은 5주를 비시즌으로 표시했습니다."
+            f"판매량 분포가 정규에 가깝지 않을 때만 비시즌을 둡니다. "
+            f"5주 이동평균이 전체 평균의 {OFF_SEASON_RATIO_TO_MEAN:.0%} 이하이고, "
+            f"해당 5주 각각이 평균의 {OFF_SEASON_EACH_WEEK_MAX_TO_MEAN:.0%} 이하이며, "
+            f"전주 대비 증가율의 변동이 작은 연속 5주 중 5주 평균이 가장 낮은 1구간을 택합니다."
         )
     elif stage == "변곡점(최고점)":
         return (
-            f"해당 주차가 전체 기간 중 최고 판매량이거나 주변 주차보다 뚜렷하게 높은 구간입니다. "
-            f"현재 판매수량은 {qty:.0f}이며 정점 주차로 판단했습니다."
+            f"전체 기간 중 최대 판매량 주차이며, 동률이면 전주 대비 증가율이 더 큰 주를 피크로 잡습니다. "
+            f"현재 판매수량은 {qty:.0f}입니다."
         )
     elif stage == "쇠퇴":
         return (
-            f"최고점 이후 하락 구간으로 판단했습니다. "
-            f"현재 판매수량은 {qty:.0f}, 최고점 대비 {ratio_pct} 수준입니다. "
-            f"최근 흐름이 하락 중이며 할인율은 {discount_pct}입니다."
+            f"피크 이후 쇠퇴 구간입니다. "
+            f"현재 판매수량 {qty:.0f}, 최고점 대비 {ratio_pct}, 전주 대비 증가율 {slope_pct}입니다."
         )
     else:
         return "현재 데이터만으로 단계 판단이 어렵습니다."
@@ -1013,7 +985,8 @@ if item_df.empty:
     st.stop()
 
 latest_row = item_df.iloc[-1]
-peak_row = item_df.loc[item_df["qty"].idxmax()]
+_peak_df = item_df[item_df["is_peak_week"] == True]
+peak_row = _peak_df.iloc[0] if len(_peak_df) else item_df.loc[item_df["qty"].idxmax()]
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("현재 PLC", latest_row["plc_stage"])
@@ -1039,7 +1012,7 @@ with st.expander("주차별 상세 데이터", expanded=False):
 
     show_cols = [
         "year_week", "qty", "peak_qty", "ratio_to_peak",
-        "recent_slope", "discount_rate", "plc_stage"
+        "recent_slope", "growth_accel", "discount_rate", "plc_stage"
     ]
     show_cols = [c for c in show_cols if c in detail_df.columns]
     st.dataframe(detail_df[show_cols], use_container_width=True, hide_index=True)
@@ -1052,36 +1025,35 @@ st.subheader("PLC 분류 기준")
 
 st.markdown(
     """
+**공통**
+- 기울기(변화율)는 **전주 대비 증가율** `(이번주−전주)/전주` 로 계산합니다.
+- 초반은 무조건 **도입**, **도입·성장·성숙·쇠퇴**는 모든 아이템에 최소 1주씩 존재하도록 맞춥니다.
+- **비시즌**은 필수가 아니며, 아래 조건을 만족할 때만 중간에 표시합니다.
+
 **도입**
-- 판매 시작 후 첫 3주 이내
-- 최고 판매량 대비 35% 미만
-- 최근 흐름이 완만하게 증가 중
+- 시작 주차는 항상 도입입니다.
+- 도입 구간은 **5주 이상이 될 수 없습니다**(최대 4주).
+- 전주 대비 증가율이 **급상승**이면(상한 초과) 도입을 끝냅니다.
 
 **성장**
-- 최고점 이전 구간
-- 최고 판매량 대비 35% 이상 ~ 85% 미만
-- 최근 판매량이 이전보다 증가 중
+- 피크 **이전** 타임라인 구간입니다.
+- **연속 3주** 동안 전주 대비 증가율이 **계속 커지는**(가속) 패턴이 있으면 성장기 근거로 활용합니다(증가량이 아니라 **증가율**).
 
 **성숙**
-- 최고점 부근
-- 최고 판매량 대비 85% 이상
-- 최근 증감률이 크지 않음
+- **4주 이상**, 피크 **앞·뒤 최소 1주씩** 포함하는 구간 후보 중에서 고릅니다.
+- 가능하면 구간 안의 **모든 주**가 판매량 **전체 평균보다 높은** 구간을 우선합니다.
 
-**비시즌**
-- 저조한 판매가 5주 이상 지속되는 구간
-- 5주 이동평균이 전체 평균의 60% 이하
-- 도입/쇠퇴 구간을 제외한 중간 구간에서만
-- 후보 중 5주 평균이 가장 낮은 연속 5주 1구간만 비시즌으로 지정
-
-**변곡점(최고점)**
-- 전체 기간 중 가장 높은 판매량 주차
-- 또는 주변 주차보다 뚜렷하게 높은 local peak
+**피크(변곡점·최고점)**
+- **최대 판매량** 주차입니다. 동률이면 전주 대비 증가율이 **더 큰(더 급한)** 주차를 피크로 씁니다.
 
 **쇠퇴**
-- 최고점 이후 구간
-- 최고점 대비 70% 미만
-- 최근 증감률 음수
-- 평균 할인율 30% 이상이면서 하락 중
+- 피크 **이후** 구간입니다.
+
+**비시즌** (선택)
+- 판매량이 **정규분포에 가깝다**고 판단되면 비시즌을 두지 않습니다(Shapiro 검정, 없으면 왜도·첨도 휴리스틱).
+- **연속 5주** 후보: 5주 이동평균 ≤ 전체평균×60%, **각 주** 판매량 ≤ 전체평균×50%.
+- 5주간 전주 대비 증가율의 **표준편차가 작을 것**(기울기 변화가 크지 않음).
+- 도입·쇠퇴 구간을 제외한 **중간**에서만 탐색하고, 후보 중 **5주 평균이 가장 낮은 연속 5주 1구간**만 지정합니다.
 """
 )
 
