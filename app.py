@@ -333,29 +333,85 @@ def build_dual_line_chart(item_name: str, weekly_df: pd.DataFrame, monthly_df: p
 # =========================
 # 월별 매출 형태 판별 (단봉 / 다봉)
 # =========================
-def count_peaks(values: np.ndarray) -> int:
+def smooth_series(values: np.ndarray, window: int = 3) -> np.ndarray:
     """
-    local peak 개수
-    y[i-1] < y[i] >= y[i+1]
+    월별 매출을 약간 부드럽게 만들어 작은 흔들림을 줄입니다.
+    """
+    if len(values) < window:
+        return values.copy()
+
+    return pd.Series(values).rolling(
+        window=window,
+        center=True,
+        min_periods=1
+    ).mean().values
+
+
+def find_significant_peaks(
+    values: np.ndarray,
+    min_peak_ratio: float = 0.6,
+    min_prominence_ratio: float = 0.15,
+    min_distance: int = 2
+) -> List[int]:
+    """
+    의미 있는 peak만 찾기
+
+    - min_peak_ratio:
+      최고 peak 대비 몇 % 이상이어야 peak로 인정할지
+    - min_prominence_ratio:
+      주변보다 얼마나 높아야 peak로 인정할지
+    - min_distance:
+      peak 간 최소 거리(월 수)
     """
     if len(values) < 3:
-        return 0
+        return []
 
-    peaks = 0
+    max_val = np.max(values)
+    if max_val <= 0:
+        return []
 
+    candidate_peaks = []
+
+    # 1차 local peak 찾기
     for i in range(1, len(values) - 1):
         if values[i] > values[i - 1] and values[i] >= values[i + 1]:
-            peaks += 1
+            left_base = values[i - 1]
+            right_base = values[i + 1]
+            base_level = max(left_base, right_base)
 
-    return peaks
+            peak_ratio = values[i] / max_val
+            prominence = values[i] - base_level
+            prominence_ratio = prominence / max_val
+
+            if peak_ratio >= min_peak_ratio and prominence_ratio >= min_prominence_ratio:
+                candidate_peaks.append(i)
+
+    # 후보가 하나도 없으면 최고점 1개만 남김
+    if not candidate_peaks:
+        return [int(np.argmax(values))]
+
+    # 2차: peak 간 거리 정리
+    filtered = []
+    for idx in candidate_peaks:
+        if not filtered:
+            filtered.append(idx)
+        else:
+            prev_idx = filtered[-1]
+
+            if idx - prev_idx < min_distance:
+                # 너무 가까우면 더 큰 peak만 남김
+                if values[idx] > values[prev_idx]:
+                    filtered[-1] = idx
+            else:
+                filtered.append(idx)
+
+    return filtered
 
 
 def classify_monthly_shape(monthly_df: pd.DataFrame) -> str:
     """
-    월별 매출 기준
-    단봉형 / 다봉형 / 무봉형
+    월별 매출 기준으로 단봉형 / 다봉형 / 무봉형 분류
     """
-
     if monthly_df.empty:
         return "판단불가"
 
@@ -364,18 +420,25 @@ def classify_monthly_shape(monthly_df: pd.DataFrame) -> str:
     if len(y) < 3:
         return "판단불가"
 
-    peaks = count_peaks(y)
+    # 1) smoothing
+    y_smooth = smooth_series(y, window=3)
 
-    if peaks == 0:
+    # 2) 의미 있는 peak만 탐지
+    peaks = find_significant_peaks(
+        y_smooth,
+        min_peak_ratio=0.6,
+        min_prominence_ratio=0.15,
+        min_distance=2
+    )
+
+    if len(peaks) == 0:
         return "무봉형"
-
-    if peaks == 1:
+    elif len(peaks) == 1:
         return "단봉형"
-
-    if peaks >= 2:
+    else:
         return "다봉형"
 
-    return "판단불가"
+
 
 # =========================
 # 메인 화면
