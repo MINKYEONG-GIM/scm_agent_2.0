@@ -104,6 +104,137 @@ def parse_yearweek_to_date(yearweek: str) -> pd.Timestamp:
     except Exception:
         return pd.NaT
 
+def call_openai_chat_json(messages: List[dict]) -> dict:
+    """
+    Chat Completions API를 호출해서 JSON 응답을 받습니다.
+    """
+    api_key = get_gpt_gpi()
+    if not api_key:
+        raise ValueError("OpenAI API Key가 없습니다. st.secrets 또는 환경변수에 gpt_gpi / OPENAI_API_KEY를 설정하세요.")
+
+    payload = {
+        "model": "gpt-4.1-mini",
+        "messages": messages,
+        "temperature": 0,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "shape_result",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "shape_label": {
+                            "type": "string",
+                            "enum": ["단봉형", "다봉형"]
+                        },
+                        "reason": {
+                            "type": "string"
+                        }
+                    },
+                    "required": ["shape_label", "reason"],
+                    "additionalProperties": False
+                }
+            }
+        }
+    }
+
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    req = urllib.request.Request(
+        OPENAI_CHAT_URL,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        raise ValueError(f"OpenAI API 호출 실패: {e.code} / {body}")
+    except Exception as e:
+        raise ValueError(f"OpenAI API 호출 중 오류: {str(e)}")
+
+    content = result["choices"][0]["message"]["content"]
+    return json.loads(content)
+
+def classify_shape_with_gpt_if_ambiguous(item_name: str, monthly_df: pd.DataFrame) -> Tuple[str, str]:
+    """
+    1차는 로직으로 판별하고,
+    애매한 경우만 GPT로 단봉형/다봉형 판별
+    반환값: (shape_label, reason)
+    """
+    if monthly_df.empty:
+        return "판단불가", "월별 데이터가 없습니다."
+
+    y = monthly_df["sales"].values.astype(float)
+
+    if len(y) < 3:
+        return "판단불가", "월별 데이터가 3개 미만입니다."
+
+    y_smooth = smooth_series(y, window=2)
+    peaks = find_significant_peaks(
+        y_smooth,
+        min_peak_ratio=0.35,
+        min_prominence_ratio=0.10,
+        min_distance=1
+    )
+
+    # 명확하면 로직으로 바로 반환
+    if not is_ambiguous_case(y_smooth, peaks):
+        if len(peaks) <= 1:
+            return "단봉형", f"로직 판별: 의미 있는 peak {len(peaks)}개"
+        else:
+            return "다봉형", f"로직 판별: 의미 있는 peak {len(peaks)}개"
+
+    # 애매하면 GPT 호출
+    month_labels = monthly_df["month"].dt.strftime("%Y-%m").tolist()
+
+    prompt = f"""
+아이템의 월별 매출 형태를 단봉형 또는 다봉형 중 하나로만 판단해라.
+
+판단 기준:
+- 단봉형: 큰 중심 peak가 1개이고 나머지는 작은 흔들림
+- 다봉형: 서로 독립적인 의미 있는 peak가 2개 이상
+
+주의:
+- 작은 잡음은 별도 peak로 보지 말 것
+- 반드시 "단봉형" 또는 "다봉형" 중 하나만 선택할 것
+- reason은 짧고 명확하게 한글로 작성할 것
+
+아이템명: {item_name}
+월 라벨: {month_labels}
+월별 매출: {[float(v) for v in y]}
+스무딩 값: {[round(float(v), 2) for v in y_smooth]}
+peak 후보 인덱스: {peaks}
+peak 후보 월: {[month_labels[i] for i in peaks] if peaks else []}
+""".strip()
+
+    messages = [
+        {
+            "role": "developer",
+            "content": "너는 월별 매출 형태를 단봉형 또는 다봉형으로만 분류하는 분석가다. 반드시 JSON만 반환한다."
+        },
+        {
+            "role": "user",
+            "content": prompt
+        }
+    ]
+
+    try:
+        result = call_openai_chat_json(messages)
+        return result["shape_label"], result["reason"]
+    except Exception as e:
+        # GPT 실패 시 로직 fallback
+        if len(peaks) <= 1:
+            return "단봉형", f"GPT 실패로 로직 fallback 사용: {str(e)}"
+        else:
+            return "다봉형", f"GPT 실패로 로직 fallback 사용: {str(e)}"
+
 
 # =========================
 # 구글 시트 로딩 함수
@@ -329,13 +460,12 @@ def build_dual_line_chart(item_name: str, weekly_df: pd.DataFrame, monthly_df: p
 
     return fig
 
-
 # =========================
 # 월별 매출 형태 판별 (단봉 / 다봉)
 # =========================
-def smooth_series(values: np.ndarray, window: int = 3) -> np.ndarray:
+def smooth_series(values: np.ndarray, window: int = 2) -> np.ndarray:
     """
-    월별 매출을 약간 부드럽게 만들어 작은 흔들림을 줄입니다.
+    월별 매출을 약하게 smoothing
     """
     if len(values) < window:
         return values.copy()
@@ -349,19 +479,12 @@ def smooth_series(values: np.ndarray, window: int = 3) -> np.ndarray:
 
 def find_significant_peaks(
     values: np.ndarray,
-    min_peak_ratio: float = 0.6,
-    min_prominence_ratio: float = 0.15,
-    min_distance: int = 2
+    min_peak_ratio: float = 0.35,
+    min_prominence_ratio: float = 0.10,
+    min_distance: int = 1
 ) -> List[int]:
     """
     의미 있는 peak만 찾기
-
-    - min_peak_ratio:
-      최고 peak 대비 몇 % 이상이어야 peak로 인정할지
-    - min_prominence_ratio:
-      주변보다 얼마나 높아야 peak로 인정할지
-    - min_distance:
-      peak 간 최소 거리(월 수)
     """
     if len(values) < 3:
         return []
@@ -372,7 +495,6 @@ def find_significant_peaks(
 
     candidate_peaks = []
 
-    # 1차 local peak 찾기
     for i in range(1, len(values) - 1):
         if values[i] > values[i - 1] and values[i] >= values[i + 1]:
             left_base = values[i - 1]
@@ -386,20 +508,16 @@ def find_significant_peaks(
             if peak_ratio >= min_peak_ratio and prominence_ratio >= min_prominence_ratio:
                 candidate_peaks.append(i)
 
-    # 후보가 하나도 없으면 최고점 1개만 남김
     if not candidate_peaks:
         return []
 
-    # 2차: peak 간 거리 정리
     filtered = []
     for idx in candidate_peaks:
         if not filtered:
             filtered.append(idx)
         else:
             prev_idx = filtered[-1]
-
-            if idx - prev_idx < min_distance:
-                # 너무 가까우면 더 큰 peak만 남김
+            if idx - prev_idx <= min_distance:
                 if values[idx] > values[prev_idx]:
                     filtered[-1] = idx
             else:
@@ -408,38 +526,34 @@ def find_significant_peaks(
     return filtered
 
 
-def classify_monthly_shape(monthly_df: pd.DataFrame) -> str:
+def is_ambiguous_case(y_smooth: np.ndarray, peaks: List[int]) -> bool:
     """
-    월별 매출 기준으로 단봉형 / 다봉형 / 무봉형 분류
+    로직으로 단정하기 애매한 케이스인지 판단
     """
-    if monthly_df.empty:
-        return "판단불가"
+    if len(y_smooth) < 3:
+        return True
 
-    y = monthly_df["sales"].values.astype(float)
+    if len(peaks) == 1:
+        # 두 번째로 큰 값이 꽤 크면 애매
+        sorted_vals = np.sort(y_smooth)[::-1]
+        if len(sorted_vals) >= 2 and sorted_vals[0] > 0:
+            second_ratio = sorted_vals[1] / sorted_vals[0]
+            if second_ratio >= 0.65:
+                return True
 
-    if len(y) < 3:
-        return "판단불가"
-
-    # 1) smoothing
-    y_smooth = smooth_series(y, window=3)
-
-    # 2) 의미 있는 peak만 탐지
-    peaks = find_significant_peaks(
-        y_smooth,
-        min_peak_ratio=0.45,
-        min_prominence_ratio=0.1,
-        min_distance=2
-    )
+    if len(peaks) == 2:
+        # 두 peak 높이 차이가 작으면 애매
+        p1 = y_smooth[peaks[0]]
+        p2 = y_smooth[peaks[1]]
+        if max(p1, p2) > 0:
+            ratio = min(p1, p2) / max(p1, p2)
+            if ratio >= 0.6:
+                return True
 
     if len(peaks) == 0:
-        return "무봉형"
-    elif len(peaks) == 1:
-        return "단봉형"
-    else:
-        return "다봉형"
+        return True
 
-
-
+    return False
 # =========================
 # 메인 화면
 # =========================
@@ -466,10 +580,11 @@ def main():
     )
 
     weekly_df, monthly_df = prepare_item_timeseries(df, selected_item)
-    shape_label = classify_monthly_shape(monthly_df)
-    
+    shape_label, shape_reason = classify_shape_with_gpt_if_ambiguous(selected_item, monthly_df)
+
     st.markdown(f"### 형태: {shape_label}")
-    
+    st.caption(shape_reason)
+        
     fig = build_dual_line_chart(selected_item, weekly_df, monthly_df)
 
     st.plotly_chart(fig, use_container_width=True)
