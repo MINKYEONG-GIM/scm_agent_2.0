@@ -281,7 +281,8 @@ def find_off_season_ranges(df: pd.DataFrame) -> List[Tuple[int, int]]:
     """
     비시즌 정의:
     - 5주 이동평균이 전체 평균의 60% 이하인 구간만 후보
-    - 후보 중 '가장 낮은 5주 평균' 1개 구간을 비시즌으로 선택
+    - 후보는 '저조 구간이 5주 이상 연속'일 때만 유효
+    - 유효 후보 주차 중 판매량이 가장 낮은 5개 주차만 비시즌으로 선택
     """
     if df.empty or "qty" not in df.columns:
         return []
@@ -305,10 +306,39 @@ def find_off_season_ranges(df: pd.DataFrame) -> List[Tuple[int, int]]:
     if not valid_window_ends:
         return []
 
-    best_end = min(valid_window_ends, key=lambda i: float(rolling_avg.iloc[i]))
-    best_start = best_end - OFF_SEASON_WINDOW + 1
+    # 이동평균 조건을 만족하는 window들에서 주차 후보를 수집
+    candidate_weeks = set()
+    for end_idx in valid_window_ends:
+        start_idx = end_idx - OFF_SEASON_WINDOW + 1
+        for w in range(start_idx, end_idx + 1):
+            candidate_weeks.add(w)
 
-    return [(best_start, best_end)]
+    if len(candidate_weeks) < OFF_SEASON_MIN_WEEKS:
+        return []
+
+    # 5주 이상 연속되는 저조 구간만 유효
+    sorted_weeks = sorted(candidate_weeks)
+    valid_pool: List[int] = []
+    streak = [sorted_weeks[0]]
+    for i in range(1, len(sorted_weeks)):
+        if sorted_weeks[i] == sorted_weeks[i - 1] + 1:
+            streak.append(sorted_weeks[i])
+        else:
+            if len(streak) >= OFF_SEASON_MIN_WEEKS:
+                valid_pool.extend(streak)
+            streak = [sorted_weeks[i]]
+    if len(streak) >= OFF_SEASON_MIN_WEEKS:
+        valid_pool.extend(streak)
+
+    if len(valid_pool) < OFF_SEASON_MIN_WEEKS:
+        return []
+
+    # 최종 비시즌은 정확히 5주(판매량 가장 낮은 5개 주차)
+    unique_pool = sorted(set(valid_pool))
+    lowest_five = sorted(unique_pool, key=lambda i: float(qty_series.iloc[i]))[:OFF_SEASON_WINDOW]
+    lowest_five = sorted(lowest_five)
+
+    return [(i, i) for i in lowest_five]
 
 
 # =========================
@@ -418,13 +448,13 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     PLC 단계 흐름을 보정한다.
 
     기본 흐름:
-    도입 -> 성장 -> 비시즌 -> 성장/성숙 -> 쇠퇴
+    도입 -> 성장 -> 성숙 -> 쇠퇴 (필수)
+    비시즌은 선택적으로 중간에 표시
 
     규칙:
-    - 도입은 맨 앞 최대 INTRO_WEEKS까지만 허용
-    - 쇠퇴는 맨 뒤 1개 연속 구간만 허용
-    - 비시즌은 5주 이동평균이 전체 평균의 60% 이하인 후보 중
-      가장 낮은 5주 평균 1개 구간으로 지정
+    - 초반은 무조건 도입
+    - 도입/성장/성숙/쇠퇴는 모든 아이템에 반드시 존재하도록 강제
+    - 비시즌은 필수가 아니며, 조건을 만족할 때만 선택적으로 반영
     """
     df = item_df.copy().reset_index(drop=True)
 
@@ -434,17 +464,25 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     peak_idx = int(df["qty"].fillna(0).values.argmax())
     n = len(df)
 
+    if n < 4:
+        # 주차가 너무 짧은 경우 가능한 범위에서만 배치
+        df["plc_stage_final"] = df.get("plc_stage_raw", pd.Series(index=df.index, dtype="object"))
+        if n >= 1:
+            df.loc[0, "plc_stage_final"] = "도입"
+        if n >= 2:
+            df.loc[1, "plc_stage_final"] = "성장"
+        if n >= 3:
+            df.loc[2, "plc_stage_final"] = "성숙"
+        if n >= 4:
+            df.loc[3:, "plc_stage_final"] = "쇠퇴"
+        df["plc_stage"] = df["plc_stage_final"]
+        return df
+
     # -------------------------
     # 1. 도입 구간 확정
     # -------------------------
-    intro_end = -1
-    for i in range(n):
-        if df.loc[i, "plc_stage_raw"] == "도입":
-            intro_end = i
-        else:
-            break
-
-    intro_end = min(intro_end, INTRO_WEEKS - 1)
+    # 초반 도입은 무조건 보장하되, 4단계가 모두 남도록 상한을 둔다.
+    intro_end = min(INTRO_WEEKS - 1, max(0, n - 4))
 
     for i in range(intro_end + 1, n):
         if df.loc[i, "plc_stage_raw"] == "도입":
@@ -458,14 +496,13 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
             df.loc[i, "plc_stage_raw"] = "성장"
 
     # -------------------------
-    # 3. 끝 연속 쇠퇴만 인정
+    # 3. 필수 단계 경계 강제 설정
     # -------------------------
-    decline_start = n
-    for i in range(n - 1, -1, -1):
-        if df.loc[i, "plc_stage_raw"] == "쇠퇴":
-            decline_start = i
-        else:
-            break
+    growth_start = intro_end + 1
+    decline_start = n - 1  # 쇠퇴는 마지막 주차에 최소 1주 강제
+    mature_start = min(max(peak_idx, growth_start + 1), decline_start - 1)
+    growth_anchor = growth_start
+    mature_anchor = mature_start
 
     for i in range(0, decline_start):
         if df.loc[i, "plc_stage_raw"] == "쇠퇴":
@@ -500,11 +537,11 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     # -------------------------
     # 7. 최종 흐름 정리
     # -------------------------
-    for i in range(intro_end + 1, peak_idx):
+    for i in range(growth_start, mature_start):
         if df.loc[i, "plc_stage_final"] != "비시즌":
             df.loc[i, "plc_stage_final"] = "성장"
 
-    for i in range(peak_idx + 1, decline_start):
+    for i in range(mature_start, decline_start):
         if df.loc[i, "plc_stage_final"] != "비시즌":
             df.loc[i, "plc_stage_final"] = "성숙"
 
@@ -514,6 +551,12 @@ def enforce_single_intro_decline(item_df: pd.DataFrame) -> pd.DataFrame:
     # 마지막 쇠퇴 구간 유지
     for i in range(decline_start, n):
         df.loc[i, "plc_stage_final"] = "쇠퇴"
+
+    # 비시즌은 선택 단계이므로, 필수 4단계 앵커는 마지막에 다시 보장
+    df.loc[:intro_end, "plc_stage_final"] = "도입"
+    df.loc[growth_anchor, "plc_stage_final"] = "성장"
+    df.loc[mature_anchor, "plc_stage_final"] = "성숙"
+    df.loc[decline_start:, "plc_stage_final"] = "쇠퇴"
 
     df["plc_stage"] = df["plc_stage_final"]
 
@@ -970,7 +1013,7 @@ st.markdown(
 **비시즌**
 - 저조한 판매가 5주 이상 지속되는 구간
 - 5주 이동평균이 전체 평균의 60% 이하
-- 후보 중 5주 평균 판매량이 가장 낮은 5주를 비시즌으로 지정
+- 유효 후보 주차 중 판매량이 가장 낮은 5주만 비시즌으로 지정
 
 **변곡점(최고점)**
 - 전체 기간 중 가장 높은 판매량 주차
