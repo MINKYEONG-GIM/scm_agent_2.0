@@ -331,6 +331,53 @@ def build_dual_line_chart(item_name: str, weekly_df: pd.DataFrame, monthly_df: p
 
 
 # =========================
+# 월별 매출 형태 판별 (단봉 / 다봉)
+# =========================
+def count_peaks(values: np.ndarray) -> int:
+    """
+    local peak 개수
+    y[i-1] < y[i] >= y[i+1]
+    """
+    if len(values) < 3:
+        return 0
+
+    peaks = 0
+
+    for i in range(1, len(values) - 1):
+        if values[i] > values[i - 1] and values[i] >= values[i + 1]:
+            peaks += 1
+
+    return peaks
+
+
+def classify_monthly_shape(monthly_df: pd.DataFrame) -> str:
+    """
+    월별 매출 기준
+    단봉형 / 다봉형 / 무봉형
+    """
+
+    if monthly_df.empty:
+        return "판단불가"
+
+    y = monthly_df["sales"].values.astype(float)
+
+    if len(y) < 3:
+        return "판단불가"
+
+    peaks = count_peaks(y)
+
+    if peaks == 0:
+        return "무봉형"
+
+    if peaks == 1:
+        return "단봉형"
+
+    if peaks >= 2:
+        return "다봉형"
+
+    return "판단불가"
+
+# =========================
 # 메인 화면
 # =========================
 def main():
@@ -356,9 +403,15 @@ def main():
     )
 
     weekly_df, monthly_df = prepare_item_timeseries(df, selected_item)
+    shape_label = classify_monthly_shape(monthly_df)
+    
+    st.markdown(f"### 형태: {shape_label}")
+    
     fig = build_dual_line_chart(selected_item, weekly_df, monthly_df)
 
     st.plotly_chart(fig, use_container_width=True)
+
+    
 
 
 if __name__ == "__main__":
