@@ -1100,10 +1100,11 @@ def build_year_compare_table(
     result["SKU"] = selected_sku
     result["SKU_NAME"] = selected_sku_name
 
-    result["작년의 해당 주차 판매비중(%)"] = result["last_year_ratio_pct"].round(2)
+    # 화면 표시는 0~100(%) 단위로 보여주기
+    result["작년의 해당 주차 판매비중(%)"] = (result["last_year_ratio_pct"] * 100).round(2)
 
     result = result[
-        ["SKU", "SKU_NAME", "주차", "작년의 해당 주차 판매비중(%)", "올해 해당 주차 판매량 (장)"]
+        ["SKU", "SKU_NAME", "week_no", "주차", "작년의 해당 주차 판매비중(%)", "올해 해당 주차 판매량 (장)"]
     ].copy()
 
     return result
@@ -1182,10 +1183,32 @@ def main():
 
     st.markdown("### 주차별 작년 비중 / 올해 판매량 비교표")
 
+    current_week_no = int(pd.Timestamp.today().isocalendar().week)
+
+    display_df = compare_table_df[
+        ["SKU", "주차", "작년의 해당 주차 판매비중(%)", "올해 해당 주차 판매량 (장)"]
+    ].copy()
+
+    def _highlight_current_week(_):
+        styles = pd.DataFrame("", index=display_df.index, columns=display_df.columns)
+        mask = compare_table_df["week_no"].astype(int) == current_week_no
+        styles.loc[mask, "올해 해당 주차 판매량 (장)"] = "background-color: #FFF3BF; font-weight: 700;"
+        return styles
+
     st.dataframe(
-        compare_table_df,
+        display_df.style.apply(_highlight_current_week, axis=None),
         use_container_width=True,
-        hide_index=True
+        hide_index=True,
+        column_config={
+            "작년의 해당 주차 판매비중(%)": st.column_config.NumberColumn(
+                "작년의 해당 주차 판매비중(%)",
+                format="%.2f%%",
+            ),
+            "올해 해당 주차 판매량 (장)": st.column_config.NumberColumn(
+                "올해 해당 주차 판매량 (장)",
+                format="%d",
+            ),
+        }
     )
 
     forecast_df = forecast_with_gpt(
