@@ -1031,6 +1031,86 @@ def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def build_year_compare_table(
+    weekly_df: pd.DataFrame,
+    final_item_df: pd.DataFrame,
+    selected_sku: str,
+    selected_sku_name: str
+) -> pd.DataFrame:
+    """
+    표 컬럼:
+    SKU / SKU_NAME / 주차 / 작년의 해당 주차 판매비중(%) / 올해 해당 주차 판매량 (장)
+    """
+
+    # -----------------------------
+    # 1) 작년 주차별 판매비중 계산
+    # -----------------------------
+    last_year_df = weekly_df.copy()
+
+    last_year_df["week_no"] = last_year_df["week_start"].dt.isocalendar().week.astype(int)
+    last_year_df["sales"] = pd.to_numeric(last_year_df["sales"], errors="coerce").fillna(0)
+
+    total_last_year_sales = last_year_df["sales"].sum()
+
+    if total_last_year_sales > 0:
+        last_year_df["last_year_ratio_pct"] = (
+            last_year_df["sales"] / total_last_year_sales * 100
+        )
+    else:
+        last_year_df["last_year_ratio_pct"] = 0.0
+
+    # 주차 라벨: 예) 2025 - 8주차
+    last_year_df["주차"] = (
+        last_year_df["week_start"].dt.year.astype(str)
+        + " - "
+        + last_year_df["week_no"].astype(str)
+        + "주차"
+    )
+
+    # -----------------------------
+    # 2) 올해 주차별 판매량 계산
+    # -----------------------------
+    this_year_df = final_item_df.copy()
+    this_year_df = this_year_df.dropna(subset=["날짜"]).copy()
+
+    if not this_year_df.empty:
+        this_year_df["week_no"] = this_year_df["날짜"].dt.isocalendar().week.astype(int)
+        this_year_df["판매량"] = pd.to_numeric(this_year_df["판매량"], errors="coerce").fillna(0)
+
+        this_year_weekly = (
+            this_year_df.groupby("week_no", as_index=False)["판매량"]
+            .sum()
+            .rename(columns={"판매량": "올해 해당 주차 판매량 (장)"})
+        )
+    else:
+        this_year_weekly = pd.DataFrame(columns=["week_no", "올해 해당 주차 판매량 (장)"])
+
+    # -----------------------------
+    # 3) 작년 주차 기준으로 merge
+    # -----------------------------
+    result = last_year_df[["week_no", "주차", "last_year_ratio_pct"]].merge(
+        this_year_weekly,
+        on="week_no",
+        how="left"
+    )
+
+    result["올해 해당 주차 판매량 (장)"] = (
+        result["올해 해당 주차 판매량 (장)"]
+        .fillna(0)
+        .astype(int)
+    )
+
+    result["SKU"] = selected_sku
+    result["SKU_NAME"] = selected_sku_name
+
+    result["작년의 해당 주차 판매비중(%)"] = result["last_year_ratio_pct"].round(2)
+
+    result = result[
+        ["SKU", "SKU_NAME", "주차", "작년의 해당 주차 판매비중(%)", "올해 해당 주차 판매량 (장)"]
+    ].copy()
+
+    return result
+
 
 # =========================
 # 메인 화면
@@ -1082,6 +1162,7 @@ def main():
     selected_item_code = selected_row["item_code"]
 
     selected_sku = str(selected_row["sku"]).strip()
+    selected_sku_name = str(selected_row["sku_name"]).strip()
 
     final_item_df = final_prepared[
         final_prepared["sku"].astype(str).str.strip() == selected_sku
@@ -1091,12 +1172,13 @@ def main():
     st.write("final_item_df 건수:", len(final_item_df))
     st.write("날짜 null 개수:", final_item_df["날짜"].isna().sum())
     
-    if not final_item_df.empty:
-        st.dataframe(
-            final_item_df[["sku", "sku_name", "날짜", "판매량"]].head(20),
-            use_container_width=True,
-            hide_index=True
-        )
+    st.markdown("### 주차별 작년 비중 / 올해 판매량 비교표")
+
+    st.dataframe(
+        compare_table_df,
+        use_container_width=True,
+        hide_index=True
+)
 
     item_name, weekly_df, monthly_df = prepare_plc_item_timeseries(plc_df, selected_item_code)
     shape_label, shape_reason = classify_shape(item_name, monthly_df)
