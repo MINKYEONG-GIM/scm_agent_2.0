@@ -533,12 +533,12 @@ def prepare_plc_item_timeseries(
 def get_final_item_options(final_df: pd.DataFrame) -> pd.DataFrame:
     df = prepare_final_df(final_df).copy()
 
-    # sku_name + item_code 기준으로 유니크
+    # plant_name + sku_name + item_code 기준으로 유니크
     options = (
-        df[["sku_name", "item_code", "sku"]]
-        .dropna(subset=["sku_name"])
+        df[["plant_name", "sku_name", "item_code", "sku"]]
+        .dropna(subset=["sku_name", "plant_name"])
         .drop_duplicates()
-        .sort_values(["sku_name", "sku"])
+        .sort_values(["plant_name", "sku_name", "sku"])
         .reset_index(drop=True)
     )
     return options
@@ -1001,9 +1001,14 @@ def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"final 시트 필수 컬럼이 없습니다: {missing}")
 
+    # plant_name은 매장 필터용(없으면 '전체'로 처리)
+    if "plant_name" not in df.columns:
+        df["plant_name"] = "전체"
+
     # sku 문자열 정리
     df["sku"] = df["sku"].astype(str).str.strip()
     df["sku_name"] = df["sku_name"].astype(str).str.strip()
+    df["plant_name"] = df["plant_name"].astype(str).str.strip().replace("", "전체")
 
     df["item_code"] = df["sku"].apply(extract_item_code_from_sku)
     df["판매량"] = df["판매량"].apply(clean_number).fillna(0)
@@ -1146,17 +1151,43 @@ def main():
         st.warning("final에서 선택 가능한 SKU 데이터가 없습니다.")
         return
 
-    options_df["label"] = options_df.apply(
+    # 표시용 라벨(상품 선택 드롭다운에는 매장명 미포함)
+    options_df["display_label"] = options_df.apply(
         lambda r: f"{r['sku_name']} | 코드:{r['item_code']} | SKU:{r['sku']}",
         axis=1
     )
-
-    selected_label = st.selectbox(
-        "개별 차트 확인할 상품",
-        options=options_df["label"].tolist()
+    # 내부 식별용 키(전체 매장일 때도 선택이 겹치지 않도록)
+    options_df["option_id"] = options_df.apply(
+        lambda r: f"{r['plant_name']}||{r['sku']}",
+        axis=1
     )
 
-    selected_row = options_df[options_df["label"] == selected_label].iloc[0]
+    col_a, col_b = st.columns([1, 3])
+
+    with col_a:
+        plant_values = options_df["plant_name"].dropna().astype(str).str.strip()
+        plant_values = plant_values[plant_values != ""]
+        plant_options = ["전체"] + sorted([p for p in plant_values.unique().tolist() if p != "전체"])
+
+        selected_plant = st.selectbox(
+            "매장 선택",
+            options=plant_options
+        )
+
+    with col_b:
+        filtered_options_df = options_df.copy()
+        if selected_plant != "전체":
+            filtered_options_df = filtered_options_df[filtered_options_df["plant_name"] == selected_plant].copy()
+
+        selected_option_id = st.selectbox(
+            "개별 차트 확인할 상품",
+            options=filtered_options_df["option_id"].tolist(),
+            format_func=lambda oid: filtered_options_df.loc[
+                filtered_options_df["option_id"] == oid, "display_label"
+            ].iloc[0]
+        )
+
+    selected_row = filtered_options_df[filtered_options_df["option_id"] == selected_option_id].iloc[0]
     selected_item_code = selected_row["item_code"]
 
     selected_sku = str(selected_row["sku"]).strip()
@@ -1165,6 +1196,11 @@ def main():
     final_item_df = final_prepared[
         final_prepared["sku"].astype(str).str.strip() == selected_sku
     ].copy()
+
+    if selected_plant != "전체":
+        final_item_df = final_item_df[
+            final_item_df["plant_name"].astype(str).str.strip() == selected_plant
+        ].copy()
     
     st.write("selected_sku:", selected_sku)
     st.write("final_item_df 건수:", len(final_item_df))
