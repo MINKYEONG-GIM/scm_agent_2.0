@@ -1100,8 +1100,8 @@ def build_year_compare_table(
     result["SKU"] = selected_sku
     result["SKU_NAME"] = selected_sku_name
 
-    # 화면 표시는 0~100(%) 단위로 보여주기
-    result["작년의 해당 주차 판매비중(%)"] = (result["last_year_ratio_pct"] * 100).round(2)
+    # last_year_ratio_pct 는 이미 0~100(%) 단위로 계산됨
+    result["작년의 해당 주차 판매비중(%)"] = result["last_year_ratio_pct"].round(1)
 
     result = result[
         ["SKU", "SKU_NAME", "week_no", "주차", "작년의 해당 주차 판매비중(%)", "올해 해당 주차 판매량 (장)"]
