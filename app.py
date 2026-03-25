@@ -175,99 +175,142 @@ def forecast_with_gpt(
     final_item_df: pd.DataFrame
 ) -> Tuple[pd.DataFrame, str]:
 
-    plot_final_df = final_item_df.dropna(subset=["날짜"]).copy()
+    # ------------------------------------------------------------
+    # 비중 기반 예측(절대값 직접 생성 금지)
+    # - 작년(weekly_df)의 주차별 비중 분포를 기반으로
+    # - 올해는 "현재까지 누적 실적"이 작년 같은 주차까지 누적 대비 어느 정도인지로 스케일만 보정
+    # - 남은 주차 판매량은 작년 남은 주차 비중대로 배분
+    # ------------------------------------------------------------
+    df_last = weekly_df.copy()
+    df_last["week_no"] = df_last["week_start"].dt.isocalendar().week.astype(int)
+    df_last["sales"] = pd.to_numeric(df_last["sales"], errors="coerce").fillna(0.0)
 
-    last_year = weekly_df["sales"].tolist()
+    last_total = float(df_last["sales"].sum())
+    if last_total <= 0:
+        empty_df = pd.DataFrame(columns=["날짜", "forecast"])
+        return empty_df, "작년 판매량 합계가 0이라 비중 기반 예측을 만들 수 없습니다."
 
-    this_year_weekly = (
-        plot_final_df
-        .sort_values("날짜")
-        .groupby(pd.Grouper(key="날짜", freq="W"))["판매량"]
-        .sum()
-        .reset_index()
+    df_last["ratio"] = df_last["sales"] / last_total
+    ratio_by_week = df_last.groupby("week_no")["ratio"].sum().to_dict()
+    last_sales_by_week = df_last.groupby("week_no")["sales"].sum().to_dict()
+
+    # 올해 실측 주차별(ISO week) 판매량
+    df_this = final_item_df.dropna(subset=["날짜"]).copy()
+    if df_this.empty:
+        this_sales_by_week = {}
+    else:
+        df_this["iso_year"] = df_this["날짜"].dt.isocalendar().year.astype(int)
+        df_this["week_no"] = df_this["날짜"].dt.isocalendar().week.astype(int)
+        df_this["판매량"] = pd.to_numeric(df_this["판매량"], errors="coerce").fillna(0.0)
+        # "올해" 기준으로만 집계 (현재 연도)
+        this_year = int(pd.Timestamp.today().year)
+        df_this = df_this[df_this["iso_year"] == this_year].copy()
+        this_sales_by_week = df_this.groupby("week_no")["판매량"].sum().to_dict()
+
+    this_year = int(pd.Timestamp.today().year)
+    current_week_no = int(pd.Timestamp.today().isocalendar().week)
+
+    # 올해 현재까지 누적 / 작년 같은 주차까지 누적
+    this_to_date = float(sum(v for w, v in this_sales_by_week.items() if int(w) <= current_week_no))
+    last_to_date = float(sum(v for w, v in last_sales_by_week.items() if int(w) <= current_week_no))
+
+    # 작년 같은 기간 누적이 0이면 스케일 추정이 불가하므로 보수적으로 0 예측
+    if last_to_date <= 0:
+        empty_df = pd.DataFrame(columns=["날짜", "forecast"])
+        base_reason = (
+            "작년 동일 주차까지 누적 판매량이 0이라 스케일을 추정할 수 없어, "
+            "비중 기반 예측을 0으로 처리했습니다."
+        )
+        return empty_df, base_reason
+
+    scale = this_to_date / last_to_date
+    expected_total = last_total * scale
+    remaining_total = max(0.0, expected_total - this_to_date)
+
+    # 남은 주차(현재 주차 이후) 비중만 추출 후 재정규화
+    remaining_weeks = sorted([int(w) for w in ratio_by_week.keys() if int(w) > current_week_no])
+    if not remaining_weeks:
+        empty_df = pd.DataFrame(columns=["날짜", "forecast"])
+        return empty_df, "현재 주차 이후 주차가 없어 예측이 필요하지 않습니다."
+
+    remaining_ratio_sum = float(sum(ratio_by_week.get(w, 0.0) for w in remaining_weeks))
+    if remaining_ratio_sum <= 0:
+        empty_df = pd.DataFrame(columns=["날짜", "forecast"])
+        return empty_df, "남은 주차의 작년 비중 합계가 0이라 예측이 불가합니다."
+
+    forecast_values = []
+    forecast_dates = []
+    for w in remaining_weeks:
+        r = float(ratio_by_week.get(w, 0.0)) / remaining_ratio_sum
+        v = int(round(remaining_total * r))
+        forecast_values.append(v)
+        # ISO week의 월요일 날짜
+        d = pd.to_datetime(f"{this_year}-W{w:02d}-1", format="%G-W%V-%u", errors="coerce")
+        forecast_dates.append(d)
+
+    forecast_df = pd.DataFrame({"날짜": forecast_dates, "forecast": forecast_values}).dropna(subset=["날짜"])
+
+    # 기본 설명(규칙 기반)
+    base_reason = (
+        f"- 예측 방식: 작년 주차별 판매 비중(%) 분포를 기준으로 남은 주차에 배분했습니다.\n"
+        f"- 스케일 보정: 올해 {current_week_no}주차까지 누적({this_to_date:,.0f}) / "
+        f"작년 동일 주차 누적({last_to_date:,.0f}) = {scale:.2f} 배로 올해 연간 총량을 추정했습니다.\n"
+        f"- 추정 연간 총량: 작년 총량({last_total:,.0f}) × {scale:.2f} = {expected_total:,.0f}\n"
+        f"- 남은 기간 배분 총량: max(0, {expected_total:,.0f} - {this_to_date:,.0f}) = {remaining_total:,.0f}\n"
+        f"- 남은 주차 배분: 작년 남은 주차 비중을 재정규화하여(합=100%) 남은 총량을 주차별로 배분했습니다."
     )
 
-    this_year = this_year_weekly["판매량"].tolist()
+    # 가능하면 GPT로 "설명"만 더 풍부하게 생성(숫자는 이미 고정)
+    reason = base_reason
+    try:
+        stage_info = None
+        if "stage" in weekly_df.columns:
+            stage_info = weekly_df["stage"].astype(str).tolist()
 
-    stage_info = None
-    if "stage" in weekly_df.columns:
-        stage_info = weekly_df["stage"].astype(str).tolist()
+        explain_prompt = f"""
+너는 예측 보고서를 쓰는 분석가다.
+아래 '예측 방식'으로 산출된 숫자를 바꾸지 말고, 왜 이런 방식이 과도한 예측을 줄이는지까지 포함해 한국어로 상세히 설명하라.
 
-    prompt = f"""
-작년 매출과 올해 매출을 참고해서
-올해 남은 주차의 매출을 예측하라.
+예측 방식 요약:
+- 작년 주차별 판매 비중 분포로 남은 주차를 배분
+- 올해는 현재까지 누적 실적이 작년 동일 주차 대비 몇 배인지(scale)만 사용
 
-조건
-- 작년 매출을 반드시 참고
-- shape = {shape_label}
-- 단계 흐름도 참고
-- 도입 / 성장 / 피크 / 성숙 / 쇠퇴 구조 유지
-- 피크 위치는 작년과 비슷해야 함
-- 올해 이미 존재하는 실제 매출 구간은 제외하고, 남은 주차만 예측
-- JSON으로만 반환
-- forecast와 함께 예측 근거(reason)를 한국어로 상세히 작성
-- reason에는 아래를 반드시 포함
-  - 어떤 근거로 피크/성숙/쇠퇴 구간을 잡았는지(단계 흐름 + 작년 패턴 기반)
-  - 올해 실측(this_year) 구간을 어떻게 해석했는지(상승/하락/정체)
-  - 왜 그 수준의 예측치를 선택했는지(작년 대비 스케일/완만함/보수적/공격적 등)
-  - 데이터 한계(실측 주차 수 부족, 0값 많음 등)가 있으면 명시
+입력:
+- item_name: {item_name}
+- shape: {shape_label}
+- stage(stage_info): {stage_info}
+- current_week_no: {current_week_no}
+- this_to_date: {this_to_date}
+- last_to_date: {last_to_date}
+- scale: {scale}
+- last_total: {last_total}
+- expected_total: {expected_total}
+- remaining_total: {remaining_total}
+- forecast_weeks: {remaining_weeks}
+- forecast_values: {forecast_values}
 
-아이템명:
-{item_name}
-
-작년 주차 매출:
-{last_year}
-
-작년 단계(stage) 정보:
-{stage_info}
-
-올해 현재 주차 매출:
-{this_year}
-
-결과 형식:
+출력은 아래 JSON 형식으로만:
 {{
-  "forecast":[1,2,3],
-  "reason":"- ...\\n- ..."
+  "reason": "..."
 }}
 """.strip()
 
-    messages = [
-        {"role": "user", "content": prompt}
-    ]
-
-    forecast_schema = {
-        "name": "forecast_result",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "forecast": {
-                    "type": "array",
-                    "items": {"type": "number"}
-                },
-                "reason": {
-                    "type": "string"
-                }
+        explain_schema = {
+            "name": "forecast_explain",
+            "schema": {
+                "type": "object",
+                "properties": {"reason": {"type": "string"}},
+                "required": ["reason"],
+                "additionalProperties": False,
             },
-            "required": ["forecast", "reason"],
-            "additionalProperties": False
         }
-    }
 
-    result = call_openai_chat_json(messages, json_schema=forecast_schema)
-    forecast = result["forecast"]
-    reason = str(result.get("reason", "")).strip()
-
-    if this_year_weekly.empty:
-        start_date = pd.Timestamp.today().normalize()
-    else:
-        start_date = this_year_weekly["날짜"].max() + pd.Timedelta(days=7)
-
-    forecast_dates = pd.date_range(start=start_date, periods=len(forecast), freq="W")
-
-    forecast_df = pd.DataFrame({
-        "날짜": forecast_dates,
-        "forecast": forecast
-    })
+        explain_res = call_openai_chat_json([{"role": "user", "content": explain_prompt}], json_schema=explain_schema)
+        gpt_reason = str(explain_res.get("reason", "")).strip()
+        if gpt_reason:
+            reason = gpt_reason
+    except Exception:
+        pass
 
     return forecast_df, reason
 
