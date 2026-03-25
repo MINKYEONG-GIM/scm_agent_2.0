@@ -984,7 +984,7 @@ def extract_item_code_from_sku(sku: str) -> str:
         return s[2:4]
     return ""
 
-def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
+
 def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
     df = final_df.copy()
 
