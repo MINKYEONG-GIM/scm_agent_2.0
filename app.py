@@ -1162,7 +1162,19 @@ def build_year_compare_table(
     # -----------------------------
     # 3) 작년 주차 기준으로 merge
     # -----------------------------
-    result = last_year_df[["week_no", "주차", "last_year_ratio_pct"]].merge(
+    # 표에는 5단계 중심으로 보이게: 피크/피크2는 성숙으로 표기(그래프 단계와 동일 출처)
+    last_year_df["stage_for_table"] = last_year_df["stage"].replace({
+        "피크": "성숙",
+        "피크2": "성숙",
+    }).fillna("")
+
+    last_year_df["작년 단계"] = (
+        last_year_df["week_no"].astype(str) + "주 " + last_year_df["stage_for_table"].astype(str)
+    )
+
+    result = last_year_df[
+        ["week_no", "주차", "last_year_ratio_pct", "작년 단계"]
+    ].merge(
         this_year_weekly,
         on="week_no",
         how="left"
@@ -1195,6 +1207,7 @@ def build_year_compare_table(
             "분배량",
             "출고량(회전 등)",
             "로스",
+            "작년 단계",
         ]
     ].copy()
 
@@ -1406,6 +1419,7 @@ def main():
             "분배량",
             "출고량(회전 등)",
             "로스",
+            "작년 단계",
         ]
     ].copy()
 
