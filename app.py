@@ -1361,7 +1361,15 @@ def main():
         )
 
     display_df = compare_table_df[
-        ["주차", "작년의 해당 주차 판매비중(%)", "올해 해당 주차 판매량 (장)"]
+        [
+            "주차",
+            "작년의 해당 주차 판매비중(%)",
+            "기초재고",
+            "올해 해당 주차 판매량 (장)",
+            "분배량",
+            "출고량(회전 등)",
+            "로스",
+        ]
     ].copy()
 
     def _style_compare_table(_):
@@ -1384,8 +1392,24 @@ def main():
                 "작년의 해당 주차 판매비중(%)",
                 format="%.2f%%",
             ),
+            "기초재고": st.column_config.NumberColumn(
+                "기초재고",
+                format="%d",
+            ),
             "올해 해당 주차 판매량 (장)": st.column_config.NumberColumn(
                 "올해 해당 주차 판매량 (장)",
+                format="%d",
+            ),
+            "분배량": st.column_config.NumberColumn(
+                "분배량",
+                format="%d",
+            ),
+            "출고량(회전 등)": st.column_config.NumberColumn(
+                "출고량(회전 등)",
+                format="%d",
+            ),
+            "로스": st.column_config.NumberColumn(
+                "로스",
                 format="%d",
             ),
         }
