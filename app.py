@@ -1168,9 +1168,8 @@ def build_year_compare_table(
         "피크2": "성숙",
     }).fillna("")
 
-    last_year_df["작년 단계"] = (
-        last_year_df["week_no"].astype(str) + "주 " + last_year_df["stage_for_table"].astype(str)
-    )
+    # 주차는 '주차' 열에 있으므로 이 열에는 단계명만 표시
+    last_year_df["작년 단계"] = last_year_df["stage_for_table"].astype(str)
 
     result = last_year_df[
         ["week_no", "주차", "last_year_ratio_pct", "작년 단계"]
