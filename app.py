@@ -1169,10 +1169,10 @@ def build_year_compare_table(
     }).fillna("")
 
     # 주차는 '주차' 열에 있으므로 이 열에는 단계명만 표시
-    last_year_df["작년 단계"] = last_year_df["stage_for_table"].astype(str)
+    last_year_df["예측 단계"] = last_year_df["stage_for_table"].astype(str)
 
     result = last_year_df[
-        ["week_no", "주차", "last_year_ratio_pct", "작년 단계"]
+        ["week_no", "주차", "last_year_ratio_pct", "예측 단계"]
     ].merge(
         this_year_weekly,
         on="week_no",
@@ -1206,7 +1206,7 @@ def build_year_compare_table(
             "분배량",
             "출고량(회전 등)",
             "로스",
-            "작년 단계",
+            "예측 단계",
         ]
     ].copy()
 
@@ -1418,7 +1418,7 @@ def main():
             "분배량",
             "출고량(회전 등)",
             "로스",
-            "작년 단계",
+            "예측 단계",
         ]
     ].copy()
 
