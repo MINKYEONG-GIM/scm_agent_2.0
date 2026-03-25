@@ -539,6 +539,8 @@ def build_dual_line_chart(
 ) -> go.Figure:
     fig = go.Figure()
 
+    weekly_week_no = weekly_df["week_start"].dt.isocalendar().week.astype(int)
+
     # 주차별 판매량 연결선
     fig.add_trace(
         go.Scatter(
@@ -555,40 +557,47 @@ def build_dual_line_chart(
 
     # 주차별 단계별 색상 선
     stage_df = weekly_df.copy().reset_index(drop=True)
+    stage_df["week_no"] = stage_df["week_start"].dt.isocalendar().week.astype(int)
 
     if "stage" in stage_df.columns:
         current_stage = None
         segment_x = []
         segment_y = []
+        segment_week = []
 
         for i, row in stage_df.iterrows():
             stage = row["stage"]
             x = row["week_start"]
             y = row["sales"]
+            w = int(row["week_no"])
 
             if current_stage is None:
                 current_stage = stage
                 segment_x = [x]
                 segment_y = [y]
+                segment_week = [w]
             elif stage == current_stage:
                 segment_x.append(x)
                 segment_y.append(y)
+                segment_week.append(w)
             else:
                 fig.add_trace(
                     go.Scatter(
                         x=segment_x,
                         y=segment_y,
+                        customdata=segment_week,
                         mode="lines+markers",
                         name=current_stage,
                         line=dict(color=STAGE_COLORS.get(current_stage, "#333"), width=3),
                         marker=dict(size=7),
-                        hovertemplate="주차 시작일: %{x|%Y-%m-%d}<br>판매량: %{y:,.0f}<br>단계: " + current_stage + "<extra></extra>",
+                        hovertemplate="주차: %{customdata}주차<br>주차 시작일: %{x|%Y-%m-%d}<br>판매량: %{y:,.0f}<br>단계: " + current_stage + "<extra></extra>",
                         showlegend=True
                     )
                 )
                 current_stage = stage
                 segment_x = [x]
                 segment_y = [y]
+                segment_week = [w]
 
         # 마지막 구간
         if segment_x:
@@ -596,11 +605,12 @@ def build_dual_line_chart(
                 go.Scatter(
                     x=segment_x,
                     y=segment_y,
+                    customdata=segment_week,
                     mode="lines+markers",
                     name=current_stage,
                     line=dict(color=STAGE_COLORS.get(current_stage, "#333"), width=3),
                     marker=dict(size=7),
-                    hovertemplate="주차 시작일: %{x|%Y-%m-%d}<br>판매량: %{y:,.0f}<br>단계: " + current_stage + "<extra></extra>",
+                    hovertemplate="주차: %{customdata}주차<br>주차 시작일: %{x|%Y-%m-%d}<br>판매량: %{y:,.0f}<br>단계: " + current_stage + "<extra></extra>",
                     showlegend=True
                 )
             )
@@ -610,6 +620,7 @@ def build_dual_line_chart(
         go.Scatter(
             x=monthly_df["month"],
             y=monthly_df["sales"],
+            customdata=monthly_df["month"].dt.isocalendar().week.astype(int),
             mode="lines+markers",
             name="월별 매출",
             line=dict(width=3, color="#bfbfbf"),
@@ -618,7 +629,7 @@ def build_dual_line_chart(
             fillcolor="rgba(191, 191, 191, 0.25)",
             connectgaps=True,
             yaxis="y2",
-            hovertemplate="월: %{x|%Y-%m}<br>매출: %{y:,.0f}<extra></extra>",
+            hovertemplate="월: %{x|%Y-%m}<br>(참고) 주차: %{customdata}주차<br>매출: %{y:,.0f}<extra></extra>",
         )
     )
 
@@ -1463,23 +1474,31 @@ def main():
         if real_week.empty:
             st.warning("올해 매출 데이터가 없습니다. final 시트의 날짜 형식 또는 sku 매칭을 확인하세요.")
         else:
+            real_week = real_week.copy()
+            real_week["week_no"] = real_week["날짜"].dt.isocalendar().week.astype(int)
             fig2.add_trace(
                 go.Scatter(
                     x=real_week["날짜"],
                     y=real_week["판매량"],
+                    customdata=real_week["week_no"],
                     name="올해 매출",
-                    mode="lines+markers"
+                    mode="lines+markers",
+                    hovertemplate="주차: %{customdata}주차<br>날짜: %{x|%Y-%m-%d}<br>판매량: %{y:,.0f}<extra></extra>",
                 )
             )
     
         if not forecast_plot_df.empty:
+            forecast_plot_df = forecast_plot_df.copy()
+            forecast_plot_df["week_no"] = forecast_plot_df["날짜"].dt.isocalendar().week.astype(int)
             fig2.add_trace(
                 go.Scatter(
                     x=forecast_plot_df["날짜"],
                     y=forecast_plot_df["forecast"],
+                    customdata=forecast_plot_df["week_no"],
                     name="GPT 예측",
                     mode="lines+markers",
-                    line=dict(dash="dash")
+                    line=dict(dash="dash"),
+                    hovertemplate="주차: %{customdata}주차<br>날짜: %{x|%Y-%m-%d}<br>예측 판매량: %{y:,.0f}<extra></extra>",
                 )
             )
     
