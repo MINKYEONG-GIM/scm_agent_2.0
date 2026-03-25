@@ -629,7 +629,7 @@ def build_dual_line_chart(
             fillcolor="rgba(191, 191, 191, 0.25)",
             connectgaps=True,
             yaxis="y2",
-            hovertemplate="월: %{x|%Y-%m}<br>(참고) 주차: %{customdata}주차<br>매출: %{y:,.0f}<extra></extra>",
+            hovertemplate="월: %{x|%Y-%m}<br>(참고) %{customdata}주차<br>매출: %{y:,.0f}<extra></extra>",
         )
     )
 
@@ -1483,7 +1483,7 @@ def main():
                     customdata=real_week["week_no"],
                     name="올해 매출",
                     mode="lines+markers",
-                    hovertemplate="주차: %{customdata}주차<br>날짜: %{x|%Y-%m-%d}<br>판매량: %{y:,.0f}<extra></extra>",
+                    hovertemplate=" %{customdata}주차<br>날짜: %{x|%Y-%m-%d}<br>판매량: %{y:,.0f}<extra></extra>",
                 )
             )
     
