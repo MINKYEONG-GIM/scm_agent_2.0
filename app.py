@@ -173,7 +173,7 @@ def forecast_with_gpt(
     shape_label: str,
     weekly_df: pd.DataFrame,
     final_item_df: pd.DataFrame
-) -> Tuple[pd.DataFrame, str]:
+) -> pd.DataFrame:
 
     # ------------------------------------------------------------
     # 비중 기반 예측(절대값 직접 생성 금지)
@@ -187,8 +187,7 @@ def forecast_with_gpt(
 
     last_total = float(df_last["sales"].sum())
     if last_total <= 0:
-        empty_df = pd.DataFrame(columns=["날짜", "forecast"])
-        return empty_df, "작년 판매량 합계가 0이라 비중 기반 예측을 만들 수 없습니다."
+        return pd.DataFrame(columns=["날짜", "forecast"])
 
     df_last["ratio"] = df_last["sales"] / last_total
     ratio_by_week = df_last.groupby("week_no")["ratio"].sum().to_dict()
@@ -216,12 +215,7 @@ def forecast_with_gpt(
 
     # 작년 같은 기간 누적이 0이면 스케일 추정이 불가하므로 보수적으로 0 예측
     if last_to_date <= 0:
-        empty_df = pd.DataFrame(columns=["날짜", "forecast"])
-        base_reason = (
-            "작년 동일 주차까지 누적 판매량이 0이라 스케일을 추정할 수 없어, "
-            "비중 기반 예측을 0으로 처리했습니다."
-        )
-        return empty_df, base_reason
+        return pd.DataFrame(columns=["날짜", "forecast"])
 
     scale = this_to_date / last_to_date
     expected_total = last_total * scale
@@ -230,13 +224,11 @@ def forecast_with_gpt(
     # 남은 주차(현재 주차 이후) 비중만 추출 후 재정규화
     remaining_weeks = sorted([int(w) for w in ratio_by_week.keys() if int(w) > current_week_no])
     if not remaining_weeks:
-        empty_df = pd.DataFrame(columns=["날짜", "forecast"])
-        return empty_df, "현재 주차 이후 주차가 없어 예측이 필요하지 않습니다."
+        return pd.DataFrame(columns=["날짜", "forecast"])
 
     remaining_ratio_sum = float(sum(ratio_by_week.get(w, 0.0) for w in remaining_weeks))
     if remaining_ratio_sum <= 0:
-        empty_df = pd.DataFrame(columns=["날짜", "forecast"])
-        return empty_df, "남은 주차의 작년 비중 합계가 0이라 예측이 불가합니다."
+        return pd.DataFrame(columns=["날짜", "forecast"])
 
     forecast_values = []
     forecast_dates = []
@@ -249,70 +241,7 @@ def forecast_with_gpt(
         forecast_dates.append(d)
 
     forecast_df = pd.DataFrame({"날짜": forecast_dates, "forecast": forecast_values}).dropna(subset=["날짜"])
-
-    # 기본 설명(규칙 기반)
-    base_reason = (
-        f"- 예측 방식: 작년 주차별 판매 비중(%) 분포를 기준으로 남은 주차에 배분했습니다.\n"
-        f"- 스케일 보정: 올해 {current_week_no}주차까지 누적({this_to_date:,.0f}) / "
-        f"작년 동일 주차 누적({last_to_date:,.0f}) = {scale:.2f} 배로 올해 연간 총량을 추정했습니다.\n"
-        f"- 추정 연간 총량: 작년 총량({last_total:,.0f}) × {scale:.2f} = {expected_total:,.0f}\n"
-        f"- 남은 기간 배분 총량: max(0, {expected_total:,.0f} - {this_to_date:,.0f}) = {remaining_total:,.0f}\n"
-        f"- 남은 주차 배분: 작년 남은 주차 비중을 재정규화하여(합=100%) 남은 총량을 주차별로 배분했습니다."
-    )
-
-    # 가능하면 GPT로 "설명"만 더 풍부하게 생성(숫자는 이미 고정)
-    reason = base_reason
-    try:
-        stage_info = None
-        if "stage" in weekly_df.columns:
-            stage_info = weekly_df["stage"].astype(str).tolist()
-
-        explain_prompt = f"""
-너는 예측 보고서를 쓰는 분석가다.
-아래 '예측 방식'으로 산출된 숫자를 바꾸지 말고, 왜 이런 방식이 과도한 예측을 줄이는지까지 포함해 한국어로 상세히 설명하라.
-
-예측 방식 요약:
-- 작년 주차별 판매 비중 분포로 남은 주차를 배분
-- 올해는 현재까지 누적 실적이 작년 동일 주차 대비 몇 배인지(scale)만 사용
-
-입력:
-- item_name: {item_name}
-- shape: {shape_label}
-- stage(stage_info): {stage_info}
-- current_week_no: {current_week_no}
-- this_to_date: {this_to_date}
-- last_to_date: {last_to_date}
-- scale: {scale}
-- last_total: {last_total}
-- expected_total: {expected_total}
-- remaining_total: {remaining_total}
-- forecast_weeks: {remaining_weeks}
-- forecast_values: {forecast_values}
-
-출력은 아래 JSON 형식으로만:
-{{
-  "reason": "..."
-}}
-""".strip()
-
-        explain_schema = {
-            "name": "forecast_explain",
-            "schema": {
-                "type": "object",
-                "properties": {"reason": {"type": "string"}},
-                "required": ["reason"],
-                "additionalProperties": False,
-            },
-        }
-
-        explain_res = call_openai_chat_json([{"role": "user", "content": explain_prompt}], json_schema=explain_schema)
-        gpt_reason = str(explain_res.get("reason", "")).strip()
-        if gpt_reason:
-            reason = gpt_reason
-    except Exception:
-        pass
-
-    return forecast_df, reason
+    return forecast_df
 
 def classify_shape(item_name: str, monthly_df: pd.DataFrame) -> Tuple[str, str]:
     if monthly_df.empty:
@@ -1317,7 +1246,7 @@ def main():
     )
 
     try:
-        forecast_df, forecast_reason = forecast_with_gpt(
+        forecast_df = forecast_with_gpt(
             item_name,
             shape_label,
             weekly_df,
@@ -1325,7 +1254,6 @@ def main():
         )
     except Exception as e:
         forecast_df = pd.DataFrame(columns=["날짜", "forecast"])
-        forecast_reason = ""
         st.error(f"GPT 예측 호출 실패: {e}")
 
     # -----------------------------
@@ -1561,10 +1489,6 @@ def main():
         )
     
         st.plotly_chart(fig2, use_container_width=True)
-
-        if str(forecast_reason).strip():
-            st.markdown("### GPT 예측 근거")
-            st.markdown(forecast_reason)
 
 if __name__ == "__main__":
     main()
