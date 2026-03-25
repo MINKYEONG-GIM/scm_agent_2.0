@@ -546,7 +546,7 @@ def is_double_peak(values: np.ndarray) -> Tuple[bool, List[int]]:
             continue
 
         valley = np.min(values[p1:p2 + 1])
-        lower_peak = min(values[p1], values[p2]])
+        lower_peak = min(values[p1], values[p2]]\)
 
         if lower_peak > 0 and valley / lower_peak <= 0.85:
             return True, [p1, p2]
