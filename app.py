@@ -515,9 +515,12 @@ def build_dual_line_chart(
             go.Scatter(
                 x=weekly_df["week_start"],
                 y=weekly_df["sales"],
-                mode="lines+markers",
-                name="주차별 판매량",
-                hovertemplate="주차 시작일: %{x|%Y-%m-%d}<br>판매량: %{y:,.0f}<extra></extra>",
+                mode="lines",
+                name="주차별 판매량(연결선)",
+                line=dict(color="#b0b0b0", width=2),
+                hoverinfo="skip",
+                showlegend=False,
+                connectgaps=True,
             )
         )
 
