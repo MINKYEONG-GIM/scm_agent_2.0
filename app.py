@@ -1,655 +1,719 @@
-import os
-import json
 import re
-import urllib.error
-import urllib.request
+from datetime import datetime
+from typing import Optional, Tuple, List
+
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
-from streamlit_gsheets import GSheetsConnection
-from typing import List, Optional, Tuple
 
 
+# -------------------------------------------------
+# 1. 기본 설정
+# -------------------------------------------------
+st.set_page_config(page_title="시즌 분류 + 판매 예측", layout="wide")
+st.title("아이템 시즌 분류 + 주차별 판매 예측")
 
 
-OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+# -------------------------------------------------
+# 2. 시즌 정의
+# -------------------------------------------------
+def get_season(week: int) -> str:
+    if 9 <= week <= 18:
+        return "SPRING"
+    elif 19 <= week <= 30:
+        return "SUMMER"
+    elif 31 <= week <= 40:
+        return "FALL"
+    else:
+        return "WINTER"
 
 
-def get_gpt_gpi() -> Optional[str]:
+def classify_item(row: pd.Series) -> str:
+    spring_ratio = row["SPRING_RATIO"]
+    summer_ratio = row["SUMMER_RATIO"]
+    fall_ratio = row["FALL_RATIO"]
+    winter_ratio = row["WINTER_RATIO"]
+
+    if summer_ratio >= 0.40:
+        return "SUMMER_PEAK"
+    if winter_ratio >= 0.40:
+        return "WINTER_PEAK"
+    if (spring_ratio + fall_ratio) >= 0.60:
+        return "SPRING_FALL_PEAK"
+    if spring_ratio >= 0.35:
+        return "SPRING_PEAK"
+    if fall_ratio >= 0.35:
+        return "FALL_PEAK"
+    return "ALL_SEASON"
+
+
+# -------------------------------------------------
+# 3. 구글시트 연결
+# -------------------------------------------------
+@st.cache_resource
+def get_gsheet_client():
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    credentials = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=scope,
+    )
+    client = gspread.authorize(credentials)
+    return client
+
+
+def open_main_spreadsheet():
+    client = get_gsheet_client()
+    sheet_url = st.secrets["sheets"]["SHEET_URL"]
+    return client.open_by_url(sheet_url)
+
+
+# -------------------------------------------------
+# 4. 기존 시즌 분류용 데이터 읽기
+#    - 기존 코드 기준: st.secrets["sheets"]["WORKSHEET_NAME"]
+# -------------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_history_sheet():
+    spreadsheet = open_main_spreadsheet()
+    worksheet_name = st.secrets["sheets"]["WORKSHEET_NAME"]
+    worksheet = spreadsheet.worksheet(worksheet_name)
+    values = worksheet.get_all_values()
+
+    if not values or len(values) < 3:
+        raise ValueError("기존 시즌 분류 시트 구조를 확인해주세요. 최소 3행 이상 필요합니다.")
+
+    header = values[1]
+    data = values[2:]
+    df = pd.DataFrame(data, columns=header)
+
+    # 완전히 빈 컬럼 제거
+    df = df.loc[:, [str(col).strip() != "" for col in df.columns]]
+    return df
+
+
+# -------------------------------------------------
+# 5. final 시트 읽기
+#    - 사용자가 말한 st.secrets["final"] 사용
+#    - final 값은 worksheet 이름이라고 가정
+# -------------------------------------------------
+@st.cache_data(show_spinner=False)
+def load_final_sheet_raw():
+    spreadsheet = open_main_spreadsheet()
+
+    final_sheet_name = st.secrets["final"]
+    worksheet = spreadsheet.worksheet(final_sheet_name)
+    values = worksheet.get_all_values()
+
+    if not values or len(values) < 3:
+        raise ValueError("final 시트 구조를 확인해주세요. 최소 3행 이상 필요합니다.")
+
+    return values
+
+
+def make_final_display_df(values: List[List[str]]) -> pd.DataFrame:
     """
-    Streamlit secrets의 gpt_gpi(또는 OPENAI_API_KEY) 또는 환경변수.
-    secrets.toml 예: gpt_gpi = "sk-..."
+    final 시트는 보통 2줄 헤더 구조라고 보고 처리
+    0행: 날짜
+    1행: 세부항목(기초재고, 판매량, 분배량 ...)
+    2행부터: 데이터
     """
-    try:
-        if hasattr(st, "secrets"):
-            sec = st.secrets
-            if "gpt_gpi" in sec:
-                v = sec["gpt_gpi"]
-                if v is not None and str(v).strip():
-                    return str(v).strip()
-            if "OPENAI_API_KEY" in sec:
-                v = sec["OPENAI_API_KEY"]
-                if v is not None and str(v).strip():
-                    return str(v).strip()
-    except Exception:
-        pass
-    return (os.getenv("gpt_gpi") or os.getenv("OPENAI_API_KEY") or "").strip() or None
+    header_row_1 = values[0]
+    header_row_2 = values[1]
+    data = values[2:]
 
+    max_len = max(len(r) for r in values)
 
-# =========================
-# 공통 유틸
-# =========================
-def make_unique_headers(headers: List[str]) -> List[str]:
-    """
-    중복 컬럼명이 있을 때 고유한 이름으로 바꿉니다.
-    예: ['A', 'A', 'B'] -> ['A', 'A_2', 'B']
-    """
-    seen = {}
-    result = []
+    def pad_row(row, n):
+        return row + [""] * (n - len(row))
 
-    for h in headers:
-        col = str(h).strip()
-        if not col:
-            col = "unnamed"
+    header_row_1 = pad_row(header_row_1, max_len)
+    header_row_2 = pad_row(header_row_2, max_len)
+    data = [pad_row(r, max_len) for r in data]
 
-        if col not in seen:
-            seen[col] = 1
-            result.append(col)
+    merged_columns = []
+    current_date = ""
+
+    for top, bottom in zip(header_row_1, header_row_2):
+        top = str(top).strip()
+        bottom = str(bottom).strip()
+
+        if top:
+            current_date = top
+
+        if current_date and bottom:
+            merged_columns.append(f"{current_date}|{bottom}")
+        elif bottom:
+            merged_columns.append(bottom)
+        elif current_date:
+            merged_columns.append(current_date)
         else:
-            seen[col] += 1
-            result.append(f"{col}_{seen[col]}")
+            merged_columns.append("")
 
+    df = pd.DataFrame(data, columns=merged_columns)
+
+    # 완전히 빈 컬럼 제거
+    df = df.loc[:, [str(c).strip() != "" for c in df.columns]]
+    return df
+
+
+# -------------------------------------------------
+# 6. 기존 시즌 분류용 데이터 전처리
+# -------------------------------------------------
+def convert_wide_to_long(df_wide: pd.DataFrame) -> pd.DataFrame:
+    df_wide = df_wide.copy()
+    df_wide.columns = [str(c).strip() for c in df_wide.columns]
+
+    first_col = df_wide.columns[0]
+
+    df_long = df_wide.melt(
+        id_vars=[first_col],
+        var_name="item_name",
+        value_name="sales_qty"
+    ).rename(columns={first_col: "year_week"})
+
+    df_long["item_name"] = df_long["item_name"].astype(str).str.strip()
+    df_long = df_long[df_long["item_name"] != ""]
+    return df_long
+
+
+def preprocess_history_data(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    if "year_week" not in df.columns and "item_name" not in df.columns and "sales_qty" not in df.columns:
+        df = convert_wide_to_long(df)
+
+    rename_map = {}
+    for col in df.columns:
+        if col == "연도/주":
+            rename_map[col] = "year_week"
+        elif col == "아이템":
+            rename_map[col] = "item_name"
+        elif col in ["판매수량", "판매수량의 SUM"]:
+            rename_map[col] = "sales_qty"
+
+    df = df.rename(columns=rename_map)
+
+    required_cols = {"year_week", "item_name", "sales_qty"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"기존 시즌 분류 시트에 필수 컬럼이 없습니다: {missing}")
+
+    df["year_week"] = df["year_week"].astype(str).str.strip()
+    df["item_name"] = df["item_name"].astype(str).str.strip()
+
+    df["sales_qty"] = (
+        df["sales_qty"]
+        .astype(str)
+        .str.replace(",", "", regex=False)
+        .str.strip()
+        .replace("", "0")
+    )
+    df["sales_qty"] = pd.to_numeric(df["sales_qty"], errors="coerce").fillna(0)
+
+    extracted = df["year_week"].str.extract(r"(?P<year>\d{4})-(?P<week>\d{1,2})")
+    df["year"] = pd.to_numeric(extracted["year"], errors="coerce")
+    df["week"] = pd.to_numeric(extracted["week"], errors="coerce")
+
+    df = df.dropna(subset=["year", "week"])
+    df["year"] = df["year"].astype(int)
+    df["week"] = df["week"].astype(int)
+    df["season"] = df["week"].apply(get_season)
+
+    # ISO week 기준 날짜 생성
+    df["week_start_date"] = df.apply(
+        lambda x: datetime.fromisocalendar(int(x["year"]), int(x["week"]), 1),
+        axis=1
+    )
+
+    return df
+
+
+def make_classification_table(df: pd.DataFrame) -> pd.DataFrame:
+    season_sum = (
+        df.groupby(["item_name", "season"], as_index=False)["sales_qty"]
+        .sum()
+    )
+
+    pivot = (
+        season_sum.pivot(index="item_name", columns="season", values="sales_qty")
+        .fillna(0)
+        .reset_index()
+    )
+
+    for col in ["SPRING", "SUMMER", "FALL", "WINTER"]:
+        if col not in pivot.columns:
+            pivot[col] = 0
+
+    pivot["TOTAL_QTY"] = (
+        pivot["SPRING"] + pivot["SUMMER"] + pivot["FALL"] + pivot["WINTER"]
+    )
+
+    total_nonzero = pivot["TOTAL_QTY"].replace(0, pd.NA)
+    pivot["SPRING_RATIO"] = pivot["SPRING"] / total_nonzero
+    pivot["SUMMER_RATIO"] = pivot["SUMMER"] / total_nonzero
+    pivot["FALL_RATIO"] = pivot["FALL"] / total_nonzero
+    pivot["WINTER_RATIO"] = pivot["WINTER"] / total_nonzero
+    pivot = pivot.fillna(0)
+
+    pivot["CATEGORY"] = pivot.apply(classify_item, axis=1)
+
+    result = pivot[
+        [
+            "item_name",
+            "SPRING",
+            "SUMMER",
+            "FALL",
+            "WINTER",
+            "TOTAL_QTY",
+            "SPRING_RATIO",
+            "SUMMER_RATIO",
+            "FALL_RATIO",
+            "WINTER_RATIO",
+            "CATEGORY",
+        ]
+    ].copy()
+
+    for col in ["SPRING_RATIO", "SUMMER_RATIO", "FALL_RATIO", "WINTER_RATIO"]:
+        result[col] = (result[col] * 100).round(1)
+
+    result = result.sort_values(["CATEGORY", "TOTAL_QTY"], ascending=[True, False]).reset_index(drop=True)
     return result
 
 
-def clean_number(value):
+# -------------------------------------------------
+# 7. 상품명에서 아이템 종류 추출
+# -------------------------------------------------
+ITEM_KEYWORDS = [
+    "반팔티", "긴팔티", "민소매티", "셔츠", "블라우스", "가디건", "스웨터", "맨투맨",
+    "원피스", "스커트", "반바지", "면바지", "기획바지", "변형바지", "점퍼", "일반점퍼",
+    "데님자켓", "모직코트", "트렌치코트", "다운", "가방", "모자", "부츠", "운동화",
+    "목도리", "머플러", "수영복", "슬리퍼", "양말"
+]
+
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", "", str(text).strip().lower())
+
+
+def extract_base_item_name(product_name: str) -> str:
     """
-    문자열 숫자를 안전하게 float로 변환합니다.
     예:
-    '12,345' -> 12345.0
-    '' -> np.nan
+    [코튼스판] 캡소매 절개 반팔티, (19)Black, S
+    -> 반팔티
     """
-    if pd.isna(value):
-        return np.nan
+    text = str(product_name)
 
-    s = str(value).strip()
-    if s == "":
-        return np.nan
+    # 대괄호 제거
+    text = re.sub(r"\[.*?\]", "", text).strip()
 
-    s = s.replace(",", "")
-    try:
-        return float(s)
-    except Exception:
-        return np.nan
+    # 첫 번째 쉼표 앞까지만 사용
+    text = text.split(",")[0].strip()
 
+    # 등록된 키워드 우선 탐색
+    for keyword in ITEM_KEYWORDS:
+        if keyword in text:
+            return keyword
 
-def parse_yearweek_to_date(yearweek: str) -> pd.Timestamp:
-    """
-    '2025-01' 같은 값을 해당 ISO 주차의 월요일 날짜로 변환합니다.
-    """
-    s = str(yearweek).strip()
+    # 못 찾으면 마지막 단어 비슷하게 반환
+    parts = text.split()
+    if parts:
+        return parts[-1].strip()
 
-    if not re.match(r"^\d{4}-\d{1,2}$", s):
-        return pd.NaT
+    return text.strip()
 
-    year_str, week_str = s.split("-")
-    year = int(year_str)
-    week = int(week_str)
 
-    try:
-        return pd.to_datetime(f"{year}-W{week:02d}-1", format="%G-W%V-%u", errors="coerce")
-    except Exception:
-        return pd.NaT
+def find_best_history_item(product_name: str, classification_df: pd.DataFrame) -> Optional[str]:
+    extracted = extract_base_item_name(product_name)
+    extracted_norm = normalize_text(extracted)
 
-def call_openai_chat_json(messages: List[dict]) -> dict:
-    """
-    Chat Completions API를 호출해서 JSON 응답을 받습니다.
-    """
-    api_key = get_gpt_gpi()
-    if not api_key:
-        raise ValueError("OpenAI API Key가 없습니다. st.secrets 또는 환경변수에 gpt_gpi / OPENAI_API_KEY를 설정하세요.")
+    item_names = classification_df["item_name"].dropna().astype(str).tolist()
 
-    payload = {
-        "model": "gpt-4.1-mini",
-        "messages": messages,
-        "temperature": 0,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "shape_result",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "shape_label": {
-                            "type": "string",
-                            "enum": ["단봉형", "쌍봉형", "올시즌형"]
-                        },
-                        "reason": {
-                            "type": "string"
-                        }
-                    },
-                    "required": ["shape_label", "reason"],
-                    "additionalProperties": False
-                }
-            }
-        }
-    }
+    # 1차: 완전일치
+    for item in item_names:
+        if normalize_text(item) == extracted_norm:
+            return item
 
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    # 2차: 포함일치
+    for item in item_names:
+        item_norm = normalize_text(item)
+        if extracted_norm in item_norm or item_norm in extracted_norm:
+            return item
 
-    req = urllib.request.Request(
-        OPENAI_CHAT_URL,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
+    return None
 
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
-        raise ValueError(f"OpenAI API 호출 실패: {e.code} / {body}")
-    except Exception as e:
-        raise ValueError(f"OpenAI API 호출 중 오류: {str(e)}")
 
-    content = result["choices"][0]["message"]["content"]
-    return json.loads(content)
+# -------------------------------------------------
+# 8. 그래프용 데이터 생성
+# -------------------------------------------------
+def make_item_weekly_series(history_df: pd.DataFrame, item_name: str) -> pd.DataFrame:
+    item_df = history_df[history_df["item_name"] == item_name].copy()
+    item_df = item_df.sort_values("week_start_date")
 
-def classify_shape(item_name: str, monthly_df: pd.DataFrame) -> Tuple[str, str]:
-    if monthly_df.empty:
-        return "판단불가", "월별 데이터가 없습니다."
-
-    y = monthly_df["sales"].values.astype(float)
-
-    if len(y) < 3:
-        return "판단불가", "월별 데이터가 3개 미만입니다."
-
-    y_smooth = smooth_series(y, window=2)
-    month_labels = monthly_df["month"].dt.strftime("%Y-%m").tolist()
-
-    prompt = f"""
-
-    
-아이템의 월별 매출 형태를 아래 3개 중 하나로만 판단하라.
-
-- 반드시 월별 매출 기준으로만 판단할 것
-- 주차별 매출은 참고하지 말 것
-
-분류 순서
-1. 쌍봉형
-2. 단봉형
-3. 올시즌형
-
-판단 기준
-- 쌍봉형: 의미 있는 피크가 2개 이상이고, 두 피크 사이에 저점이 존재함
-- 단봉형: 의미 있는 큰 피크가 1개임
-- 올시즌형: 큰 중심 피크 없이 전체 기간에 비교적 고르게 분포함
-
-주의
-- 반드시 월별 매출 기준으로만 판단할 것
-- 주차별 매출은 참고하지 말 것
-- 작은 잡음은 피크로 보지 말 것
-- 반드시 3개 중 하나만 선택할 것
-- reason은 짧고 명확한 한글로 작성할 것
-
-아이템명: {item_name}
-월 라벨: {month_labels}
-월별 매출: {[float(v) for v in y]}
-스무딩 값: {[round(float(v), 2) for v in y_smooth]}
-""".strip()
-
-    messages = [
-        {
-            "role": "developer",
-            "content": "너는 월별 매출 형태를 쌍봉형, 단봉형, 올시즌형 중 하나로만 분류하는 분석가다. 반드시 JSON만 반환한다. 반드시 월별 매출 기준으로만 판단한다."
-        },
-        {
-            "role": "user",
-            "content": prompt
-        }
-    ]
-
-    # 1차 판단: GPT
-    try:
-        result = call_openai_chat_json(messages)
-        return result["shape_label"], f"GPT 1차 판별: {result['reason']}"
-    except Exception as e:
-        pass
-
-    # 2차 fallback: 로직
-    is_double, double_peaks = is_double_peak(y_smooth)
-    if is_double:
-        return "쌍봉형", f"GPT 실패, 로직 fallback: 의미 있는 피크 2개 ({[month_labels[i] for i in double_peaks]})"
-
-    is_single, single_peaks = is_single_peak(y_smooth)
-    if is_single:
-        return "단봉형", f"GPT 실패, 로직 fallback: 의미 있는 피크 1개 ({[month_labels[i] for i in single_peaks]})"
-
-    if is_all_season(y_smooth):
-        return "올시즌형", "GPT 실패, 로직 fallback: 큰 피크 없이 전체적으로 고르게 분포"
-
-    return "단봉형", "GPT 실패 및 로직 미확정으로 단봉형 fallback"
-
-# =========================
-# 구글 시트 로딩 함수
-# =========================
-def get_gspread_client():
-    """
-    Streamlit secrets 또는 환경변수에서 구글 서비스계정 정보를 읽어
-    gspread client를 생성합니다.
-    """
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ]
-
-    if "gcp_service_account" in st.secrets:
-        creds_dict = dict(st.secrets["gcp_service_account"])
-        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        return gspread.authorize(credentials)
-
-    service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if service_account_json:
-        creds_dict = json.loads(service_account_json)
-        credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        return gspread.authorize(credentials)
-
-    raise ValueError("구글 서비스 계정 정보가 없습니다.")
-
-
-def get_sheets_config() -> dict:
-    """
-    secrets.toml의 [sheets] 섹션을 dict로 반환합니다.
-    필수 키: sheet_id
-    선택 키: worksheet
-    """
-    if "sheets" not in st.secrets:
-        raise ValueError("st.secrets['sheets'] 설정이 없습니다. secrets.toml에 [sheets] 섹션을 추가하세요.")
-    return dict(st.secrets["sheets"])
-
-
-@st.cache_data(ttl=300)
-def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
-    """
-    구글시트의 특정 워크시트를 DataFrame으로 읽습니다.
-    """
-    client = get_gspread_client()
-    sheets_cfg = get_sheets_config()
-    sheet_id = sheets_cfg.get("sheet_id")
-
-    if not sheet_id:
-        raise ValueError("secrets.toml의 [sheets].sheet_id 가 비어있습니다.")
-
-    sh = client.open_by_key(sheet_id)
-
-    try:
-        ws = sh.worksheet(worksheet_name)
-    except Exception as e:
-        available = [w.title for w in sh.worksheets()]
-        raise ValueError(
-            f"워크시트 '{worksheet_name}'를 찾지 못했습니다. 사용 가능한 워크시트: {available}"
-        ) from e
-
-    values = ws.get_all_values()
-    if not values:
-        return pd.DataFrame()
-
-    raw_headers = values[0]
-    headers = make_unique_headers([str(h) for h in raw_headers])
-
-    rows = values[1:] if len(values) > 1 else []
-    if not rows:
-        return pd.DataFrame(columns=headers)
-
-    max_cols = len(headers)
-    normalized_rows = []
-
-    for row in rows:
-        row = list(row)
-        if len(row) < max_cols:
-            row = row + [""] * (max_cols - len(row))
-        elif len(row) > max_cols:
-            row = row[:max_cols]
-        normalized_rows.append(row)
-
-    return pd.DataFrame(normalized_rows, columns=headers)
-
-
-@st.cache_data(ttl=300)
-def load_sheet_data() -> pd.DataFrame:
-    sheets_cfg = get_sheets_config()
-
-    sheet_id = sheets_cfg.get("sheet_id")
-    worksheet_name = (
-        sheets_cfg.get("WORKSHEET_NAME")
-        or sheets_cfg.get("worksheet")
-        or sheets_cfg.get("forecast_base_sheet")
-        or "plc db"
-    )
-
-    if not sheet_id:
-        raise ValueError("secrets.toml의 [sheets].sheet_id 가 비어있습니다.")
-
-    return load_sheet_as_df(worksheet_name)
-
-
-# =========================
-# 데이터 전처리
-# =========================
-def get_item_columns(df: pd.DataFrame) -> List[str]:
-    """
-    아이템 선택용 컬럼 목록 반환
-    '연도/주'를 제외한 컬럼 중 값이 있는 컬럼만 반환
-    """
-    exclude_cols = {"연도/주", "", " "}
-    candidate_cols = [c for c in df.columns if str(c).strip() not in exclude_cols]
-
-    item_cols = []
-    for col in candidate_cols:
-        series = df[col].astype(str).str.strip().replace("", np.nan)
-        if series.notna().any():
-            item_cols.append(col)
-
-    return item_cols
-
-
-def prepare_item_timeseries(df: pd.DataFrame, item_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    선택한 아이템의
-    1) 주차별 매출 데이터
-    2) 월별 매출 데이터
-    를 만들어 반환합니다.
-    """
-    if df.empty:
-        raise ValueError("시트 데이터가 비어 있습니다.")
-
-    if "연도/주" not in df.columns:
-        raise ValueError("필수 컬럼 '연도/주'가 없습니다.")
-
-    if item_name not in df.columns:
-        raise ValueError(f"선택한 아이템 컬럼 '{item_name}'이 없습니다.")
-
-    temp = df[["연도/주", item_name]].copy()
-    temp.columns = ["year_week", "sales"]
-
-    # 연도/주 형식 데이터만 사용
-    temp["year_week"] = temp["year_week"].astype(str).str.strip()
-    temp = temp[temp["year_week"].str.match(r"^\d{4}-\d{1,2}$", na=False)].copy()
-
-    if temp.empty:
-        raise ValueError("연도/주 형식의 데이터가 없습니다. 예: 2025-01")
-
-    # 숫자 변환
-    temp["sales"] = temp["sales"].apply(clean_number)
-
-    # 날짜 변환
-    temp["week_start"] = temp["year_week"].apply(parse_yearweek_to_date)
-    temp = temp.dropna(subset=["week_start"]).copy()
-
-    # 숫자 없는 건 0 처리
-    temp["sales"] = temp["sales"].fillna(0)
-
-    # 주차 정렬
-    weekly_df = temp.sort_values("week_start").reset_index(drop=True)
-
-    # 월 컬럼 생성
-    weekly_df["month"] = weekly_df["week_start"].dt.to_period("M").dt.to_timestamp()
-
-    # 월별 매출 합산
-    monthly_df = (
-        weekly_df.groupby("month", as_index=False)["sales"]
+    weekly = (
+        item_df.groupby(["year_week", "week_start_date"], as_index=False)["sales_qty"]
         .sum()
-        .sort_values("month")
+        .sort_values("week_start_date")
         .reset_index(drop=True)
     )
+    return weekly
 
-    return weekly_df, monthly_df
+
+def make_item_monthly_series(history_df: pd.DataFrame, item_name: str) -> pd.DataFrame:
+    item_df = history_df[history_df["item_name"] == item_name].copy()
+    item_df["year_month"] = pd.to_datetime(item_df["week_start_date"]).dt.to_period("M").astype(str)
+
+    monthly = (
+        item_df.groupby("year_month", as_index=False)["sales_qty"]
+        .sum()
+        .rename(columns={"sales_qty": "monthly_sales_qty"})
+    )
+    return monthly
 
 
-# =========================
-# 차트 생성
-# =========================
-def build_dual_line_chart(item_name: str, weekly_df: pd.DataFrame, monthly_df: pd.DataFrame) -> go.Figure:
+def draw_weekly_monthly_chart(weekly_df: pd.DataFrame, monthly_df: pd.DataFrame, item_name: str):
     fig = go.Figure()
 
-    # 주차별 매출 선
     fig.add_trace(
         go.Scatter(
-            x=weekly_df["week_start"],
-            y=weekly_df["sales"],
+            x=weekly_df["year_week"],
+            y=weekly_df["sales_qty"],
             mode="lines+markers",
-            name="주차별 매출",
-            hovertemplate="주차 시작일: %{x|%Y-%m-%d}<br>매출: %{y:,.0f}<extra></extra>",
+            name="주차별 판매량"
         )
     )
 
-    # 월별 매출 선
-    fig.add_trace(
-        go.Scatter(
-            x=monthly_df["month"],
-            y=monthly_df["sales"],
-            mode="lines+markers",
-            name="월별 매출",
-            hovertemplate="월: %{x|%Y-%m}<br>매출: %{y:,.0f}<extra></extra>",
+    # 월별 선도 같이 표시
+    # x축 라벨 길이가 달라서 월별은 별도 축 대신 같은 축에 간단히 뒤쪽에 표시하기보다
+    # 사용자 요청대로 한 화면에 2개 선을 보여주려면 x축 기준을 날짜로 맞추는 게 가장 안전함
+    if not monthly_df.empty:
+        monthly_plot = monthly_df.copy()
+        monthly_plot["month_date"] = pd.to_datetime(monthly_plot["year_month"] + "-01")
+
+        fig.add_trace(
+            go.Scatter(
+                x=monthly_plot["month_date"],
+                y=monthly_plot["monthly_sales_qty"],
+                mode="lines+markers",
+                name="월별 판매량"
+            )
         )
-    )
 
     fig.update_layout(
-        title=f"{item_name} 주차별/월별 매출 추이",
-        xaxis_title="연도/주",
-        yaxis_title="매출",
-        height=620,
+        title=f"{item_name} 월별/주차별 판매 추이",
+        xaxis_title="기간",
+        yaxis_title="판매량",
         hovermode="x unified",
-        margin=dict(l=30, r=30, t=70, b=30),
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1
-        ),
+        height=500,
     )
-
-    fig.update_yaxes(tickformat=",.0f")
-
-    return fig
-
-# =========================
-# 월별 매출 형태 판별 (단봉 / 다봉)
-# =========================
-def smooth_series(values: np.ndarray, window: int = 2) -> np.ndarray:
-    """
-    월별 매출을 약하게 smoothing
-    """
-    if len(values) < window:
-        return values.copy()
-
-    return pd.Series(values).rolling(
-        window=window,
-        center=True,
-        min_periods=1
-    ).mean().values
-
-
-def find_significant_peaks(
-    values: np.ndarray,
-    min_peak_ratio: float = 0.35,
-    min_prominence_ratio: float = 0.10,
-    min_distance: int = 1
-) -> List[int]:
-    """
-    의미 있는 peak만 찾기
-    """
-    if len(values) < 3:
-        return []
-
-    max_val = np.max(values)
-    if max_val <= 0:
-        return []
-
-    candidate_peaks = []
-
-    for i in range(1, len(values) - 1):
-        if values[i] > values[i - 1] and values[i] >= values[i + 1]:
-            left_base = values[i - 1]
-            right_base = values[i + 1]
-            base_level = max(left_base, right_base)
-
-            peak_ratio = values[i] / max_val
-            prominence = values[i] - base_level
-            prominence_ratio = prominence / max_val
-
-            if peak_ratio >= min_peak_ratio and prominence_ratio >= min_prominence_ratio:
-                candidate_peaks.append(i)
-
-    if not candidate_peaks:
-        return []
-
-    filtered = []
-    for idx in candidate_peaks:
-        if not filtered:
-            filtered.append(idx)
-        else:
-            prev_idx = filtered[-1]
-            if idx - prev_idx <= min_distance:
-                if values[idx] > values[prev_idx]:
-                    filtered[-1] = idx
-            else:
-                filtered.append(idx)
-
-    return filtered
-
-
-def is_double_peak(values: np.ndarray) -> Tuple[bool, List[int]]:
-    peaks = find_significant_peaks(
-        values,
-        min_peak_ratio=0.25,
-        min_prominence_ratio=0.05,
-        min_distance=2
-    )
-
-    if len(peaks) < 2:
-        return False, peaks
-
-    mx = np.max(values)
-    if mx <= 0:
-        return False, peaks
-
-    strong = [p for p in peaks if values[p] >= mx * 0.6]
-
-    if len(strong) < 2:
-        return False, peaks
-
-    strong = sorted(strong)
-
-    for i in range(len(strong) - 1):
-        p1 = strong[i]
-        p2 = strong[i + 1]
-
-        # 두 피크 간 거리 6 이상
-        if p2 - p1 < 6:
-            continue
-
-        # 피크 사이 저점 존재 여부 확인
-        valley = np.min(values[p1:p2 + 1])
-        lower_peak = min(values[p1], values[p2])
-
-        if lower_peak > 0 and valley / lower_peak <= 0.85:
-            return True, [p1, p2]
-
-    return False, peaks
-
-
-def is_single_peak(values: np.ndarray) -> Tuple[bool, List[int]]:
-    peaks = find_significant_peaks(
-        values,
-        min_peak_ratio=0.30,
-        min_prominence_ratio=0.08,
-        min_distance=2
-    )
-
-    if len(peaks) == 1:
-        return True, peaks
-
-    if len(peaks) == 0:
-        return False, peaks
-
-    mx = np.max(values)
-    strong_peaks = [p for p in peaks if values[p] >= mx * 0.60]
-
-    if len(strong_peaks) == 1:
-        return True, strong_peaks
-
-    return False, peaks
-
-
-def is_all_season(values: np.ndarray) -> bool:
-    if len(values) < 4:
-        return False
-
-    avg = np.mean(values)
-    mx = np.max(values)
-
-    if avg <= 0:
-        return False
-
-    if mx / avg > 2.0:
-        return False
-
-    low = values < avg * 0.5
-    if np.sum(low) > len(values) * 0.3:
-        return False
-
-    near_avg = (values >= avg * 0.7) & (values <= avg * 1.3)
-    if np.sum(near_avg) < len(values) * 0.7:
-        return False
-
-    return True
-
-# =========================
-# 메인 화면
-# =========================
-def main():
-    st.set_page_config(page_title="아이템 매출 추이", layout="wide")
-
-    df = load_sheet_data()
-
-    if df.empty:
-        st.warning("불러온 데이터가 없습니다.")
-        return
-
-    item_cols = get_item_columns(df)
-    if not item_cols:
-        st.warning("선택 가능한 아이템 컬럼이 없습니다.")
-        return
-
-    st.markdown("개별 차트 확인할 아이템")
-    selected_item = st.selectbox(
-        "개별 차트 확인할 아이템",
-        options=item_cols,
-        index=item_cols.index("가디건") if "가디건" in item_cols else 0,
-        label_visibility="collapsed",
-    )
-
-    weekly_df, monthly_df = prepare_item_timeseries(df, selected_item)
-    shape_label, shape_reason = classify_shape(selected_item, monthly_df)
-
-    st.markdown(f"### 형태: {shape_label}")
-    st.caption(shape_reason)
-        
-    fig = build_dual_line_chart(selected_item, weekly_df, monthly_df)
 
     st.plotly_chart(fig, use_container_width=True)
 
-    
+
+# -------------------------------------------------
+# 9. final 시트 전처리
+# -------------------------------------------------
+def get_first_existing_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
 
 
-if __name__ == "__main__":
-    main()
+def parse_final_to_long(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    final 시트 구조 예시:
+    상품코드 / 상품명 / 02월25일|기초재고 / 02월25일|판매량 / ... / 03월25일|예측판매량 ...
+    """
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    sku_col = get_first_existing_col(df, ["품번", "상품코드", "스타일", "style", "STYLE"])
+    name_col = get_first_existing_col(df, ["상품명", "아이템명", "품명", "name", "NAME"])
+
+    if sku_col is None:
+        sku_col = df.columns[0]
+    if name_col is None:
+        name_col = df.columns[1]
+
+    meta_cols = [sku_col, name_col]
+    date_metric_cols = [c for c in df.columns if "|" in str(c)]
+
+    long_rows = []
+
+    for _, row in df.iterrows():
+        sku = row[sku_col]
+        product_name = row[name_col]
+
+        grouped = {}
+        for col in date_metric_cols:
+            date_str, metric = col.split("|", 1)
+            grouped.setdefault(date_str, {})
+            grouped[date_str][metric] = row[col]
+
+        for date_str, metrics in grouped.items():
+            one = {
+                "sku": sku,
+                "product_name": product_name,
+                "date_label": date_str.strip(),
+            }
+            one.update(metrics)
+            long_rows.append(one)
+
+    long_df = pd.DataFrame(long_rows)
+
+    # 숫자형 변환
+    numeric_cols = ["기초재고", "판매량", "예측판매량", "분배량", "출고량(회전 등)", "로스", "보조지표"]
+    for c in numeric_cols:
+        if c not in long_df.columns:
+            long_df[c] = 0
+
+        long_df[c] = (
+            long_df[c]
+            .astype(str)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+            .replace("", "0")
+        )
+        long_df[c] = pd.to_numeric(long_df[c], errors="coerce").fillna(0)
+
+    # 날짜 파싱
+    long_df["parsed_date"] = pd.to_datetime(long_df["date_label"], format="%m월 %d일", errors="coerce")
+
+    # 연도는 현재 연도 기준으로 넣음
+    current_year = datetime.now().year
+    long_df["parsed_date"] = long_df["parsed_date"].apply(
+        lambda x: x.replace(year=current_year) if pd.notnull(x) else pd.NaT
+    )
+
+    long_df = long_df.sort_values(["product_name", "parsed_date"]).reset_index(drop=True)
+    return long_df
+
+
+# -------------------------------------------------
+# 10. 주차별 판매 예측
+# -------------------------------------------------
+def compute_seasonal_factor(history_weekly_df: pd.DataFrame, target_week: int) -> float:
+    """
+    과거 동일 주차 평균 / 전체 주차 평균
+    """
+    if history_weekly_df.empty:
+        return 1.0
+
+    temp = history_weekly_df.copy()
+    temp["week_no"] = temp["year_week"].str.extract(r"-(\d{1,2})$")[0]
+    temp["week_no"] = pd.to_numeric(temp["week_no"], errors="coerce")
+
+    overall_mean = temp["sales_qty"].mean()
+    same_week_mean = temp.loc[temp["week_no"] == target_week, "sales_qty"].mean()
+
+    if pd.isna(overall_mean) or overall_mean <= 0:
+        return 1.0
+    if pd.isna(same_week_mean) or same_week_mean <= 0:
+        return 1.0
+
+    factor = same_week_mean / overall_mean
+
+    # 너무 과하게 흔들리지 않게 제한
+    factor = max(0.7, min(1.3, factor))
+    return factor
+
+
+def predict_next_sales(item_final_df: pd.DataFrame, history_weekly_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    예측 방식:
+    1. 최근 실제 판매량 3주 가중평균
+    2. 과거 동일 시즌성 보정
+    3. 기초재고보다 많이 예측하지 않도록 제한
+    """
+    df = item_final_df.copy().sort_values("parsed_date").reset_index(drop=True)
+
+    sales_col = "판매량"
+    pred_col = "예측판매량"
+
+    actual_sales = df[sales_col].astype(float).tolist()
+    base_stock = df["기초재고"].astype(float).tolist()
+
+    predictions = []
+
+    for i in range(len(df)):
+        current_actual = df.loc[i, sales_col]
+        current_pred = df.loc[i, pred_col]
+
+        # 이미 예측판매량이 있으면 유지
+        if pd.notnull(current_pred) and float(current_pred) > 0:
+            predictions.append(float(current_pred))
+            continue
+
+        # 최근 실제 판매량 확보
+        history_actual = [x for x in actual_sales[:i] if pd.notnull(x)]
+        recent = history_actual[-3:]
+
+        if len(recent) == 0:
+            base_pred = 0.0
+        elif len(recent) == 1:
+            base_pred = recent[-1]
+        elif len(recent) == 2:
+            base_pred = recent[-1] * 0.6 + recent[-2] * 0.4
+        else:
+            base_pred = recent[-1] * 0.5 + recent[-2] * 0.3 + recent[-3] * 0.2
+
+        # 목표 주차 계산
+        target_date = df.loc[i, "parsed_date"]
+        if pd.notnull(target_date):
+            target_week = int(target_date.isocalendar().week)
+        else:
+            target_week = None
+
+        seasonal_factor = 1.0
+        if target_week is not None and not history_weekly_df.empty:
+            seasonal_factor = compute_seasonal_factor(history_weekly_df, target_week)
+
+        pred = base_pred * seasonal_factor
+
+        # 음수 방지
+        pred = max(0.0, pred)
+
+        # 재고 제한
+        stock = float(base_stock[i]) if pd.notnull(base_stock[i]) else 0.0
+        pred = min(pred, stock)
+
+        predictions.append(round(pred))
+
+    df["최종예측판매량"] = predictions
+    return df
+
+
+# -------------------------------------------------
+# 11. 화면 실행
+# -------------------------------------------------
+if st.button("데이터 불러오기"):
+    try:
+        # 1) 기존 시즌 분류용 데이터
+        raw_history_df = load_history_sheet()
+        history_df = preprocess_history_data(raw_history_df)
+        classification_df = make_classification_table(history_df)
+
+        # 2) final 시트
+        final_values = load_final_sheet_raw()
+        final_display_df = make_final_display_df(final_values)
+        final_long_df = parse_final_to_long(final_display_df)
+
+        st.success("데이터를 불러왔습니다.")
+
+        # -------------------------------------------------
+        # A. 기존 시즌 분류 결과
+        # -------------------------------------------------
+        st.subheader("시즌 분류 결과")
+        st.dataframe(classification_df, use_container_width=True)
+
+        # -------------------------------------------------
+        # B. final 시트 원본 표
+        # -------------------------------------------------
+        st.subheader("final 시트 원본 표")
+        st.dataframe(final_display_df, use_container_width=True)
+
+        # -------------------------------------------------
+        # C. 상품 선택
+        # -------------------------------------------------
+        st.subheader("상품 상세 조회")
+        product_list = final_long_df["product_name"].dropna().astype(str).unique().tolist()
+        selected_product = st.selectbox("상품명 선택", product_list)
+
+        product_final_df = final_long_df[final_long_df["product_name"] == selected_product].copy()
+        product_final_df = product_final_df.sort_values("parsed_date").reset_index(drop=True)
+
+        st.write("선택 상품 데이터")
+        st.dataframe(product_final_df, use_container_width=True)
+
+        # -------------------------------------------------
+        # D. 상품명 -> 시즌 아이템 매칭
+        # -------------------------------------------------
+        extracted_item = extract_base_item_name(selected_product)
+        matched_history_item = find_best_history_item(selected_product, classification_df)
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("상품명에서 읽은 아이템", extracted_item)
+        col2.metric("매칭된 기존 아이템", matched_history_item if matched_history_item else "매칭 실패")
+
+        if matched_history_item:
+            matched_row = classification_df[classification_df["item_name"] == matched_history_item].iloc[0]
+            col3.metric("시즌 분류", matched_row["CATEGORY"])
+
+            st.write("시즌 분류 상세")
+            st.dataframe(
+                pd.DataFrame([matched_row]),
+                use_container_width=True
+            )
+        else:
+            st.warning("상품명에서 기존 시즌 분류 아이템을 찾지 못했습니다. 키워드 사전을 추가하면 더 정확해집니다.")
+
+        # -------------------------------------------------
+        # E. 월별 / 주차별 그래프
+        # -------------------------------------------------
+        if matched_history_item:
+            weekly_series = make_item_weekly_series(history_df, matched_history_item)
+            monthly_series = make_item_monthly_series(history_df, matched_history_item)
+
+            st.subheader("월별 / 주차별 판매 그래프")
+            draw_weekly_monthly_chart(weekly_series, monthly_series, matched_history_item)
+
+            st.write("주차별 판매 데이터")
+            st.dataframe(weekly_series, use_container_width=True)
+
+            st.write("월별 판매 데이터")
+            st.dataframe(monthly_series, use_container_width=True)
+
+        # -------------------------------------------------
+        # F. 다음 주 판매 예측
+        # -------------------------------------------------
+        st.subheader("주차별 판매 예측")
+
+        if matched_history_item:
+            weekly_series_for_pred = make_item_weekly_series(history_df, matched_history_item)
+        else:
+            weekly_series_for_pred = pd.DataFrame(columns=["year_week", "week_start_date", "sales_qty"])
+
+        predicted_df = predict_next_sales(product_final_df, weekly_series_for_pred)
+
+        st.dataframe(predicted_df, use_container_width=True)
+
+        # 예측 그래프
+        fig_pred = go.Figure()
+
+        fig_pred.add_trace(
+            go.Scatter(
+                x=predicted_df["date_label"],
+                y=predicted_df["판매량"],
+                mode="lines+markers",
+                name="실판매량"
+            )
+        )
+
+        fig_pred.add_trace(
+            go.Scatter(
+                x=predicted_df["date_label"],
+                y=predicted_df["최종예측판매량"],
+                mode="lines+markers",
+                name="예측판매량"
+            )
+        )
+
+        fig_pred.update_layout(
+            title=f"{selected_product} 주차별 판매 예측",
+            xaxis_title="기준일",
+            yaxis_title="판매량",
+            hovermode="x unified",
+            height=500
+        )
+
+        st.plotly_chart(fig_pred, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"오류가 발생했습니다: {e}")
