@@ -276,6 +276,19 @@ def get_sheets_config() -> dict:
 
 
 @st.cache_data(ttl=300)
+def load_plc_df() -> pd.DataFrame:
+    sheets_cfg = get_sheets_config()
+    plc_sheet = sheets_cfg.get("plc_db") or "plc db"
+    return load_sheet_as_df(plc_sheet)
+
+
+@st.cache_data(ttl=300)
+def load_final_df() -> pd.DataFrame:
+    sheets_cfg = get_sheets_config()
+    final_sheet = sheets_cfg.get("final") or "final"
+    return load_sheet_as_df(final_sheet)
+
+
 def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
     """
     구글시트의 특정 워크시트를 DataFrame으로 읽습니다.
@@ -360,49 +373,57 @@ def get_item_columns(df: pd.DataFrame) -> List[str]:
     return item_cols
 
 
-def prepare_item_timeseries(df: pd.DataFrame, item_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def prepare_plc_item_timeseries(
+    plc_df: pd.DataFrame,
+    item_code: str
+) -> Tuple[str, pd.DataFrame, pd.DataFrame]:
     """
-    선택한 아이템의
-    1) 주차별 매출 데이터
-    2) 월별 매출 데이터
-    를 만들어 반환합니다.
+    plc db에서 item_code에 해당하는 행을 찾아
+    주차별/월별 시계열을 생성한다.
+    반환:
+    - item_name
+    - weekly_df
+    - monthly_df
     """
-    if df.empty:
-        raise ValueError("시트 데이터가 비어 있습니다.")
+    df = plc_df.copy()
 
-    if "연도/주" not in df.columns:
-        raise ValueError("필수 컬럼 '연도/주'가 없습니다.")
+    required_cols = ["아이템명", "아이템코드"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"plc db 필수 컬럼이 없습니다: {missing}")
 
-    if item_name not in df.columns:
-        raise ValueError(f"선택한 아이템 컬럼 '{item_name}'이 없습니다.")
+    df["아이템코드"] = df["아이템코드"].astype(str).str.strip()
+    matched = df[df["아이템코드"] == str(item_code).strip()].copy()
 
-    temp = df[["연도/주", item_name]].copy()
-    temp.columns = ["year_week", "sales"]
+    if matched.empty:
+        raise ValueError(f"plc db에서 아이템코드 '{item_code}'를 찾지 못했습니다.")
 
-    # 연도/주 형식 데이터만 사용
-    temp["year_week"] = temp["year_week"].astype(str).str.strip()
-    temp = temp[temp["year_week"].str.match(r"^\d{4}-\d{1,2}$", na=False)].copy()
+    row = matched.iloc[0]
+    item_name = str(row["아이템명"]).strip()
 
-    if temp.empty:
-        raise ValueError("연도/주 형식의 데이터가 없습니다. 예: 2025-01")
+    week_cols = [c for c in df.columns if re.match(r"^\d{4}-\d{1,2}$", str(c).strip())]
+    if not week_cols:
+        raise ValueError("plc db에 2025-01 형식의 주차 컬럼이 없습니다.")
 
-    # 숫자 변환
-    temp["sales"] = temp["sales"].apply(clean_number)
+    records = []
+    for col in week_cols:
+        sales = clean_number(row[col])
+        week_start = parse_yearweek_to_date(col)
+        if pd.isna(week_start):
+            continue
 
-    # 날짜 변환
-    temp["week_start"] = temp["year_week"].apply(parse_yearweek_to_date)
-    temp = temp.dropna(subset=["week_start"]).copy()
+        records.append({
+            "year_week": col,
+            "week_start": week_start,
+            "sales": 0 if pd.isna(sales) else float(sales)
+        })
 
-    # 숫자 없는 건 0 처리
-    temp["sales"] = temp["sales"].fillna(0)
+    weekly_df = pd.DataFrame(records).sort_values("week_start").reset_index(drop=True)
+    if weekly_df.empty:
+        raise ValueError(f"아이템코드 '{item_code}'의 주차 데이터가 없습니다.")
 
-    # 주차 정렬
-    weekly_df = temp.sort_values("week_start").reset_index(drop=True)
-
-    # 월 컬럼 생성
     weekly_df["month"] = weekly_df["week_start"].dt.to_period("M").dt.to_timestamp()
 
-    # 월별 매출 합산
     monthly_df = (
         weekly_df.groupby("month", as_index=False)["sales"]
         .sum()
@@ -410,7 +431,21 @@ def prepare_item_timeseries(df: pd.DataFrame, item_name: str) -> Tuple[pd.DataFr
         .reset_index(drop=True)
     )
 
-    return weekly_df, monthly_df
+    return item_name, weekly_df, monthly_df
+
+
+def get_final_item_options(final_df: pd.DataFrame) -> pd.DataFrame:
+    df = prepare_final_df(final_df).copy()
+
+    # sku_name + item_code 기준으로 유니크
+    options = (
+        df[["sku_name", "item_code", "sku"]]
+        .dropna(subset=["sku_name"])
+        .drop_duplicates()
+        .sort_values(["sku_name", "sku"])
+        .reset_index(drop=True)
+    )
+    return options
 
 
 # =========================
@@ -849,6 +884,25 @@ def classify_weekly_stages_by_shape(
 
     return df
 
+def extract_item_code_from_sku(sku: str) -> str:
+    s = str(sku).strip()
+    if len(s) >= 4:
+        return s[2:4]
+    return ""
+
+def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
+    df = final_df.copy()
+
+    required_cols = ["sku", "sku_name", "날짜", "판매량"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"final 시트 필수 컬럼이 없습니다: {missing}")
+
+    df["item_code"] = df["sku"].apply(extract_item_code_from_sku)
+    df["판매량"] = df["판매량"].apply(clean_number).fillna(0)
+    df["날짜"] = pd.to_datetime(df["날짜"], errors="coerce")
+    return df
+
 
 
 # =========================
@@ -869,45 +923,60 @@ STAGE_COLORS = {
 def main():
     st.set_page_config(page_title="아이템 매출 추이", layout="wide")
 
-    df = load_sheet_data()
+    plc_df = load_plc_df()
+    final_df = load_final_df()
 
-    if df.empty:
-        st.warning("불러온 데이터가 없습니다.")
+    if plc_df.empty:
+        st.warning("plc db 데이터가 없습니다.")
         return
 
-    item_cols = get_item_columns(df)
-    if not item_cols:
-        st.warning("선택 가능한 아이템 컬럼이 없습니다.")
+    if final_df.empty:
+        st.warning("final 데이터가 없습니다.")
         return
 
-    st.markdown("개별 차트 확인할 아이템")
-    selected_item = st.selectbox(
-        "개별 차트 확인할 아이템",
-        options=item_cols,
-        index=item_cols.index("가디건") if "가디건" in item_cols else 0,
-        label_visibility="collapsed",
+    final_prepared = prepare_final_df(final_df)
+    options_df = get_final_item_options(final_prepared)
+
+    if options_df.empty:
+        st.warning("final에서 선택 가능한 SKU 데이터가 없습니다.")
+        return
+
+    options_df["label"] = options_df.apply(
+        lambda r: f"{r['sku_name']} | 코드:{r['item_code']} | SKU:{r['sku']}",
+        axis=1
     )
 
-    weekly_df, monthly_df = prepare_item_timeseries(df, selected_item)
-    shape_label, shape_reason = classify_shape(selected_item, monthly_df)
-    
-    # 월별 형태 기준으로, 주차별 단계 라벨 부여
+    selected_label = st.selectbox(
+        "개별 차트 확인할 상품",
+        options=options_df["label"].tolist()
+    )
+
+    selected_row = options_df[options_df["label"] == selected_label].iloc[0]
+    selected_item_code = selected_row["item_code"]
+
+    item_name, weekly_df, monthly_df = prepare_plc_item_timeseries(plc_df, selected_item_code)
+    shape_label, shape_reason = classify_shape(item_name, monthly_df)
     weekly_df = classify_weekly_stages_by_shape(weekly_df, shape_label)
-    
+
+    st.markdown(f"### 아이템명: {item_name}")
     st.markdown(f"### 형태: {shape_label}")
     st.caption(shape_reason)
-    
-    stage_order_text = ""
+
     if shape_label == "단봉형":
-        stage_order_text = "도입 > 성장 > 피크 > 성숙 > 쇠퇴"
+        st.markdown("**주차 단계 순서:** 도입 > 성장 > 피크 > 성숙 > 쇠퇴")
     elif shape_label == "쌍봉형":
-        stage_order_text = "도입 > 성장 > 피크 > 성숙 > 비시즌 > 성숙 > 피크2 > 성숙 > 쇠퇴"
+        st.markdown("**주차 단계 순서:** 도입 > 성장 > 피크 > 성숙 > 비시즌 > 성숙 > 피크2 > 성숙 > 쇠퇴")
     else:
-        stage_order_text = "도입 > 성장 > 성숙 > 쇠퇴"
-    
-    st.markdown(f"**주차 단계 순서:** {stage_order_text}")
-    
-    fig = build_dual_line_chart(selected_item, weekly_df, monthly_df)
+        st.markdown("**주차 단계 순서:** 도입 > 성장 > 성숙 > 쇠퇴")
+
+    fig = build_dual_line_chart(item_name, weekly_df, monthly_df)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.dataframe(
+        weekly_df[["year_week", "sales", "stage"]],
+        use_container_width=True,
+        hide_index=True
+    )
 
     
 
