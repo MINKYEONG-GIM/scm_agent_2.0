@@ -1433,6 +1433,7 @@ def main():
         # 미래 주차 예측값: 빨강
         styles.loc[predict_mask, "올해 해당 주차 판매량 (장)"] = "color: #C92A2A; font-weight: 800;"
         styles.loc[base_pred_mask.values, "기초재고"] = "color: #C92A2A; font-weight: 800;"
+        styles.loc[is_future_week, "로스"] = "color: #C92A2A; font-weight: 800;"
         return styles
 
     st.dataframe(
@@ -1466,7 +1467,10 @@ def main():
             ),
         }
     )
-    st.caption("빨간색 수치는 AI 예측값입니다.")
+    st.markdown(
+        "<span style='color:#C92A2A; font-weight:800;'>빨간색 수치는 AI 예측값입니다.</span>",
+        unsafe_allow_html=True
+    )
 
     st.markdown(f"### 아이템명: {item_name}")
     st.markdown(f"### 형태: {shape_label}")
