@@ -1069,6 +1069,12 @@ def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
     df["item_code"] = df["sku"].apply(extract_item_code_from_sku)
     df["판매량"] = df["판매량"].apply(clean_number).fillna(0)
 
+    # 선택 컬럼(있으면 숫자 정리)
+    optional_numeric_cols = ["기초재고", "분배량", "출고량(회전 등)", "로스"]
+    for c in optional_numeric_cols:
+        if c in df.columns:
+            df[c] = df[c].apply(clean_number)
+
     # 날짜 문자열 정리
     raw_date = (
         df["날짜"]
@@ -1124,7 +1130,7 @@ def build_year_compare_table(
     last_year_df["주차"] = last_year_df["week_no"].astype(str) + "주차"
 
     # -----------------------------
-    # 2) 올해 주차별 판매량 계산
+    # 2) 올해 주차별 지표 계산
     # -----------------------------
     this_year_df = final_item_df.copy()
     this_year_df = this_year_df.dropna(subset=["날짜"]).copy()
@@ -1133,13 +1139,38 @@ def build_year_compare_table(
         this_year_df["week_no"] = this_year_df["날짜"].dt.isocalendar().week.astype(int)
         this_year_df["판매량"] = pd.to_numeric(this_year_df["판매량"], errors="coerce").fillna(0)
 
-        this_year_weekly = (
-            this_year_df.groupby("week_no", as_index=False)["판매량"]
-            .sum()
-            .rename(columns={"판매량": "올해 해당 주차 판매량 (장)"})
-        )
+        agg_map = {"판매량": "sum"}
+
+        if "분배량" in this_year_df.columns:
+            this_year_df["분배량"] = pd.to_numeric(this_year_df["분배량"], errors="coerce").fillna(0)
+            agg_map["분배량"] = "sum"
+
+        if "출고량(회전 등)" in this_year_df.columns:
+            this_year_df["출고량(회전 등)"] = pd.to_numeric(this_year_df["출고량(회전 등)"], errors="coerce").fillna(0)
+            agg_map["출고량(회전 등)"] = "sum"
+
+        if "로스" in this_year_df.columns:
+            this_year_df["로스"] = pd.to_numeric(this_year_df["로스"], errors="coerce").fillna(0)
+            agg_map["로스"] = "sum"
+
+        this_year_weekly = this_year_df.groupby("week_no", as_index=False).agg(agg_map)
+
+        # 기초재고: 주차 내 가장 이른 날짜 행의 값(없으면 NaN)
+        if "기초재고" in this_year_df.columns:
+            tmp_base = this_year_df.dropna(subset=["기초재고"]).copy()
+            if not tmp_base.empty:
+                tmp_base = tmp_base.sort_values(["week_no", "날짜"])
+                base_weekly = tmp_base.groupby("week_no", as_index=False).first()[["week_no", "기초재고"]]
+            else:
+                base_weekly = pd.DataFrame(columns=["week_no", "기초재고"])
+
+            this_year_weekly = this_year_weekly.merge(base_weekly, on="week_no", how="left")
+
+        this_year_weekly = this_year_weekly.rename(columns={"판매량": "올해 해당 주차 판매량 (장)"})
     else:
-        this_year_weekly = pd.DataFrame(columns=["week_no", "올해 해당 주차 판매량 (장)"])
+        this_year_weekly = pd.DataFrame(
+            columns=["week_no", "올해 해당 주차 판매량 (장)", "기초재고", "분배량", "출고량(회전 등)", "로스"]
+        )
 
     # -----------------------------
     # 3) 작년 주차 기준으로 merge
@@ -1152,11 +1183,12 @@ def build_year_compare_table(
 
     result = result.sort_values("week_no").reset_index(drop=True)
 
-    result["올해 해당 주차 판매량 (장)"] = (
-        result["올해 해당 주차 판매량 (장)"]
-        .fillna(0)
-        .astype(int)
-    )
+    for col in ["올해 해당 주차 판매량 (장)", "분배량", "출고량(회전 등)", "로스"]:
+        if col in result.columns:
+            result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0).round().astype(int)
+
+    if "기초재고" in result.columns:
+        result["기초재고"] = pd.to_numeric(result["기초재고"], errors="coerce").fillna(0).round().astype(int)
 
     result["SKU"] = selected_sku
     result["SKU_NAME"] = selected_sku_name
@@ -1165,7 +1197,18 @@ def build_year_compare_table(
     result["작년의 해당 주차 판매비중(%)"] = result["last_year_ratio_pct"].round(1)
 
     result = result[
-        ["SKU", "SKU_NAME", "week_no", "주차", "작년의 해당 주차 판매비중(%)", "올해 해당 주차 판매량 (장)"]
+        [
+            "SKU",
+            "SKU_NAME",
+            "week_no",
+            "주차",
+            "작년의 해당 주차 판매비중(%)",
+            "기초재고",
+            "올해 해당 주차 판매량 (장)",
+            "분배량",
+            "출고량(회전 등)",
+            "로스",
+        ]
     ].copy()
 
     return result
