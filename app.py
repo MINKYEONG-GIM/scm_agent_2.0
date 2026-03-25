@@ -1151,8 +1151,14 @@ def main():
         st.warning("final에서 선택 가능한 SKU 데이터가 없습니다.")
         return
 
-    options_df["label"] = options_df.apply(
-        lambda r: f"{r['plant_name']} | {r['sku_name']} | 코드:{r['item_code']} | SKU:{r['sku']}",
+    # 표시용 라벨(상품 선택 드롭다운에는 매장명 미포함)
+    options_df["display_label"] = options_df.apply(
+        lambda r: f"{r['sku_name']} | 코드:{r['item_code']} | SKU:{r['sku']}",
+        axis=1
+    )
+    # 내부 식별용 키(전체 매장일 때도 선택이 겹치지 않도록)
+    options_df["option_id"] = options_df.apply(
+        lambda r: f"{r['plant_name']}||{r['sku']}",
         axis=1
     )
 
@@ -1173,12 +1179,15 @@ def main():
         if selected_plant != "전체":
             filtered_options_df = filtered_options_df[filtered_options_df["plant_name"] == selected_plant].copy()
 
-        selected_label = st.selectbox(
+        selected_option_id = st.selectbox(
             "개별 차트 확인할 상품",
-            options=filtered_options_df["label"].tolist()
+            options=filtered_options_df["option_id"].tolist(),
+            format_func=lambda oid: filtered_options_df.loc[
+                filtered_options_df["option_id"] == oid, "display_label"
+            ].iloc[0]
         )
 
-    selected_row = filtered_options_df[filtered_options_df["label"] == selected_label].iloc[0]
+    selected_row = filtered_options_df[filtered_options_df["option_id"] == selected_option_id].iloc[0]
     selected_item_code = selected_row["item_code"]
 
     selected_sku = str(selected_row["sku"]).strip()
