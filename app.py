@@ -416,19 +416,75 @@ def prepare_item_timeseries(df: pd.DataFrame, item_name: str) -> Tuple[pd.DataFr
 # =========================
 # 차트 생성
 # =========================
-def build_dual_line_chart(item_name: str, weekly_df: pd.DataFrame, monthly_df: pd.DataFrame) -> go.Figure:
+def build_dual_line_chart(
+    item_name: str,
+    weekly_df: pd.DataFrame,
+    monthly_df: pd.DataFrame
+) -> go.Figure:
     fig = go.Figure()
 
-    # 주차별 매출 선
-    fig.add_trace(
-        go.Scatter(
-            x=weekly_df["week_start"],
-            y=weekly_df["sales"],
-            mode="lines+markers",
-            name="주차별 매출",
-            hovertemplate="주차 시작일: %{x|%Y-%m-%d}<br>매출: %{y:,.0f}<extra></extra>",
+    # 주차별 단계별 색상 선
+    stage_df = weekly_df.copy().reset_index(drop=True)
+
+    if "stage" in stage_df.columns:
+        current_stage = None
+        segment_x = []
+        segment_y = []
+
+        for i, row in stage_df.iterrows():
+            stage = row["stage"]
+            x = row["week_start"]
+            y = row["sales"]
+
+            if current_stage is None:
+                current_stage = stage
+                segment_x = [x]
+                segment_y = [y]
+            elif stage == current_stage:
+                segment_x.append(x)
+                segment_y.append(y)
+            else:
+                fig.add_trace(
+                    go.Scatter(
+                        x=segment_x,
+                        y=segment_y,
+                        mode="lines+markers",
+                        name=current_stage,
+                        line=dict(color=STAGE_COLORS.get(current_stage, "#333")),
+                        marker=dict(size=7),
+                        hovertemplate="주차 시작일: %{x|%Y-%m-%d}<br>판매량: %{y:,.0f}<br>단계: " + current_stage + "<extra></extra>",
+                        showlegend=True
+                    )
+                )
+                current_stage = stage
+                segment_x = [x]
+                segment_y = [y]
+
+        # 마지막 구간
+        if segment_x:
+            fig.add_trace(
+                go.Scatter(
+                    x=segment_x,
+                    y=segment_y,
+                    mode="lines+markers",
+                    name=current_stage,
+                    line=dict(color=STAGE_COLORS.get(current_stage, "#333")),
+                    marker=dict(size=7),
+                    hovertemplate="주차 시작일: %{x|%Y-%m-%d}<br>판매량: %{y:,.0f}<br>단계: " + current_stage + "<extra></extra>",
+                    showlegend=True
+                )
+            )
+    else:
+        # 혹시 stage 없을 때 fallback
+        fig.add_trace(
+            go.Scatter(
+                x=weekly_df["week_start"],
+                y=weekly_df["sales"],
+                mode="lines+markers",
+                name="주차별 판매량",
+                hovertemplate="주차 시작일: %{x|%Y-%m-%d}<br>판매량: %{y:,.0f}<extra></extra>",
+            )
         )
-    )
 
     # 월별 매출 선
     fig.add_trace(
@@ -437,15 +493,24 @@ def build_dual_line_chart(item_name: str, weekly_df: pd.DataFrame, monthly_df: p
             y=monthly_df["sales"],
             mode="lines+markers",
             name="월별 매출",
+            line=dict(width=3, dash="dot", color="black"),
+            marker=dict(size=8),
+            yaxis="y2",
             hovertemplate="월: %{x|%Y-%m}<br>매출: %{y:,.0f}<extra></extra>",
         )
     )
 
     fig.update_layout(
-        title=f"{item_name} 주차별/월별 매출 추이",
-        xaxis_title="연도/주",
-        yaxis_title="매출",
-        height=620,
+        title=f"{item_name} 주차별 단계 / 월별 형태 기준 매출 추이",
+        xaxis_title="날짜",
+        yaxis_title="주차별 판매량",
+        yaxis2=dict(
+            title="월별 매출",
+            overlaying="y",
+            side="right",
+            showgrid=False
+        ),
+        height=650,
         hovermode="x unified",
         margin=dict(l=30, r=30, t=70, b=30),
         legend=dict(
@@ -458,9 +523,7 @@ def build_dual_line_chart(item_name: str, weekly_df: pd.DataFrame, monthly_df: p
     )
 
     fig.update_yaxes(tickformat=",.0f")
-
     return fig
-
 # =========================
 # 월별 매출 형태 판별 (단봉 / 다봉)
 # =========================
@@ -613,9 +676,196 @@ def is_all_season(values: np.ndarray) -> bool:
 
     return True
 
+
+def classify_weekly_stages_by_shape(
+    weekly_df: pd.DataFrame,
+    shape_label: str
+) -> pd.DataFrame:
+    """
+    월별 shape_label(단봉형/쌍봉형/올시즌형)에 따라
+    주차별 판매량을 기반으로 단계 라벨을 강제 부여한다.
+    """
+
+    df = weekly_df.copy().reset_index(drop=True)
+    y = df["sales"].astype(float).fillna(0).values
+    n = len(df)
+
+    if n == 0:
+        df["stage"] = []
+        return df
+
+    # 기본값
+    df["stage"] = "성숙"
+
+    # 판매량 smoothing
+    smooth = pd.Series(y).rolling(window=3, center=True, min_periods=1).mean().values
+
+    # 전주 대비 증감
+    diff = np.diff(smooth, prepend=smooth[0])
+
+    # ----------------------------
+    # 공통 유틸
+    # ----------------------------
+    def safe_argmax(arr):
+        if len(arr) == 0:
+            return 0
+        return int(np.argmax(arr))
+
+    def clip_idx(v):
+        return max(0, min(n - 1, int(v)))
+
+    # ============================
+    # 1) 단봉형
+    # 도입 > 성장 > 피크 > 성숙 > 쇠퇴
+    # ============================
+    if shape_label == "단봉형":
+        peak_idx = safe_argmax(smooth)
+
+        # 도입: 앞쪽 최대 4주
+        intro_end = min(3, max(1, peak_idx // 3))
+        # 성장: 도입 다음부터 피크 직전
+        growth_start = intro_end + 1
+        growth_end = max(growth_start, peak_idx - 1)
+
+        # 피크: 최고점 1주
+        peak_start = peak_idx
+        peak_end = peak_idx
+
+        # 성숙: 피크 직후 2~4주 정도
+        maturity_start = min(n - 1, peak_end + 1)
+        maturity_end = min(n - 1, maturity_start + 2)
+
+        # 쇠퇴: 이후 전체
+        decline_start = min(n - 1, maturity_end + 1)
+
+        df.loc[:intro_end, "stage"] = "도입"
+        if growth_start <= growth_end:
+            df.loc[growth_start:growth_end, "stage"] = "성장"
+        df.loc[peak_start:peak_end, "stage"] = "피크"
+        if maturity_start <= maturity_end:
+            df.loc[maturity_start:maturity_end, "stage"] = "성숙"
+        if decline_start < n:
+            df.loc[decline_start:, "stage"] = "쇠퇴"
+
+        return df
+
+    # ============================
+    # 2) 쌍봉형
+    # 도입 > 성장 > 피크 > 성숙 > 비시즌 > 성숙 > 피크2 > 성숙 > 쇠퇴
+    # ============================
+    if shape_label == "쌍봉형":
+        peaks = find_significant_peaks(
+            smooth,
+            min_peak_ratio=0.25,
+            min_prominence_ratio=0.05,
+            min_distance=2
+        )
+
+        # 강한 피크만
+        if len(peaks) >= 2:
+            peaks = sorted(peaks, key=lambda i: smooth[i], reverse=True)[:2]
+            peaks = sorted(peaks)
+            peak1, peak2 = peaks[0], peaks[1]
+        else:
+            # 실패 시 fallback
+            peak1 = safe_argmax(smooth[: max(1, n // 2)])
+            peak2 = safe_argmax(smooth[max(peak1 + 1, 1):]) + max(peak1 + 1, 1)
+            if peak2 >= n:
+                peak2 = n - 1
+
+        # valley = 두 피크 사이 최저점
+        if peak2 > peak1 + 1:
+            valley_rel = np.argmin(smooth[peak1:peak2 + 1])
+            valley_idx = peak1 + valley_rel
+        else:
+            valley_idx = min(n - 1, peak1 + 1)
+
+        intro_end = min(3, max(1, peak1 // 3))
+        growth_start = intro_end + 1
+        growth_end = max(growth_start, peak1 - 1)
+
+        peak1_idx = peak1
+
+        # 첫 성숙
+        maturity1_start = min(n - 1, peak1_idx + 1)
+        maturity1_end = min(n - 1, max(maturity1_start, valley_idx - 2))
+
+        # 비시즌
+        offseason_start = min(n - 1, max(maturity1_end + 1, valley_idx - 1))
+        offseason_end = min(n - 1, valley_idx + 1)
+
+        # 두 번째 성숙
+        maturity2_start = min(n - 1, offseason_end + 1)
+        maturity2_end = min(n - 1, max(maturity2_start, peak2 - 1))
+
+        peak2_idx = peak2
+
+        maturity3_start = min(n - 1, peak2_idx + 1)
+        maturity3_end = min(n - 1, maturity3_start + 1)
+
+        decline_start = min(n - 1, maturity3_end + 1)
+
+        df.loc[:intro_end, "stage"] = "도입"
+        if growth_start <= growth_end:
+            df.loc[growth_start:growth_end, "stage"] = "성장"
+
+        df.loc[peak1_idx:peak1_idx, "stage"] = "피크"
+
+        if maturity1_start <= maturity1_end:
+            df.loc[maturity1_start:maturity1_end, "stage"] = "성숙"
+
+        if offseason_start <= offseason_end:
+            df.loc[offseason_start:offseason_end, "stage"] = "비시즌"
+
+        if maturity2_start <= maturity2_end:
+            df.loc[maturity2_start:maturity2_end, "stage"] = "성숙"
+
+        df.loc[peak2_idx:peak2_idx, "stage"] = "피크2"
+
+        if maturity3_start <= maturity3_end:
+            df.loc[maturity3_start:maturity3_end, "stage"] = "성숙"
+
+        if decline_start < n:
+            df.loc[decline_start:, "stage"] = "쇠퇴"
+
+        return df
+
+    # ============================
+    # 3) 올시즌형
+    # 요청에 명시된 강제 규칙이 없으므로
+    # 도입 > 성장 > 성숙 > 쇠퇴 로 단순 처리
+    # ============================
+    intro_end = min(2, n - 1)
+    growth_end = min(max(intro_end + 2, n // 4), n - 1)
+    decline_start = max(growth_end + 1, n - max(3, n // 5))
+
+    df.loc[:intro_end, "stage"] = "도입"
+    if intro_end + 1 <= growth_end:
+        df.loc[intro_end + 1:growth_end, "stage"] = "성장"
+    if growth_end + 1 <= decline_start - 1:
+        df.loc[growth_end + 1:decline_start - 1, "stage"] = "성숙"
+    if decline_start < n:
+        df.loc[decline_start:, "stage"] = "쇠퇴"
+
+    return df
+
+
+
 # =========================
 # 메인 화면
 # =========================
+
+STAGE_COLORS = {
+    "도입": "#1f77b4",   # 파랑
+    "성장": "#2ca02c",   # 초록
+    "피크": "##d62728",   # 빨강
+    "피크2": "#d62728",  # 빨강
+    "성숙": "#9467bd",   # 보라
+    "비시즌": "#7f7f7f", # 회색
+    "쇠퇴": "#8c564b",   # 갈색
+}
+
+
 def main():
     st.set_page_config(page_title="아이템 매출 추이", layout="wide")
 
@@ -640,13 +890,24 @@ def main():
 
     weekly_df, monthly_df = prepare_item_timeseries(df, selected_item)
     shape_label, shape_reason = classify_shape(selected_item, monthly_df)
-
+    
+    # 월별 형태 기준으로, 주차별 단계 라벨 부여
+    weekly_df = classify_weekly_stages_by_shape(weekly_df, shape_label)
+    
     st.markdown(f"### 형태: {shape_label}")
     st.caption(shape_reason)
-        
+    
+    stage_order_text = ""
+    if shape_label == "단봉형":
+        stage_order_text = "도입 > 성장 > 피크 > 성숙 > 쇠퇴"
+    elif shape_label == "쌍봉형":
+        stage_order_text = "도입 > 성장 > 피크 > 성숙 > 비시즌 > 성숙 > 피크2 > 성숙 > 쇠퇴"
+    else:
+        stage_order_text = "도입 > 성장 > 성숙 > 쇠퇴"
+    
+    st.markdown(f"**주차 단계 순서:** {stage_order_text}")
+    
     fig = build_dual_line_chart(selected_item, weekly_df, monthly_df)
-
-    st.plotly_chart(fig, use_container_width=True)
 
     
 
