@@ -458,6 +458,20 @@ def build_dual_line_chart(
 ) -> go.Figure:
     fig = go.Figure()
 
+    # 주차별 판매량 연결선
+    fig.add_trace(
+        go.Scatter(
+            x=weekly_df["week_start"],
+            y=weekly_df["sales"],
+            mode="lines",
+            name="주차별 판매량(연결선)",
+            line=dict(color="#b0b0b0", width=2),
+            hoverinfo="skip",
+            showlegend=False,
+            connectgaps=True,
+        )
+    )
+
     # 주차별 단계별 색상 선
     stage_df = weekly_df.copy().reset_index(drop=True)
 
@@ -485,7 +499,7 @@ def build_dual_line_chart(
                         y=segment_y,
                         mode="lines+markers",
                         name=current_stage,
-                        line=dict(color=STAGE_COLORS.get(current_stage, "#333")),
+                        line=dict(color=STAGE_COLORS.get(current_stage, "#333"), width=3),
                         marker=dict(size=7),
                         hovertemplate="주차 시작일: %{x|%Y-%m-%d}<br>판매량: %{y:,.0f}<br>단계: " + current_stage + "<extra></extra>",
                         showlegend=True
@@ -503,36 +517,24 @@ def build_dual_line_chart(
                     y=segment_y,
                     mode="lines+markers",
                     name=current_stage,
-                    line=dict(color=STAGE_COLORS.get(current_stage, "#333")),
+                    line=dict(color=STAGE_COLORS.get(current_stage, "#333"), width=3),
                     marker=dict(size=7),
                     hovertemplate="주차 시작일: %{x|%Y-%m-%d}<br>판매량: %{y:,.0f}<br>단계: " + current_stage + "<extra></extra>",
                     showlegend=True
                 )
             )
-    else:
-        # 혹시 stage 없을 때 fallback
-        fig.add_trace(
-            go.Scatter(
-                x=weekly_df["week_start"],
-                y=weekly_df["sales"],
-                mode="lines",
-                name="주차별 판매량(연결선)",
-                line=dict(color="#b0b0b0", width=2),
-                hoverinfo="skip",
-                showlegend=False,
-                connectgaps=True,
-            )
-        )
 
-    # 월별 매출 선
+    # 월별 매출
     fig.add_trace(
         go.Scatter(
             x=monthly_df["month"],
             y=monthly_df["sales"],
             mode="lines+markers",
             name="월별 매출",
-            line=dict(width=3, color="#cfcfcf"),
-            marker=dict(size=7, color="#cfcfcf"),
+            line=dict(width=3, color="#bfbfbf"),
+            marker=dict(size=7, color="#bfbfbf"),
+            fill="tozeroy",
+            fillcolor="rgba(191, 191, 191, 0.25)",
             connectgaps=True,
             yaxis="y2",
             hovertemplate="월: %{x|%Y-%m}<br>매출: %{y:,.0f}<extra></extra>",
