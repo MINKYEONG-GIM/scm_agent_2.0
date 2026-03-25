@@ -1230,22 +1230,67 @@ def main():
         selected_sku_name=selected_sku_name
     )
 
+    try:
+        forecast_df, forecast_reason = forecast_with_gpt(
+            item_name,
+            shape_label,
+            weekly_df,
+            final_item_df
+        )
+    except Exception as e:
+        forecast_df = pd.DataFrame(columns=["날짜", "forecast"])
+        forecast_reason = ""
+        st.error(f"GPT 예측 호출 실패: {e}")
+
+    # -----------------------------
+    # 주차별 작년 비중 / 올해 판매량 비교표
+    # - 미래 주차(현재 주차 이후)는 GPT 예측값으로 채우고 빨간색 표시
+    # -----------------------------
     st.markdown("### 주차별 작년 비중 / 올해 판매량 비교표")
 
+    this_year = int(pd.Timestamp.today().year)
     current_week_no = int(pd.Timestamp.today().isocalendar().week)
+
+    forecast_week_map = {}
+    if not forecast_df.empty and "날짜" in forecast_df.columns and "forecast" in forecast_df.columns:
+        tmp_fc = forecast_df.dropna(subset=["날짜"]).copy()
+        if not tmp_fc.empty:
+            tmp_fc["year"] = tmp_fc["날짜"].dt.isocalendar().year.astype(int)
+            tmp_fc = tmp_fc[tmp_fc["year"] == this_year].copy()
+            if not tmp_fc.empty:
+                tmp_fc["week_no"] = tmp_fc["날짜"].dt.isocalendar().week.astype(int)
+                tmp_fc["forecast"] = pd.to_numeric(tmp_fc["forecast"], errors="coerce").fillna(0)
+                forecast_week_map = (
+                    tmp_fc.groupby("week_no")["forecast"].sum().round().astype(int).to_dict()
+                )
+
+    compare_table_df = compare_table_df.copy()
+    is_future_week = compare_table_df["week_no"].astype(int) > current_week_no
+    has_forecast = compare_table_df["week_no"].astype(int).map(lambda w: w in forecast_week_map)
+    predict_mask = is_future_week & has_forecast
+
+    if predict_mask.any():
+        compare_table_df.loc[predict_mask, "올해 해당 주차 판매량 (장)"] = (
+            compare_table_df.loc[predict_mask, "week_no"].astype(int).map(forecast_week_map).fillna(0).astype(int)
+        )
 
     display_df = compare_table_df[
         ["주차", "작년의 해당 주차 판매비중(%)", "올해 해당 주차 판매량 (장)"]
     ].copy()
 
-    def _highlight_current_week(_):
+    def _style_compare_table(_):
         styles = pd.DataFrame("", index=display_df.index, columns=display_df.columns)
-        mask = compare_table_df["week_no"].astype(int) == current_week_no
-        styles.loc[mask, "올해 해당 주차 판매량 (장)"] = "background-color: #FFF3BF; font-weight: 700;"
+
+        # 현재 주차: 강조(노랑)
+        mask_current = compare_table_df["week_no"].astype(int) == current_week_no
+        styles.loc[mask_current, "올해 해당 주차 판매량 (장)"] = "background-color: #FFF3BF; font-weight: 700;"
+
+        # 미래 주차 예측값: 빨강
+        styles.loc[predict_mask, "올해 해당 주차 판매량 (장)"] = "color: #C92A2A; font-weight: 800;"
         return styles
 
     st.dataframe(
-        display_df.style.apply(_highlight_current_week, axis=None),
+        display_df.style.apply(_style_compare_table, axis=None),
         use_container_width=True,
         hide_index=True,
         column_config={
@@ -1259,18 +1304,6 @@ def main():
             ),
         }
     )
-
-    try:
-        forecast_df, forecast_reason = forecast_with_gpt(
-            item_name,
-            shape_label,
-            weekly_df,
-            final_item_df
-        )
-    except Exception as e:
-        forecast_df = pd.DataFrame(columns=["날짜", "forecast"])
-        forecast_reason = ""
-        st.error(f"GPT 예측 호출 실패: {e}")
 
     st.markdown(f"### 아이템명: {item_name}")
     st.markdown(f"### 형태: {shape_label}")
