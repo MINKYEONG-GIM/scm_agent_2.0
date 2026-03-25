@@ -644,7 +644,8 @@ def build_dual_line_chart(
         ),
     )
 
-    fig.update_yaxes(tickformat=",.0f")
+    fig.update_yaxes(tickformat=",.0f", rangemode="tozero")
+    fig.update_yaxes(tickformat=",.0f", rangemode="tozero", secondary_y=True)
     return fig
 # =========================
 # 월별 매출 형태 판별 (단봉 / 다봉)
@@ -1485,7 +1486,8 @@ def main():
             yaxis_title="판매량",
             height=650,
             hovermode="x unified",
-            xaxis=dict(range=[year_start, year_end])
+            xaxis=dict(range=[year_start, year_end]),
+            yaxis=dict(rangemode="tozero")
         )
     
         st.plotly_chart(fig2, use_container_width=True)
