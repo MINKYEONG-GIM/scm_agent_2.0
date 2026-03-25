@@ -1136,14 +1136,12 @@ def main():
 
 
     with col2:
-
-        st.markdown("### 올해 매출 + GPT 예측")
-
+        st.markdown("### 올해 매출 + AI 예측")
+    
         fig2 = go.Figure()
-
-        # 올해 실제
+    
         plot_final_df = final_item_df.dropna(subset=["날짜"]).copy()
-
+    
         real_week = (
             plot_final_df
             .sort_values("날짜")
@@ -1151,43 +1149,41 @@ def main():
             .sum()
             .reset_index()
         )
-        
-        real_week = real_week[real_week["판매량"] > 0].copy()
-        
-        st.write("주차 집계 건수:", len(real_week))
-        st.dataframe(real_week, use_container_width=True, hide_index=True)
-
-        fig2.add_trace(
-            go.Scatter(
-                x=real_week["날짜"],
-                y=real_week["판매량"],
-                name="올해 매출",
-                mode="lines+markers"
-            )
-        )
-
-        # GPT 예측
-
-        fig2.add_trace(
-            go.Scatter(
-                x=list(range(len(forecast_df))),
-                y=forecast_df["forecast"],
-                name="예측",
-                mode="lines",
-                line=dict(dash="dash")
-            )
-        )
-
-        st.plotly_chart(fig2, use_container_width=True)
-
-    st.dataframe(
-        weekly_df[["year_week", "sales", "stage"]],
-        use_container_width=True,
-        hide_index=True
-    )
-
     
-
+        real_week = real_week[real_week["판매량"] > 0].copy()
+    
+        if real_week.empty:
+            st.warning("올해 매출 데이터가 없습니다. final 시트의 날짜 형식 또는 sku 매칭을 확인하세요.")
+        else:
+            fig2.add_trace(
+                go.Scatter(
+                    x=real_week["날짜"],
+                    y=real_week["판매량"],
+                    name="올해 매출",
+                    mode="lines+markers"
+                )
+            )
+    
+        if not forecast_df.empty:
+            fig2.add_trace(
+                go.Scatter(
+                    x=forecast_df["날짜"],
+                    y=forecast_df["forecast"],
+                    name="GPT 예측",
+                    mode="lines+markers",
+                    line=dict(dash="dash")
+                )
+            )
+    
+        fig2.update_layout(
+            title=f"{item_name} 올해 매출 및 연말 예측",
+            xaxis_title="날짜",
+            yaxis_title="판매량",
+            height=650,
+            hovermode="x unified"
+        )
+    
+        st.plotly_chart(fig2, use_container_width=True)
 
 if __name__ == "__main__":
     main()
