@@ -1349,6 +1349,8 @@ def main():
                 )
 
     compare_table_df = compare_table_df.copy()
+    compare_table_df = compare_table_df.sort_values("week_no").reset_index(drop=True)
+
     is_future_week = compare_table_df["week_no"].astype(int) > current_week_no
     has_forecast = compare_table_df["week_no"].astype(int).map(lambda w: w in forecast_week_map)
     predict_mask = is_future_week & has_forecast
@@ -1362,7 +1364,6 @@ def main():
     # 미래 주차 기초재고 예측
     # 기초재고(t) = 기초재고(t-1) - 판매량(t-1) + 분배량(t-1) - 출고량(t-1)
     # -----------------------------
-    compare_table_df = compare_table_df.sort_values("week_no").reset_index(drop=True)
 
     for col in ["기초재고", "올해 해당 주차 판매량 (장)", "분배량", "출고량(회전 등)"]:
         if col not in compare_table_df.columns:
@@ -1400,14 +1401,31 @@ def main():
             if w_cur > current_week_no:
                 base_pred_mask.iloc[i] = True
 
-    # -----------------------------
-    # 로스 계산(조건부 표시)
-    # - 기초재고 < 판매량일 때만 표시
-    # - 로스 = 기초재고 - 판매량
-    # -----------------------------
+    # 기초재고는 음수일 수 없음(표시는 0). 롤링·로스 판단은 클립 전 값(base_raw) 사용.
     sales_col = "올해 해당 주차 판매량 (장)"
-    loss = compare_table_df["기초재고"].astype(int) - compare_table_df[sales_col].astype(int)
-    compare_table_df["로스"] = np.where(compare_table_df["기초재고"].astype(int) < compare_table_df[sales_col].astype(int), loss, 0).astype(int)
+    base_raw = compare_table_df["기초재고"].astype(int).copy()
+    compare_table_df["기초재고"] = np.maximum(base_raw, 0).astype(int)
+
+    # -----------------------------
+    # 로스 계산
+    # - 기초재고(raw) > 0: 기존과 같이 재고 < 판매일 때만 로스 = 재고 - 판매
+    # - 기초재고(raw) <= 0: 이번주 로스 = 지난주 로스 - 이번주 판매량
+    # -----------------------------
+    n_rows = len(compare_table_df)
+    loss_vals = []
+    prev_loss = 0
+    for i in range(n_rows):
+        raw_b = int(base_raw.iloc[i])
+        sales = int(compare_table_df.loc[i, sales_col])
+        if raw_b <= 0:
+            cur_loss = prev_loss - sales
+        elif raw_b < sales:
+            cur_loss = raw_b - sales
+        else:
+            cur_loss = 0
+        prev_loss = cur_loss
+        loss_vals.append(cur_loss)
+    compare_table_df["로스"] = loss_vals
 
     display_df = compare_table_df[
         [
@@ -1433,6 +1451,7 @@ def main():
         styles.loc[predict_mask, "올해 해당 주차 판매량 (장)"] = "color: #C92A2A; font-weight: 800;"
         styles.loc[base_pred_mask.values, "기초재고"] = "color: #C92A2A; font-weight: 800;"
         styles.loc[is_future_week, "로스"] = "color: #C92A2A; font-weight: 800;"
+        styles.loc[is_future_week, "예측 단계"] = "color: #C92A2A; font-weight: 800;"
         return styles
 
     st.dataframe(
