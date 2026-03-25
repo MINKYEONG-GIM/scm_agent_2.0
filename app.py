@@ -1359,10 +1359,6 @@ def main():
             "reorder 시트에서 해당 SKU의 리오더 소요일(lead_time)을 찾지 못했습니다."
         )
 
-    st.write("selected_sku:", selected_sku)
-    st.write("final_item_df 건수:", len(final_item_df))
-    st.write("날짜 null 개수:", final_item_df["날짜"].isna().sum())
-
     item_name, weekly_df, monthly_df = prepare_plc_item_timeseries(plc_df, selected_item_code)
     shape_label, shape_reason = classify_shape(item_name, monthly_df)
     weekly_df = classify_weekly_stages_by_shape(weekly_df, shape_label)
