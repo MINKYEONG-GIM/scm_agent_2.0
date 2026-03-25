@@ -645,7 +645,10 @@ def build_dual_line_chart(
     )
 
     fig.update_yaxes(tickformat=",.0f", rangemode="tozero")
-    fig.update_yaxes(tickformat=",.0f", rangemode="tozero", secondary_y=True)
+    fig.update_layout(
+        yaxis=dict(rangemode="tozero"),
+        yaxis2=dict(rangemode="tozero"),
+    )
     return fig
 # =========================
 # 월별 매출 형태 판별 (단봉 / 다봉)
