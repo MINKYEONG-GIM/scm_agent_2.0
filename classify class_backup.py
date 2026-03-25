@@ -104,13 +104,32 @@ def parse_yearweek_to_date(yearweek: str) -> pd.Timestamp:
     except Exception:
         return pd.NaT
 
-def call_openai_chat_json(messages: List[dict]) -> dict:
+def call_openai_chat_json(messages: List[dict], json_schema: Optional[dict] = None) -> dict:
     """
     Chat Completions API를 호출해서 JSON 응답을 받습니다.
     """
     api_key = get_gpt_gpi()
     if not api_key:
         raise ValueError("OpenAI API Key가 없습니다. st.secrets 또는 환경변수에 gpt_gpi / OPENAI_API_KEY를 설정하세요.")
+
+    if json_schema is None:
+        json_schema = {
+            "name": "shape_result",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "shape_label": {
+                        "type": "string",
+                        "enum": ["단봉형", "쌍봉형", "올시즌형"]
+                    },
+                    "reason": {
+                        "type": "string"
+                    }
+                },
+                "required": ["shape_label", "reason"],
+                "additionalProperties": False
+            }
+        }
 
     payload = {
         "model": "gpt-4.1-mini",
@@ -119,21 +138,7 @@ def call_openai_chat_json(messages: List[dict]) -> dict:
         "response_format": {
             "type": "json_schema",
             "json_schema": {
-                "name": "shape_result",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "shape_label": {
-                            "type": "string",
-                            "enum": ["단봉형", "쌍봉형", "올시즌형"]
-                        },
-                        "reason": {
-                            "type": "string"
-                        }
-                    },
-                    "required": ["shape_label", "reason"],
-                    "additionalProperties": False
-                }
+                **json_schema
             }
         }
     }
@@ -161,6 +166,97 @@ def call_openai_chat_json(messages: List[dict]) -> dict:
 
     content = result["choices"][0]["message"]["content"]
     return json.loads(content)
+
+
+def forecast_with_gpt(
+    item_name: str,
+    shape_label: str,
+    weekly_df: pd.DataFrame,
+    final_item_df: pd.DataFrame
+) -> pd.DataFrame:
+
+    plot_final_df = final_item_df.dropna(subset=["날짜"]).copy()
+
+    last_year = weekly_df["sales"].tolist()
+
+    this_year_weekly = (
+        plot_final_df
+        .sort_values("날짜")
+        .groupby(pd.Grouper(key="날짜", freq="W"))["판매량"]
+        .sum()
+        .reset_index()
+    )
+
+    this_year = this_year_weekly["판매량"].tolist()
+
+    stage_info = None
+    if "stage" in weekly_df.columns:
+        stage_info = weekly_df["stage"].astype(str).tolist()
+
+    prompt = f"""
+작년 매출과 올해 매출을 참고해서
+올해 남은 주차의 매출을 예측하라.
+
+조건
+- 작년 매출을 반드시 참고
+- shape = {shape_label}
+- 단계 흐름도 참고
+- 도입 / 성장 / 피크 / 성숙 / 쇠퇴 구조 유지
+- 피크 위치는 작년과 비슷해야 함
+- 올해 이미 존재하는 실제 매출 구간은 제외하고, 남은 주차만 예측
+- JSON 배열로 반환
+
+아이템명:
+{item_name}
+
+작년 주차 매출:
+{last_year}
+
+작년 단계(stage) 정보:
+{stage_info}
+
+올해 현재 주차 매출:
+{this_year}
+
+결과 형식:
+{{
+  "forecast":[1,2,3]
+}}
+""".strip()
+
+    messages = [
+        {"role": "user", "content": prompt}
+    ]
+
+    forecast_schema = {
+        "name": "forecast_result",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "forecast": {
+                    "type": "array",
+                    "items": {"type": "number"}
+                }
+            },
+            "required": ["forecast"],
+            "additionalProperties": False
+        }
+    }
+
+    result = call_openai_chat_json(messages, json_schema=forecast_schema)
+    forecast = result["forecast"]
+
+    if this_year_weekly.empty:
+        start_date = pd.Timestamp.today().normalize()
+    else:
+        start_date = this_year_weekly["날짜"].max() + pd.Timedelta(days=7)
+
+    forecast_dates = pd.date_range(start=start_date, periods=len(forecast), freq="W")
+
+    return pd.DataFrame({
+        "날짜": forecast_dates,
+        "forecast": forecast
+    })
 
 def classify_shape(item_name: str, monthly_df: pd.DataFrame) -> Tuple[str, str]:
     if monthly_df.empty:
@@ -896,6 +992,7 @@ def extract_item_code_from_sku(sku: str) -> str:
         return s[2:4]
     return ""
 
+
 def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
     df = final_df.copy()
 
@@ -904,16 +1001,112 @@ def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"final 시트 필수 컬럼이 없습니다: {missing}")
 
+    # sku 문자열 정리
+    df["sku"] = df["sku"].astype(str).str.strip()
+    df["sku_name"] = df["sku_name"].astype(str).str.strip()
+
     df["item_code"] = df["sku"].apply(extract_item_code_from_sku)
     df["판매량"] = df["판매량"].apply(clean_number).fillna(0)
-    df["날짜"] = pd.to_datetime(
-        df["날짜"].astype(str)
-            .str.replace(".", "-", regex=False)
-            .str.replace(" ", "", regex=False),
-        errors="coerce"
-)
+
+    # 날짜 문자열 정리
+    raw_date = (
+        df["날짜"]
+        .astype(str)
+        .str.strip()
+        .str.replace(".", "-", regex=False)
+        .str.replace("/", "-", regex=False)
+        .str.replace(" ", "", regex=False)
+    )
+
+    # 예: 02월25일 -> 2026-02-25 로 변환
+    current_year = pd.Timestamp.today().year
+    raw_date = raw_date.str.replace(
+        r"^(\d{1,2})월(\d{1,2})일$",
+        rf"{current_year}-\1-\2",
+        regex=True
+    )
+
+    df["날짜"] = pd.to_datetime(raw_date, errors="coerce")
+
     return df
 
+
+def build_year_compare_table(
+    weekly_df: pd.DataFrame,
+    final_item_df: pd.DataFrame,
+    selected_sku: str,
+    selected_sku_name: str
+) -> pd.DataFrame:
+    """
+    표 컬럼:
+    SKU / SKU_NAME / 주차 / 작년의 해당 주차 판매비중(%) / 올해 해당 주차 판매량 (장)
+    """
+
+    # -----------------------------
+    # 1) 작년 주차별 판매비중 계산
+    # -----------------------------
+    last_year_df = weekly_df.copy()
+
+    last_year_df["week_no"] = last_year_df["week_start"].dt.isocalendar().week.astype(int)
+    last_year_df["sales"] = pd.to_numeric(last_year_df["sales"], errors="coerce").fillna(0)
+
+    total_last_year_sales = last_year_df["sales"].sum()
+
+    if total_last_year_sales > 0:
+        last_year_df["last_year_ratio_pct"] = (
+            last_year_df["sales"] / total_last_year_sales * 100
+        )
+    else:
+        last_year_df["last_year_ratio_pct"] = 0.0
+
+    # 주차 라벨: 예) 8주차
+    last_year_df["주차"] = last_year_df["week_no"].astype(str) + "주차"
+
+    # -----------------------------
+    # 2) 올해 주차별 판매량 계산
+    # -----------------------------
+    this_year_df = final_item_df.copy()
+    this_year_df = this_year_df.dropna(subset=["날짜"]).copy()
+
+    if not this_year_df.empty:
+        this_year_df["week_no"] = this_year_df["날짜"].dt.isocalendar().week.astype(int)
+        this_year_df["판매량"] = pd.to_numeric(this_year_df["판매량"], errors="coerce").fillna(0)
+
+        this_year_weekly = (
+            this_year_df.groupby("week_no", as_index=False)["판매량"]
+            .sum()
+            .rename(columns={"판매량": "올해 해당 주차 판매량 (장)"})
+        )
+    else:
+        this_year_weekly = pd.DataFrame(columns=["week_no", "올해 해당 주차 판매량 (장)"])
+
+    # -----------------------------
+    # 3) 작년 주차 기준으로 merge
+    # -----------------------------
+    result = last_year_df[["week_no", "주차", "last_year_ratio_pct"]].merge(
+        this_year_weekly,
+        on="week_no",
+        how="left"
+    )
+
+    result = result.sort_values("week_no").reset_index(drop=True)
+
+    result["올해 해당 주차 판매량 (장)"] = (
+        result["올해 해당 주차 판매량 (장)"]
+        .fillna(0)
+        .astype(int)
+    )
+
+    result["SKU"] = selected_sku
+    result["SKU_NAME"] = selected_sku_name
+
+    result["작년의 해당 주차 판매비중(%)"] = result["last_year_ratio_pct"].round(2)
+
+    result = result[
+        ["SKU", "SKU_NAME", "주차", "작년의 해당 주차 판매비중(%)", "올해 해당 주차 판매량 (장)"]
+    ].copy()
+
+    return result
 
 
 # =========================
@@ -965,9 +1158,42 @@ def main():
     selected_row = options_df[options_df["label"] == selected_label].iloc[0]
     selected_item_code = selected_row["item_code"]
 
+    selected_sku = str(selected_row["sku"]).strip()
+    selected_sku_name = str(selected_row["sku_name"]).strip()
+
+    final_item_df = final_prepared[
+        final_prepared["sku"].astype(str).str.strip() == selected_sku
+    ].copy()
+    
+    st.write("selected_sku:", selected_sku)
+    st.write("final_item_df 건수:", len(final_item_df))
+    st.write("날짜 null 개수:", final_item_df["날짜"].isna().sum())
+
     item_name, weekly_df, monthly_df = prepare_plc_item_timeseries(plc_df, selected_item_code)
     shape_label, shape_reason = classify_shape(item_name, monthly_df)
     weekly_df = classify_weekly_stages_by_shape(weekly_df, shape_label)
+
+    compare_table_df = build_year_compare_table(
+        weekly_df=weekly_df,
+        final_item_df=final_item_df,
+        selected_sku=selected_sku,
+        selected_sku_name=selected_sku_name
+    )
+
+    st.markdown("### 주차별 작년 비중 / 올해 판매량 비교표")
+
+    st.dataframe(
+        compare_table_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    forecast_df = forecast_with_gpt(
+        item_name,
+        shape_label,
+        weekly_df,
+        final_item_df
+    )
 
     st.markdown(f"### 아이템명: {item_name}")
     st.markdown(f"### 형태: {shape_label}")
@@ -980,17 +1206,70 @@ def main():
     else:
         st.markdown("**주차 단계 순서:** 도입 > 성장 > 성숙 > 쇠퇴")
 
-    fig = build_dual_line_chart(item_name, weekly_df, monthly_df)
-    st.plotly_chart(fig, use_container_width=True)
+    col1, col2 = st.columns([1, 1])
 
-    st.dataframe(
-        weekly_df[["year_week", "sales", "stage"]],
-        use_container_width=True,
-        hide_index=True
-    )
+    with col1:
 
+        st.markdown("### 작년 매출")
+
+        fig1 = build_dual_line_chart(
+            item_name,
+            weekly_df,
+            monthly_df
+        )
+
+        st.plotly_chart(fig1, use_container_width=True)
+
+
+    with col2:
+        st.markdown("### 올해 매출 + AI 예측")
     
-
+        fig2 = go.Figure()
+    
+        plot_final_df = final_item_df.dropna(subset=["날짜"]).copy()
+    
+        real_week = (
+            plot_final_df
+            .sort_values("날짜")
+            .groupby(pd.Grouper(key="날짜", freq="W"))["판매량"]
+            .sum()
+            .reset_index()
+        )
+    
+        real_week = real_week[real_week["판매량"] > 0].copy()
+    
+        if real_week.empty:
+            st.warning("올해 매출 데이터가 없습니다. final 시트의 날짜 형식 또는 sku 매칭을 확인하세요.")
+        else:
+            fig2.add_trace(
+                go.Scatter(
+                    x=real_week["날짜"],
+                    y=real_week["판매량"],
+                    name="올해 매출",
+                    mode="lines+markers"
+                )
+            )
+    
+        if not forecast_df.empty:
+            fig2.add_trace(
+                go.Scatter(
+                    x=forecast_df["날짜"],
+                    y=forecast_df["forecast"],
+                    name="GPT 예측",
+                    mode="lines+markers",
+                    line=dict(dash="dash")
+                )
+            )
+    
+        fig2.update_layout(
+            title=f"{item_name} 올해 매출 및 연말 예측",
+            xaxis_title="날짜",
+            yaxis_title="판매량",
+            height=650,
+            hovermode="x unified"
+        )
+    
+        st.plotly_chart(fig2, use_container_width=True)
 
 if __name__ == "__main__":
     main()
