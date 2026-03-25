@@ -1235,7 +1235,7 @@ def main():
     current_week_no = int(pd.Timestamp.today().isocalendar().week)
 
     display_df = compare_table_df[
-        ["SKU", "주차", "작년의 해당 주차 판매비중(%)", "올해 해당 주차 판매량 (장)"]
+        ["주차", "작년의 해당 주차 판매비중(%)", "올해 해당 주차 판매량 (장)"]
     ].copy()
 
     def _highlight_current_week(_):
@@ -1260,12 +1260,17 @@ def main():
         }
     )
 
-    forecast_df, forecast_reason = forecast_with_gpt(
-        item_name,
-        shape_label,
-        weekly_df,
-        final_item_df
-    )
+    try:
+        forecast_df, forecast_reason = forecast_with_gpt(
+            item_name,
+            shape_label,
+            weekly_df,
+            final_item_df
+        )
+    except Exception as e:
+        forecast_df = pd.DataFrame(columns=["날짜", "forecast"])
+        forecast_reason = ""
+        st.error(f"GPT 예측 호출 실패: {e}")
 
     st.markdown(f"### 아이템명: {item_name}")
     st.markdown(f"### 형태: {shape_label}")
