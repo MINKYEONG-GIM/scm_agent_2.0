@@ -56,24 +56,23 @@ def get_gspread_client():
 
 @st.cache_data(ttl=300)
 def load_final_sheet():
-
     client = get_gspread_client()
 
     sheet_id = st.secrets["sheets"]["sheet_id"]
-    final_sheet_name = st.secrets["sheets"]["final"]
+    final_sheet = st.secrets["sheets"]["final"]
 
     spreadsheet = client.open_by_key(sheet_id)
 
-    final_ws = spreadsheet.worksheet(final_sheet_name)
+    final_ws = spreadsheet.worksheet(final_sheet)
 
-    values = final_ws.get_all_values()
+    final_values = final_ws.get_all_values()
 
-    if not values or len(values) < 2:
+    if not final_values or len(final_values) < 2:
         return pd.DataFrame()
 
     final_df = pd.DataFrame(
-        values[1:],
-        columns=values[0]
+        final_values[1:],
+        columns=final_values[0]
     )
 
     return final_df
@@ -169,11 +168,12 @@ def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
 # -------------------------------------------------
 # 4. 데이터 로드
 # -------------------------------------------------
-raw_df = load_final_data()
-df = preprocess_data(raw_df)
+# final 원본 -> 전처리 규칙 통일
+final_raw_df = load_final_sheet()
+final_df = preprocess_data(final_raw_df)
 
-if df.empty:
-    st.warning("불러온 데이터가 없습니다.")
+if final_df.empty:
+    st.warning("final 시트 데이터 없음")
     st.stop()
 
 
@@ -188,8 +188,8 @@ view_level = st.sidebar.radio(
     horizontal=False
 )
 
-date_min = df["날짜"].min().date()
-date_max = df["날짜"].max().date()
+date_min = final_df["날짜"].min().date()
+date_max = final_df["날짜"].max().date()
 
 date_range = st.sidebar.date_input(
     "기간 선택",
@@ -203,9 +203,9 @@ if isinstance(date_range, tuple) and len(date_range) == 2:
 else:
     start_date, end_date = date_min, date_max
 
-filtered_df = df[
-    (df["날짜"].dt.date >= start_date) &
-    (df["날짜"].dt.date <= end_date)
+filtered_df = final_df[
+    (final_df["날짜"].dt.date >= start_date) &
+    (final_df["날짜"].dt.date <= end_date)
 ].copy()
 
 if view_level == "대표 아이템":
