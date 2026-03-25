@@ -87,12 +87,17 @@ def load_data_from_gsheet():
     client = get_gsheet_client()
 
     sheet_url = st.secrets["sheets"]["SHEET_URL"]
-    worksheet_name = st.secrets["sheets"]["WORKSHEET_NAME"]
+    plc_db_sheet = st.secrets["sheets"]["PLC DB"]
+    season_db_sheet = st.secrets["sheets"]["SEASON DB"]
+    final_sheet = st.secrets["sheets"]["final"]
 
     spreadsheet = client.open_by_url(sheet_url)
-    worksheet = spreadsheet.worksheet(worksheet_name)
+    plc_worksheet = spreadsheet.worksheet(plc_db_sheet)
+    season_worksheet = spreadsheet.worksheet(season_db_sheet)
+    final_worksheet = spreadsheet.worksheet(final_sheet)
 
-    values = worksheet.get_all_values()
+    # PLC DB: 가로형 판매(0행 제목, 1행 헤더, 2행~ 데이터)
+    values = plc_worksheet.get_all_values()
 
     if not values or len(values) < 3:
         raise ValueError("구글시트 데이터 구조를 확인해주세요. 최소 3행 이상 필요합니다.")
