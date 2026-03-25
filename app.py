@@ -103,111 +103,6 @@ def parse_yearweek_to_date(yearweek: str) -> pd.Timestamp:
     except Exception:
         return pd.NaT
 
-def is_yearweek_col(col: object) -> bool:
-    return bool(re.match(r"^\d{4}-\d{1,2}$", str(col).strip()))
-
-def preprocess_plc_db(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    PLC DB 시트 구조를 자동 감지해 long 포맷으로 표준화합니다.
-
-    지원 구조
-    - (A) 세로형: '연도/주' + 아이템 컬럼들
-    - (B) 가로형: ['아이템명','아이템코드', '2025-01','2025-02', ...]
-
-    반환 long 컬럼
-    - year_week, item_name, item_code, sales, week_start, month, week
-    """
-    if df_raw.empty:
-        return pd.DataFrame(columns=["year_week", "item_name", "item_code", "sales", "week_start", "month", "week"])
-
-    df = df_raw.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-
-    # (A) 세로형: '연도/주' 존재
-    if "연도/주" in df.columns:
-        year_week_col = "연도/주"
-        item_cols = [c for c in df.columns if c not in {year_week_col, "", " "}]
-        if not item_cols:
-            raise ValueError("PLC DB: '연도/주' 외 아이템 컬럼이 없습니다.")
-
-        long_df = df.melt(id_vars=[year_week_col], var_name="item_name", value_name="sales").rename(
-            columns={year_week_col: "year_week"}
-        )
-        long_df["item_name"] = long_df["item_name"].astype(str).str.strip()
-        long_df["item_code"] = long_df["item_name"].apply(normalize_item_code)
-
-    else:
-        # (B) 가로형: 주차 컬럼들이 존재하고 아이템코드/아이템명이 존재
-        week_cols = [c for c in df.columns if is_yearweek_col(c)]
-        if not week_cols:
-            raise ValueError("PLC DB: '연도/주' 컬럼도 없고 주차(예: 2025-01) 컬럼도 찾지 못했습니다.")
-
-        # 헤더 후보(일반적으로 '아이템명','아이템코드')
-        name_col = "아이템명" if "아이템명" in df.columns else df.columns[0]
-        code_col = "아이템코드" if "아이템코드" in df.columns else ("item_code" if "item_code" in df.columns else None)
-        if code_col is None:
-            raise ValueError("PLC DB: 아이템코드 컬럼을 찾지 못했습니다. (예: '아이템코드')")
-
-        long_df = df.melt(id_vars=[name_col, code_col], value_vars=week_cols, var_name="year_week", value_name="sales")
-        long_df = long_df.rename(columns={name_col: "item_name", code_col: "item_code"})
-        long_df["item_name"] = long_df["item_name"].astype(str).str.strip()
-        long_df["item_code"] = long_df["item_code"].apply(normalize_item_code)
-
-    # 공통 정리
-    long_df["year_week"] = long_df["year_week"].astype(str).str.strip()
-    long_df = long_df[long_df["year_week"].str.match(r"^\d{4}-\d{1,2}$", na=False)].copy()
-
-    long_df["sales"] = long_df["sales"].apply(clean_number).fillna(0)
-    long_df["week_start"] = long_df["year_week"].apply(parse_yearweek_to_date)
-    long_df = long_df.dropna(subset=["week_start"]).copy()
-
-    extracted = long_df["year_week"].str.extract(r"(?P<year>\d{4})-(?P<week>\d{1,2})")
-    long_df["week"] = pd.to_numeric(extracted["week"], errors="coerce").fillna(0).astype(int)
-    long_df["month"] = long_df["week_start"].dt.to_period("M").dt.to_timestamp()
-
-    # item_code 없으면 item_name에서라도 뽑기
-    long_df["item_code"] = long_df["item_code"].fillna(long_df["item_name"].apply(normalize_item_code))
-
-    return long_df.sort_values(["item_code", "week_start"]).reset_index(drop=True)
-
-def build_timeseries_from_plc_long(
-    plc_long: pd.DataFrame,
-    item_code: Optional[str] = None,
-    item_name: Optional[str] = None,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    plc_long에서 특정 아이템(코드 우선, 없으면 이름)만 필터링하여
-    주차/월 집계를 반환합니다.
-    """
-    if plc_long.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    df = plc_long.copy()
-    if item_code:
-        code = normalize_item_code(item_code)
-        df = df[df["item_code"] == code].copy()
-    elif item_name:
-        df = df[df["item_name"] == str(item_name).strip()].copy()
-
-    if df.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    weekly_df = (
-        df.groupby(["year_week", "week_start", "month", "week", "item_code", "item_name"], as_index=False)["sales"]
-        .sum()
-        .sort_values("week_start")
-        .reset_index(drop=True)
-    )
-
-    monthly_df = (
-        weekly_df.groupby("month", as_index=False)["sales"]
-        .sum()
-        .sort_values("month")
-        .reset_index(drop=True)
-    )
-
-    return weekly_df, monthly_df
-
 def extract_item_code_from_code(code: object) -> Optional[str]:
     """
     스타일코드/SKU 코드에서 3~4번째 2자리(영문)를 아이템코드로 추출합니다.
@@ -915,54 +810,34 @@ def main():
     st.set_page_config(page_title="PLC 매출 분석", layout="wide")
     st.title("PLC 매출 분석")
 
-    plc_raw = load_sheet_data()
-    if plc_raw.empty:
+    plc_df = load_sheet_data()
+    if plc_df.empty:
         st.warning("PLC DB(시트) 데이터를 불러오지 못했습니다.")
-        return
-
-    try:
-        plc_long = preprocess_plc_db(plc_raw)
-    except Exception as e:
-        st.error(f"PLC DB 전처리 실패: {e}")
-        return
-
-    if plc_long.empty:
-        st.warning("PLC DB 전처리 결과가 비었습니다. 데이터 구조를 확인해주세요.")
         return
 
     tab1, tab2 = st.tabs(["아이템 직접 선택", "스타일/SKU → 아이템코드 매칭(PLC 분석)"])
 
     with tab1:
-        items = (
-            plc_long[["item_name", "item_code"]]
-            .dropna()
-            .drop_duplicates()
-            .sort_values(["item_name", "item_code"])
-            .reset_index(drop=True)
-        )
-        if items.empty:
-            st.warning("PLC DB에서 아이템 목록을 만들지 못했습니다.")
+        item_cols = get_item_columns(plc_df)
+        if not item_cols:
+            st.warning("선택 가능한 아이템 컬럼이 없습니다.")
             return
-
-        items["_label"] = items.apply(lambda r: f"{r['item_name']} ({r['item_code']})", axis=1)
-        labels = items["_label"].tolist()
 
         st.markdown("개별 차트 확인할 아이템")
-        default_idx = labels.index("가디건 (CK)") if "가디건 (CK)" in labels else 0
-        selected_label = st.selectbox("개별 차트 확인할 아이템", options=labels, index=default_idx, label_visibility="collapsed")
-        selected_row = items[items["_label"] == selected_label].iloc[0]
+        selected_item = st.selectbox(
+            "개별 차트 확인할 아이템",
+            options=item_cols,
+            index=item_cols.index("가디건") if "가디건" in item_cols else 0,
+            label_visibility="collapsed",
+        )
 
-        sel_code = str(selected_row["item_code"]).strip()
-        weekly_df, monthly_df = build_timeseries_from_plc_long(plc_long, item_code=sel_code)
-        if weekly_df.empty or monthly_df.empty:
-            st.warning("선택 아이템의 시계열을 만들지 못했습니다.")
-            return
+        weekly_df, monthly_df = prepare_item_timeseries(plc_df, selected_item)
+        shape_label, shape_reason = classify_shape(selected_item, monthly_df)
 
-        shape_label, shape_reason = classify_shape(selected_label, monthly_df)
         st.markdown(f"### 형태: {shape_label}")
         st.caption(shape_reason)
 
-        fig = build_dual_line_chart(selected_label, weekly_df, monthly_df)
+        fig = build_dual_line_chart(selected_item, weekly_df, monthly_df)
         st.plotly_chart(fig, use_container_width=True)
 
     with tab2:
@@ -977,12 +852,12 @@ def main():
         style_col = st.selectbox(
             "스타일코드 컬럼",
             options=cols,
-            index=cols.index("스타일코드") if "스타일코드" in cols else (cols.index("style") if "style" in cols else 0),
+            index=cols.index("스타일코드") if "스타일코드" in cols else 0,
         )
         sku_col = st.selectbox(
             "SKU코드 컬럼",
             options=cols,
-            index=cols.index("sku") if "sku" in cols else (cols.index("SKU") if "SKU" in cols else (cols.index("SKU코드") if "SKU코드" in cols else 0)),
+            index=cols.index("SKU") if "SKU" in cols else (cols.index("SKU코드") if "SKU코드" in cols else 0),
         )
 
         tmp = final_df.copy()
@@ -1005,17 +880,14 @@ def main():
         selected_row = tmp[tmp["_label"] == selected_label].iloc[0]
         item_code = str(selected_row["match_item_code"]).strip().upper()
 
-        plc_weekly_df, plc_monthly_df = build_timeseries_from_plc_long(plc_long, item_code=item_code)
-        if plc_weekly_df.empty or plc_monthly_df.empty:
-            st.error(f"PLC DB에서 아이템코드 '{item_code}' 매칭 결과가 없습니다.")
+        try:
+            matched_col, plc_weekly_df, plc_monthly_df = prepare_item_timeseries_by_code(plc_df, item_code)
+        except Exception as e:
+            st.error(str(e))
             return
 
-        # 매칭된 아이템명(가능하면 같이 표시)
-        matched_names = plc_weekly_df["item_name"].dropna().unique().tolist() if "item_name" in plc_weekly_df.columns else []
-        matched_name = matched_names[0] if matched_names else ""
-
         st.markdown("### 매칭 결과")
-        st.write({"match_item_code": item_code, "matched_item_name": matched_name})
+        st.write({"match_item_code": item_code, "plc_column": matched_col})
 
         core_season_code, ratios_percent = analyze_core_season(plc_weekly_df)
         shape2, peak_months, shape_reason2 = analyze_monthly_shape_and_peaks(plc_monthly_df)
@@ -1031,7 +903,7 @@ def main():
         )
         st.caption(shape_reason2)
 
-        fig2 = build_dual_line_chart(f"PLC({item_code}) {matched_name}".strip(), plc_weekly_df, plc_monthly_df)
+        fig2 = build_dual_line_chart(f"PLC({item_code}) → {matched_col}", plc_weekly_df, plc_monthly_df)
         st.plotly_chart(fig2, use_container_width=True)
 
     
