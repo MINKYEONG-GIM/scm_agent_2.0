@@ -522,29 +522,32 @@ def is_double_peak(values: np.ndarray) -> Tuple[bool, List[int]]:
         values,
         min_peak_ratio=0.25,
         min_prominence_ratio=0.05,
-        min_distance=2,
-        strong_peak_ratio=0.60,
-        peak_gap_min=6
+        min_distance=2
     )
 
     if len(peaks) < 2:
         return False, peaks
 
     mx = np.max(values)
-    valid_peaks = [p for p in peaks if values[p] >= mx * 0.60]
-
-    if len(valid_peaks) < 2:
+    if mx <= 0:
         return False, peaks
 
-    valid_peaks = sorted(valid_peaks)
+    strong = [p for p in peaks if values[p] >= mx * 0.6]
 
-    for i in range(len(valid_peaks) - 1):
-        p1 = valid_peaks[i]
-        p2 = valid_peaks[i + 1]
+    if len(strong) < 2:
+        return False, peaks
 
+    strong = sorted(strong)
+
+    for i in range(len(strong) - 1):
+        p1 = strong[i]
+        p2 = strong[i + 1]
+
+        # 두 피크 간 거리 6 이상
         if p2 - p1 < 6:
             continue
 
+        # 피크 사이 저점 존재 여부 확인
         valley = np.min(values[p1:p2 + 1])
         lower_peak = min(values[p1], values[p2])
 
