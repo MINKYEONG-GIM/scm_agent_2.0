@@ -104,13 +104,32 @@ def parse_yearweek_to_date(yearweek: str) -> pd.Timestamp:
     except Exception:
         return pd.NaT
 
-def call_openai_chat_json(messages: List[dict]) -> dict:
+def call_openai_chat_json(messages: List[dict], json_schema: Optional[dict] = None) -> dict:
     """
     Chat Completions API를 호출해서 JSON 응답을 받습니다.
     """
     api_key = get_gpt_gpi()
     if not api_key:
         raise ValueError("OpenAI API Key가 없습니다. st.secrets 또는 환경변수에 gpt_gpi / OPENAI_API_KEY를 설정하세요.")
+
+    if json_schema is None:
+        json_schema = {
+            "name": "shape_result",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "shape_label": {
+                        "type": "string",
+                        "enum": ["단봉형", "쌍봉형", "올시즌형"]
+                    },
+                    "reason": {
+                        "type": "string"
+                    }
+                },
+                "required": ["shape_label", "reason"],
+                "additionalProperties": False
+            }
+        }
 
     payload = {
         "model": "gpt-4.1-mini",
@@ -119,21 +138,7 @@ def call_openai_chat_json(messages: List[dict]) -> dict:
         "response_format": {
             "type": "json_schema",
             "json_schema": {
-                "name": "shape_result",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "shape_label": {
-                            "type": "string",
-                            "enum": ["단봉형", "쌍봉형", "올시즌형"]
-                        },
-                        "reason": {
-                            "type": "string"
-                        }
-                    },
-                    "required": ["shape_label", "reason"],
-                    "additionalProperties": False
-                }
+                **json_schema
             }
         }
     }
@@ -161,6 +166,89 @@ def call_openai_chat_json(messages: List[dict]) -> dict:
 
     content = result["choices"][0]["message"]["content"]
     return json.loads(content)
+
+
+def forecast_with_gpt(
+    item_name: str,
+    shape_label: str,
+    weekly_df: pd.DataFrame,
+    final_item_df: pd.DataFrame
+) -> pd.DataFrame:
+
+    last_year = weekly_df["sales"].tolist()
+
+    this_year = (
+        final_item_df
+        .sort_values("날짜")
+        .groupby(pd.Grouper(key="날짜", freq="W"))["판매량"]
+        .sum()
+        .tolist()
+    )
+
+    stage_info = None
+    if "stage" in weekly_df.columns:
+        stage_info = weekly_df["stage"].astype(str).tolist()
+
+    prompt = f"""
+작년 매출과 올해 매출을 참고해서
+올해 연말까지 주차별 매출을 예측하라.
+
+조건
+
+- 작년 매출을 반드시 참고
+- shape = {shape_label}
+- 단계 흐름도 참고
+- 도입 / 성장 / 피크 / 성숙 / 쇠퇴 구조 유지
+- 피크 위치는 작년과 비슷해야 함
+- JSON 배열로 반환
+
+아이템명:
+{item_name}
+
+작년 주차 매출:
+{last_year}
+
+작년 단계(stage) 정보:
+{stage_info}
+
+올해 현재 매출:
+{this_year}
+
+결과 형식:
+{{
+ "forecast":[1,2,3,...]
+}}
+""".strip()
+
+    messages = [
+        {"role": "user", "content": prompt}
+    ]
+
+    forecast_schema = {
+        "name": "forecast_result",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "forecast": {
+                    "type": "array",
+                    "items": {"type": "number"}
+                }
+            },
+            "required": ["forecast"],
+            "additionalProperties": False
+        }
+    }
+
+    result = call_openai_chat_json(messages, json_schema=forecast_schema)
+
+    forecast = result["forecast"]
+
+    df = pd.DataFrame({
+        "week": list(range(len(forecast))),
+        "forecast": forecast
+    })
+
+    return df
 
 def classify_shape(item_name: str, monthly_df: pd.DataFrame) -> Tuple[str, str]:
     if monthly_df.empty:
@@ -965,9 +1053,22 @@ def main():
     selected_row = options_df[options_df["label"] == selected_label].iloc[0]
     selected_item_code = selected_row["item_code"]
 
+    selected_sku = selected_row["sku"]
+
+    final_item_df = final_prepared[
+        final_prepared["sku"] == selected_sku
+    ].copy()
+
     item_name, weekly_df, monthly_df = prepare_plc_item_timeseries(plc_df, selected_item_code)
     shape_label, shape_reason = classify_shape(item_name, monthly_df)
     weekly_df = classify_weekly_stages_by_shape(weekly_df, shape_label)
+
+    forecast_df = forecast_with_gpt(
+        item_name,
+        shape_label,
+        weekly_df,
+        final_item_df
+    )
 
     st.markdown(f"### 아이템명: {item_name}")
     st.markdown(f"### 형태: {shape_label}")
@@ -980,8 +1081,58 @@ def main():
     else:
         st.markdown("**주차 단계 순서:** 도입 > 성장 > 성숙 > 쇠퇴")
 
-    fig = build_dual_line_chart(item_name, weekly_df, monthly_df)
-    st.plotly_chart(fig, use_container_width=True)
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+
+        st.markdown("### 작년 매출")
+
+        fig1 = build_dual_line_chart(
+            item_name,
+            weekly_df,
+            monthly_df
+        )
+
+        st.plotly_chart(fig1, use_container_width=True)
+
+
+    with col2:
+
+        st.markdown("### 올해 매출 + GPT 예측")
+
+        fig2 = go.Figure()
+
+        # 올해 실제
+        real_week = (
+            final_item_df
+            .sort_values("날짜")
+            .groupby(pd.Grouper(key="날짜", freq="W"))["판매량"]
+            .sum()
+            .reset_index()
+        )
+
+        fig2.add_trace(
+            go.Scatter(
+                x=real_week["날짜"],
+                y=real_week["판매량"],
+                name="올해 매출",
+                mode="lines+markers"
+            )
+        )
+
+        # GPT 예측
+
+        fig2.add_trace(
+            go.Scatter(
+                x=list(range(len(forecast_df))),
+                y=forecast_df["forecast"],
+                name="예측",
+                mode="lines",
+                line=dict(dash="dash")
+            )
+        )
+
+        st.plotly_chart(fig2, use_container_width=True)
 
     st.dataframe(
         weekly_df[["year_week", "sales", "stage"]],
