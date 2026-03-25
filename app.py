@@ -900,7 +900,12 @@ def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
 
     df["item_code"] = df["sku"].apply(extract_item_code_from_sku)
     df["판매량"] = df["판매량"].apply(clean_number).fillna(0)
-    df["날짜"] = pd.to_datetime(df["날짜"], errors="coerce")
+    df["날짜"] = pd.to_datetime(
+        df["날짜"].astype(str)
+            .str.replace(".", "-", regex=False)
+            .str.replace(" ", "", regex=False),
+        errors="coerce"
+)
     return df
 
 
@@ -912,7 +917,7 @@ def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
 STAGE_COLORS = {
     "도입": "#1f77b4",   # 파랑
     "성장": "#2ca02c",   # 초록
-    "피크": "##d62728",   # 빨강
+    "피크": "#d62728",   # 빨강
     "피크2": "#d62728",  # 빨강
     "성숙": "#9467bd",   # 보라
     "비시즌": "#7f7f7f", # 회색
