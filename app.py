@@ -1414,6 +1414,7 @@ def main():
             ),
         }
     )
+    st.caption("빨간색 수치는 AI 예측값입니다.")
 
     st.markdown(f"### 아이템명: {item_name}")
     st.markdown(f"### 형태: {shape_label}")
