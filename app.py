@@ -217,6 +217,49 @@ def forecast_with_gpt(
     if last_to_date <= 0:
         return pd.DataFrame(columns=["날짜", "forecast"])
 
+    # ------------------------------------------------------------
+    # 예외 규칙: 올해 판매가 계속 0인 제품
+    # - 다다음주(현재+2)부터 판매 1장을 가정
+    # - 그 이후는 작년 비중(ratio) 상대비로 판매량 산출
+    #   예: forecast[w] = round(1 * ratio[w] / ratio[seed_week])
+    # ------------------------------------------------------------
+    this_has_any_sales = any(float(v) > 0 for v in this_sales_by_week.values())
+    if (not this_has_any_sales) and this_to_date <= 0:
+        remaining_weeks = sorted([int(w) for w in ratio_by_week.keys() if int(w) > current_week_no])
+        if not remaining_weeks:
+            return pd.DataFrame(columns=["날짜", "forecast"])
+
+        seed_week = current_week_no + 2
+        seed_value = 1
+
+        # seed_week이 범위를 벗어나거나 비중이 0이면, 남은 주차 중 비중>0인 첫 주차로 대체
+        if seed_week not in ratio_by_week or float(ratio_by_week.get(seed_week, 0.0)) <= 0:
+            seed_week = None
+            for w in remaining_weeks:
+                if float(ratio_by_week.get(w, 0.0)) > 0:
+                    seed_week = w
+                    break
+            if seed_week is None:
+                # 남은 주차 비중이 모두 0이면 예측 불가
+                return pd.DataFrame(columns=["날짜", "forecast"])
+
+        seed_ratio = float(ratio_by_week.get(seed_week, 0.0))
+        if seed_ratio <= 0:
+            return pd.DataFrame(columns=["날짜", "forecast"])
+
+        forecast_weeks = [w for w in remaining_weeks if w >= seed_week]
+        forecast_values = []
+        forecast_dates = []
+        for w in forecast_weeks:
+            r = float(ratio_by_week.get(w, 0.0))
+            v = int(round(seed_value * (r / seed_ratio)))
+            forecast_values.append(max(0, v))
+            d = pd.to_datetime(f"{this_year}-W{w:02d}-1", format="%G-W%V-%u", errors="coerce")
+            forecast_dates.append(d)
+
+        forecast_df = pd.DataFrame({"날짜": forecast_dates, "forecast": forecast_values}).dropna(subset=["날짜"])
+        return forecast_df
+
     scale = this_to_date / last_to_date
     expected_total = last_total * scale
     remaining_total = max(0.0, expected_total - this_to_date)
