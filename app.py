@@ -175,15 +175,19 @@ def forecast_with_gpt(
     final_item_df: pd.DataFrame
 ) -> pd.DataFrame:
 
+    plot_final_df = final_item_df.dropna(subset=["날짜"]).copy()
+
     last_year = weekly_df["sales"].tolist()
 
-    this_year = (
-        final_item_df
+    this_year_weekly = (
+        plot_final_df
         .sort_values("날짜")
         .groupby(pd.Grouper(key="날짜", freq="W"))["판매량"]
         .sum()
-        .tolist()
+        .reset_index()
     )
+
+    this_year = this_year_weekly["판매량"].tolist()
 
     stage_info = None
     if "stage" in weekly_df.columns:
@@ -191,15 +195,15 @@ def forecast_with_gpt(
 
     prompt = f"""
 작년 매출과 올해 매출을 참고해서
-올해 연말까지 주차별 매출을 예측하라.
+올해 남은 주차의 매출을 예측하라.
 
 조건
-
 - 작년 매출을 반드시 참고
 - shape = {shape_label}
 - 단계 흐름도 참고
 - 도입 / 성장 / 피크 / 성숙 / 쇠퇴 구조 유지
 - 피크 위치는 작년과 비슷해야 함
+- 올해 이미 존재하는 실제 매출 구간은 제외하고, 남은 주차만 예측
 - JSON 배열로 반환
 
 아이템명:
@@ -211,12 +215,12 @@ def forecast_with_gpt(
 작년 단계(stage) 정보:
 {stage_info}
 
-올해 현재 매출:
+올해 현재 주차 매출:
 {this_year}
 
 결과 형식:
 {{
- "forecast":[1,2,3,...]
+  "forecast":[1,2,3]
 }}
 """.strip()
 
@@ -240,15 +244,19 @@ def forecast_with_gpt(
     }
 
     result = call_openai_chat_json(messages, json_schema=forecast_schema)
-
     forecast = result["forecast"]
 
-    df = pd.DataFrame({
-        "week": list(range(len(forecast))),
+    if this_year_weekly.empty:
+        start_date = pd.Timestamp.today().normalize()
+    else:
+        start_date = this_year_weekly["날짜"].max() + pd.Timedelta(days=7)
+
+    forecast_dates = pd.date_range(start=start_date, periods=len(forecast), freq="W")
+
+    return pd.DataFrame({
+        "날짜": forecast_dates,
         "forecast": forecast
     })
-
-    return df
 
 def classify_shape(item_name: str, monthly_df: pd.DataFrame) -> Tuple[str, str]:
     if monthly_df.empty:
@@ -1073,11 +1081,22 @@ def main():
     selected_row = options_df[options_df["label"] == selected_label].iloc[0]
     selected_item_code = selected_row["item_code"]
 
-    selected_sku = selected_row["sku"]
+    selected_sku = str(selected_row["sku"]).strip()
 
     final_item_df = final_prepared[
-        final_prepared["sku"] == selected_sku
+        final_prepared["sku"].astype(str).str.strip() == selected_sku
     ].copy()
+    
+    st.write("selected_sku:", selected_sku)
+    st.write("final_item_df 건수:", len(final_item_df))
+    st.write("날짜 null 개수:", final_item_df["날짜"].isna().sum())
+    
+    if not final_item_df.empty:
+        st.dataframe(
+            final_item_df[["sku", "sku_name", "날짜", "판매량"]].head(20),
+            use_container_width=True,
+            hide_index=True
+        )
 
     item_name, weekly_df, monthly_df = prepare_plc_item_timeseries(plc_df, selected_item_code)
     shape_label, shape_reason = classify_shape(item_name, monthly_df)
@@ -1123,13 +1142,20 @@ def main():
         fig2 = go.Figure()
 
         # 올해 실제
+        plot_final_df = final_item_df.dropna(subset=["날짜"]).copy()
+
         real_week = (
-            final_item_df
+            plot_final_df
             .sort_values("날짜")
             .groupby(pd.Grouper(key="날짜", freq="W"))["판매량"]
             .sum()
             .reset_index()
         )
+        
+        real_week = real_week[real_week["판매량"] > 0].copy()
+        
+        st.write("주차 집계 건수:", len(real_week))
+        st.dataframe(real_week, use_container_width=True, hide_index=True)
 
         fig2.add_trace(
             go.Scatter(
