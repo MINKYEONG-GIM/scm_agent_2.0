@@ -528,8 +528,9 @@ def build_dual_line_chart(
             y=monthly_df["sales"],
             mode="lines+markers",
             name="월별 매출",
-            line=dict(width=3, dash="dot", color="black"),
-            marker=dict(size=8),
+            line=dict(width=3, color="#cfcfcf"),
+            marker=dict(size=7, color="#cfcfcf"),
+            connectgaps=True,
             yaxis="y2",
             hovertemplate="월: %{x|%Y-%m}<br>매출: %{y:,.0f}<extra></extra>",
         )
@@ -754,7 +755,7 @@ def classify_weekly_stages_by_shape(
     # 도입 > 성장 > 피크 > 성숙 > 쇠퇴
     # ============================
     if shape_label == "단봉형":
-        peak_idx = safe_argmax(smooth)
+        peak_idx = int(np.argmax(y))
 
         # 도입: 앞쪽 최대 4주
         intro_end = min(3, max(1, peak_idx // 3))
