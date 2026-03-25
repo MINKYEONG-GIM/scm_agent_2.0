@@ -125,7 +125,7 @@ def call_openai_chat_json(messages: List[dict]) -> dict:
                     "properties": {
                         "shape_label": {
                             "type": "string",
-                            "enum": ["단봉형", "다봉형"]
+                            "enum": ["단봉형", "쌍봉형", "올시즌형"]
                         },
                         "reason": {
                             "type": "string"
@@ -162,12 +162,7 @@ def call_openai_chat_json(messages: List[dict]) -> dict:
     content = result["choices"][0]["message"]["content"]
     return json.loads(content)
 
-def classify_shape_with_gpt_if_ambiguous(item_name: str, monthly_df: pd.DataFrame) -> Tuple[str, str]:
-    """
-    1차는 로직으로 판별하고,
-    애매한 경우만 GPT로 단봉형/다봉형 판별
-    반환값: (shape_label, reason)
-    """
+def classify_shape(item_name: str, monthly_df: pd.DataFrame) -> Tuple[str, str]:
     if monthly_df.empty:
         return "판단불가", "월별 데이터가 없습니다."
 
@@ -177,47 +172,48 @@ def classify_shape_with_gpt_if_ambiguous(item_name: str, monthly_df: pd.DataFram
         return "판단불가", "월별 데이터가 3개 미만입니다."
 
     y_smooth = smooth_series(y, window=2)
-    peaks = find_significant_peaks(
-        y_smooth,
-        min_peak_ratio=0.35,
-        min_prominence_ratio=0.10,
-        min_distance=1
-    )
-
-    # 명확하면 로직으로 바로 반환
-    if not is_ambiguous_case(y_smooth, peaks):
-        if len(peaks) <= 1:
-            return "단봉형", f"로직 판별: 의미 있는 peak {len(peaks)}개"
-        else:
-            return "다봉형", f"로직 판별: 의미 있는 peak {len(peaks)}개"
-
-    # 애매하면 GPT 호출
     month_labels = monthly_df["month"].dt.strftime("%Y-%m").tolist()
 
+    is_double, double_peaks = is_double_peak(y_smooth)
+    if is_double:
+        return "쌍봉형", f"로직 판별: 의미 있는 피크 2개 ({[month_labels[i] for i in double_peaks]})"
+
+    is_single, single_peaks = is_single_peak(y_smooth)
+    if is_single:
+        return "단봉형", f"로직 판별: 의미 있는 피크 1개 ({[month_labels[i] for i in single_peaks]})"
+
+    if is_all_season(y_smooth):
+        return "올시즌형", "로직 판별: 큰 피크 없이 전체적으로 고르게 분포"
+
+    # 여기까지도 애매하면 GPT
     prompt = f"""
-아이템의 월별 매출 형태를 단봉형 또는 다봉형 중 하나로만 판단해라.
+아이템의 월별 매출 형태를 아래 4개 중 하나로만 판단하라.
 
-판단 기준:
-- 단봉형: 큰 중심 peak가 1개이고 나머지는 작은 흔들림
-- 다봉형: 서로 독립적인 의미 있는 peak가 2개 이상
+분류 순서
+1. 쌍봉형
+2. 단봉형
+3. 올시즌형
 
-주의:
-- 작은 잡음은 별도 peak로 보지 말 것
-- 반드시 "단봉형" 또는 "다봉형" 중 하나만 선택할 것
-- reason은 짧고 명확하게 한글로 작성할 것
+판단 기준
+- 쌍봉형: 의미 있는 피크가 2개 이상이고, 피크 사이에 저점이 존재함
+- 단봉형: 의미 있는 큰 피크가 1개임
+- 올시즌형: 쌍봉형과 단봉형이 아닌 그 외 모든 형태로 큰 피크 없이 전체 기간에 비교적 고르게 분포함
+
+주의
+- 작은 잡음은 피크로 보지 말 것
+- 반드시 3개 중 하나만 선택할 것
+- reason은 짧고 명확한 한글로 작성할 것
 
 아이템명: {item_name}
 월 라벨: {month_labels}
 월별 매출: {[float(v) for v in y]}
 스무딩 값: {[round(float(v), 2) for v in y_smooth]}
-peak 후보 인덱스: {peaks}
-peak 후보 월: {[month_labels[i] for i in peaks] if peaks else []}
 """.strip()
 
     messages = [
         {
             "role": "developer",
-            "content": "너는 월별 매출 형태를 단봉형 또는 다봉형으로만 분류하는 분석가다. 반드시 JSON만 반환한다."
+            "content": "너는 월별 매출 형태를 쌍봉형, 단봉형, 올시즌형 중 하나로만 분류하는 분석가다. 반드시 JSON만 반환한다."
         },
         {
             "role": "user",
@@ -229,12 +225,7 @@ peak 후보 월: {[month_labels[i] for i in peaks] if peaks else []}
         result = call_openai_chat_json(messages)
         return result["shape_label"], result["reason"]
     except Exception as e:
-        # GPT 실패 시 로직 fallback
-        if len(peaks) <= 1:
-            return "단봉형", f"GPT 실패로 로직 fallback 사용: {str(e)}"
-        else:
-            return "다봉형", f"GPT 실패로 로직 fallback 사용: {str(e)}"
-
+        return "기타", f"GPT 실패로 기타 처리: {str(e)}"
 
 # =========================
 # 구글 시트 로딩 함수
@@ -526,34 +517,89 @@ def find_significant_peaks(
     return filtered
 
 
-def is_ambiguous_case(y_smooth: np.ndarray, peaks: List[int]) -> bool:
-    """
-    로직으로 단정하기 애매한 케이스인지 판단
-    """
-    if len(y_smooth) < 3:
-        return True
+def is_double_peak(values: np.ndarray) -> Tuple[bool, List[int]]:
+    peaks = find_significant_peaks(
+        values,
+        min_peak_ratio=0.25
+        min_prominence_ratio=0.05
+        min_distance=2
+        strong_peak_ratio=0.60
+        peak_gap_min=6
+    )
+
+    if len(peaks) < 2:
+        return False, peaks
+
+    mx = np.max(values)
+    valid_peaks = [p for p in peaks if values[p] >= mx * 0.60]
+
+    if len(valid_peaks) < 2:
+        return False, peaks
+
+    valid_peaks = sorted(valid_peaks)
+
+    for i in range(len(valid_peaks) - 1):
+        p1 = valid_peaks[i]
+        p2 = valid_peaks[i + 1]
+
+        if p2 - p1 < 6:
+            continue
+
+        valley = np.min(values[p1:p2 + 1])
+        lower_peak = min(values[p1], values[p2]])
+
+        if lower_peak > 0 and valley / lower_peak <= 0.85:
+            return True, [p1, p2]
+
+    return False, peaks
+
+
+def is_single_peak(values: np.ndarray) -> Tuple[bool, List[int]]:
+    peaks = find_significant_peaks(
+        values,
+        min_peak_ratio=0.30,
+        min_prominence_ratio=0.08,
+        min_distance=2
+    )
 
     if len(peaks) == 1:
-        # 두 번째로 큰 값이 꽤 크면 애매
-        sorted_vals = np.sort(y_smooth)[::-1]
-        if len(sorted_vals) >= 2 and sorted_vals[0] > 0:
-            second_ratio = sorted_vals[1] / sorted_vals[0]
-            if second_ratio >= 0.65:
-                return True
-
-    if len(peaks) == 2:
-        # 두 peak 높이 차이가 작으면 애매
-        p1 = y_smooth[peaks[0]]
-        p2 = y_smooth[peaks[1]]
-        if max(p1, p2) > 0:
-            ratio = min(p1, p2) / max(p1, p2)
-            if ratio >= 0.6:
-                return True
+        return True, peaks
 
     if len(peaks) == 0:
-        return True
+        return False, peaks
 
-    return False
+    mx = np.max(values)
+    strong_peaks = [p for p in peaks if values[p] >= mx * 0.60]
+
+    if len(strong_peaks) == 1:
+        return True, strong_peaks
+
+    return False, peaks
+
+
+def is_all_season(values: np.ndarray) -> bool:
+    if len(values) < 4:
+        return False
+
+    avg = np.mean(values)
+    mx = np.max(values)
+
+    if avg <= 0:
+        return False
+
+    if mx / avg > 2.0:
+        return False
+
+    low = values < avg * 0.5
+    if np.sum(low) > len(values) * 0.3:
+        return False
+
+    near_avg = (values >= avg * 0.7) & (values <= avg * 1.3)
+    if np.sum(near_avg) < len(values) * 0.7:
+        return False
+
+    return True
+
 # =========================
 # 메인 화면
 # =========================
@@ -580,7 +626,7 @@ def main():
     )
 
     weekly_df, monthly_df = prepare_item_timeseries(df, selected_item)
-    shape_label, shape_reason = classify_shape_with_gpt_if_ambiguous(selected_item, monthly_df)
+    shape_label, shape_reason = classify_shape(selected_item, monthly_df)
 
     st.markdown(f"### 형태: {shape_label}")
     st.caption(shape_reason)
