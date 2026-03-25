@@ -1,279 +1,410 @@
+import re
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
 
+
 # -------------------------------------------------
 # 1. 기본 설정
 # -------------------------------------------------
-st.set_page_config(page_title="아이템 시즌 분류", layout="wide")
-st.title("아이템 시즌 분류 화면")
+st.set_page_config(
+    page_title="아이템 매출/재고 대시보드",
+    layout="wide"
+)
 
-st.markdown("""
-주차별 판매량 데이터를 기준으로 각 아이템을 아래 규칙으로 분류합니다.
+st.title("아이템 매출/재고 대시보드")
+st.caption("final 시트 기준으로 아이템별 매출 추이와 재고 지표를 보기 좋게 보여주는 화면")
 
-
-- SUMMER_PEAK: 여름 비중 40% 이상
-- WINTER_PEAK: 겨울 비중 40% 이상
-- SPRING_FALL_PEAK: 봄+가을 비중 60% 이상
-- SPRING_PEAK: 봄 비중 35% 이상
-- FALL_PEAK: 가을 비중 35% 이상
-- ALL_SEASON: 기타
-
-""")
 
 # -------------------------------------------------
-# 2. 시즌 정의
+# 2. 구글시트 연결
 # -------------------------------------------------
-def get_season(week: int) -> str:
-    if 9 <= week <= 18:
-        return "SPRING"
-    elif 19 <= week <= 30:
-        return "SUMMER"
-    elif 31 <= week <= 40:
-        return "FALL"
-    else:
-        return "WINTER"
 
-# -------------------------------------------------
-# 3. 분류 함수
-# -------------------------------------------------
-def classify_item(row: pd.Series) -> str:
-    spring_ratio = row["SPRING_RATIO"]
-    summer_ratio = row["SUMMER_RATIO"]
-    fall_ratio = row["FALL_RATIO"]
-    winter_ratio = row["WINTER_RATIO"]
+def get_gspread_client():
+    service_account_info = {
+        "type": st.secrets["gcp_service_account"]["type"],
+        "project_id": st.secrets["gcp_service_account"]["project_id"],
+        "private_key_id": st.secrets["gcp_service_account"]["private_key_id"],
+        "private_key": st.secrets["gcp_service_account"]["private_key"],
+        "client_email": st.secrets["gcp_service_account"]["client_email"],
+        "client_id": st.secrets["gcp_service_account"]["client_id"],
+        "auth_uri": st.secrets["gcp_service_account"]["auth_uri"],
+        "token_uri": st.secrets["gcp_service_account"]["token_uri"],
+        "auth_provider_x509_cert_url": st.secrets["gcp_service_account"]["auth_provider_x509_cert_url"],
+        "client_x509_cert_url": st.secrets["gcp_service_account"]["client_x509_cert_url"],
+    }
 
-    if summer_ratio >= 0.40:
-        return "SUMMER_PEAK"
-
-    if winter_ratio >= 0.40:
-        return "WINTER_PEAK"
-
-    if (spring_ratio + fall_ratio) >= 0.60:
-        return "SPRING_FALL_PEAK"
-
-    if spring_ratio >= 0.35:
-        return "SPRING_PEAK"
-
-    if fall_ratio >= 0.35:
-        return "FALL_PEAK"
-
-    return "ALL_SEASON"
-
-# -------------------------------------------------
-# 4. 구글시트 연결
-# -------------------------------------------------
-@st.cache_resource
-def get_gsheet_client():
-    scope = [
+    scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive.readonly"
     ]
 
     credentials = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"],
-        scopes=scope,
+        service_account_info,
+        scopes=scopes
     )
 
-    client = gspread.authorize(credentials)
-    return client
+    return gspread.authorize(credentials)
+
 
 # -------------------------------------------------
-# 5. 구글시트 데이터 읽기
+# final 시트 로드
 # -------------------------------------------------
-@st.cache_data(show_spinner=False)
-def load_data_from_gsheet():
-    client = get_gsheet_client()
 
-    sheet_url = st.secrets["sheets"]["SHEET_URL"]
-    plc_db_sheet = st.secrets["sheets"]["PLC DB"]
-    season_db_sheet = st.secrets["sheets"]["SEASON DB"]
+@st.cache_data(ttl=300)
+def load_final_sheet():
+    client = get_gspread_client()
+
+    sheet_id = st.secrets["sheets"]["sheet_id"]
     final_sheet = st.secrets["sheets"]["final"]
 
-    spreadsheet = client.open_by_url(sheet_url)
-    plc_worksheet = spreadsheet.worksheet(plc_db_sheet)
-    season_worksheet = spreadsheet.worksheet(season_db_sheet)
-    final_worksheet = spreadsheet.worksheet(final_sheet)
+    spreadsheet = client.open_by_key(sheet_id)
 
-    # PLC DB: 가로형 판매(0행 제목, 1행 헤더, 2행~ 데이터)
-    values = plc_worksheet.get_all_values()
+    final_ws = spreadsheet.worksheet(final_sheet)
 
-    if not values or len(values) < 3:
-        raise ValueError("구글시트 데이터 구조를 확인해주세요. 최소 3행 이상 필요합니다.")
+    final_values = final_ws.get_all_values()
 
-    # 0행: 상단 제목(판매수량의 SUM, 아이템 등)
-    # 1행: 실제 헤더(연도/주, 가디건, 가방, ...)
-    # 2행부터: 실제 데이터
-    header = values[1]
-    data = values[2:]
+    if not final_values or len(final_values) < 2:
+        return pd.DataFrame()
 
-    df = pd.DataFrame(data, columns=header)
+    final_df = pd.DataFrame(
+        final_values[1:],
+        columns=final_values[0]
+    )
 
-    # 완전히 빈 컬럼 제거
-    df = df.loc[:, [str(col).strip() != "" for col in df.columns]]
-
-    return df
-# -------------------------------------------------
-# 6. 가로형 데이터 -> 세로형 변환
-# -------------------------------------------------
-def convert_wide_to_long(df_wide: pd.DataFrame) -> pd.DataFrame:
-    df_wide = df_wide.copy()
-    df_wide.columns = [str(c).strip() for c in df_wide.columns]
-
-    # 첫 컬럼명 찾기
-    first_col = df_wide.columns[0]
-
-    # 보통 '연도/주' 이지만 혹시 다르면 첫 컬럼을 year_week로 강제 사용
-    df_long = df_wide.melt(
-        id_vars=[first_col],
-        var_name="item_name",
-        value_name="sales_qty"
-    ).rename(columns={first_col: "year_week"})
-
-    # 빈 아이템 제거
-    df_long["item_name"] = df_long["item_name"].astype(str).str.strip()
-    df_long = df_long[df_long["item_name"] != ""]
-
-    return df_long
+    return final_df
 
 # -------------------------------------------------
-# 7. 전처리
+# 3. 전처리
 # -------------------------------------------------
+def clean_item_name(name: str) -> str:
+    """
+    sku_name에서 색상/사이즈를 제거해서 대표 아이템명 추출
+    예:
+    [코튼스판] 캡소매 절개 반팔티, (19)Black, S
+    -> [코튼스판] 캡소매 절개 반팔티
+    """
+    if pd.isna(name):
+        return ""
+
+    name = str(name).strip()
+
+    # 마지막 ", 색상, 사이즈" 형태 제거
+    parts = [p.strip() for p in name.split(",")]
+    if len(parts) >= 3:
+        return parts[0]
+
+    return name
+
+
+def to_numeric_safe(series):
+    return pd.to_numeric(series.astype(str).str.replace(",", "").str.strip(), errors="coerce").fillna(0)
+
+
 def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
-    # 가로형이면 자동 변환
-    if "year_week" not in df.columns and "item_name" not in df.columns and "sales_qty" not in df.columns:
-        df = convert_wide_to_long(df)
-
-    # 한글 헤더 대응
+    # 컬럼명 표준화
     rename_map = {}
     for col in df.columns:
-        if col == "연도/주":
-            rename_map[col] = "year_week"
-        elif col == "아이템":
-            rename_map[col] = "item_name"
-        elif col in ["판매수량", "판매수량의 SUM"]:
-            rename_map[col] = "sales_qty"
-
+        clean_col = col.strip()
+        rename_map[col] = clean_col
     df = df.rename(columns=rename_map)
 
-    required_cols = {"year_week", "item_name", "sales_qty"}
-    missing = required_cols - set(df.columns)
-    if missing:
-        raise ValueError(f"필수 컬럼이 없습니다: {missing}")
+    required_cols = [
+        "sku", "sku_name", "날짜", "기초재고", "판매량",
+        "분배량", "출고량(회전 등)", "로스", "판매가능주차"
+    ]
 
-    df["year_week"] = df["year_week"].astype(str).str.strip()
-    df["item_name"] = df["item_name"].astype(str).str.strip()
+    missing_cols = [c for c in required_cols if c not in df.columns]
+    if missing_cols:
+        st.error(f"필수 컬럼이 없습니다: {missing_cols}")
+        st.stop()
 
-    df["sales_qty"] = (
-        df["sales_qty"]
-        .astype(str)
-        .str.replace(",", "", regex=False)
-        .str.strip()
-        .replace("", "0")
+    # 날짜 변환
+    df["날짜"] = pd.to_datetime(df["날짜"], errors="coerce")
+    df = df.dropna(subset=["날짜"]).copy()
+
+    # 숫자 컬럼 변환
+    numeric_cols = ["기초재고", "판매량", "분배량", "출고량(회전 등)", "로스", "판매가능주차"]
+    for col in numeric_cols:
+        df[col] = to_numeric_safe(df[col])
+
+    # 대표 아이템명
+    df["item_name"] = df["sku_name"].apply(clean_item_name)
+
+    # 추정 기말재고
+    df["추정기말재고"] = (
+        df["기초재고"] + df["분배량"] - df["판매량"] - df["출고량(회전 등)"] - df["로스"]
     )
-    df["sales_qty"] = pd.to_numeric(df["sales_qty"], errors="coerce").fillna(0)
 
-    extracted = df["year_week"].str.extract(r"(?P<year>\d{4})-(?P<week>\d{1,2})")
-    df["year"] = pd.to_numeric(extracted["year"], errors="coerce")
-    df["week"] = pd.to_numeric(extracted["week"], errors="coerce")
+    # 판매율
+    df["판매율"] = df.apply(
+        lambda row: (row["판매량"] / row["기초재고"] * 100) if row["기초재고"] > 0 else 0,
+        axis=1
+    )
 
-    df = df.dropna(subset=["year", "week"])
-    df["year"] = df["year"].astype(int)
-    df["week"] = df["week"].astype(int)
+    # 재고 상태
+    def stock_status(cover_weeks):
+        if cover_weeks <= 4:
+            return "부족"
+        elif cover_weeks <= 8:
+            return "적정"
+        else:
+            return "과다"
 
-    df["season"] = df["week"].apply(get_season)
+    df["재고상태"] = df["판매가능주차"].apply(stock_status)
 
     return df
 
+
 # -------------------------------------------------
-# 8. 분류 테이블 생성
+# 4. 데이터 로드
 # -------------------------------------------------
-def make_classification_table(df: pd.DataFrame) -> pd.DataFrame:
-    season_sum = (
-        df.groupby(["item_name", "season"], as_index=False)["sales_qty"]
-        .sum()
+# final 원본 -> 전처리 규칙 통일
+final_raw_df = load_final_sheet()
+final_df = preprocess_data(final_raw_df)
+
+if final_df.empty:
+    st.warning("final 시트 데이터 없음")
+    st.stop()
+
+
+# -------------------------------------------------
+# 5. 사이드바 필터
+# -------------------------------------------------
+st.sidebar.header("필터")
+
+view_level = st.sidebar.radio(
+    "보기 기준",
+    ["대표 아이템", "SKU"],
+    horizontal=False
+)
+
+date_min = final_df["날짜"].min().date()
+date_max = final_df["날짜"].max().date()
+
+date_range = st.sidebar.date_input(
+    "기간 선택",
+    value=(date_min, date_max),
+    min_value=date_min,
+    max_value=date_max
+)
+
+if isinstance(date_range, tuple) and len(date_range) == 2:
+    start_date, end_date = date_range
+else:
+    start_date, end_date = date_min, date_max
+
+filtered_df = final_df[
+    (final_df["날짜"].dt.date >= start_date) &
+    (final_df["날짜"].dt.date <= end_date)
+].copy()
+
+if view_level == "대표 아이템":
+    item_options = sorted(filtered_df["item_name"].dropna().unique().tolist())
+    selected_item = st.sidebar.selectbox("아이템 선택", item_options)
+
+    view_df = filtered_df[filtered_df["item_name"] == selected_item].copy()
+    title_name = selected_item
+else:
+    sku_options = sorted(filtered_df["sku"].dropna().unique().tolist())
+    selected_sku = st.sidebar.selectbox("SKU 선택", sku_options)
+
+    view_df = filtered_df[filtered_df["sku"] == selected_sku].copy()
+    title_name = selected_sku
+
+if view_df.empty:
+    st.warning("선택한 조건에 해당하는 데이터가 없습니다.")
+    st.stop()
+
+
+# -------------------------------------------------
+# 6. 집계 테이블 생성
+# -------------------------------------------------
+if view_level == "대표 아이템":
+    agg_df = (
+        view_df.groupby("날짜", as_index=False)
+        .agg({
+            "기초재고": "sum",
+            "판매량": "sum",
+            "분배량": "sum",
+            "출고량(회전 등)": "sum",
+            "로스": "sum",
+            "판매가능주차": "mean",
+            "추정기말재고": "sum"
+        })
+        .sort_values("날짜")
+    )
+else:
+    agg_df = view_df.sort_values("날짜").copy()
+
+latest_row = agg_df.sort_values("날짜").iloc[-1]
+total_sales = agg_df["판매량"].sum()
+total_loss = agg_df["로스"].sum()
+avg_cover_weeks = agg_df["판매가능주차"].mean()
+avg_sales = agg_df["판매량"].mean()
+
+
+# -------------------------------------------------
+# 7. 상단 KPI
+# -------------------------------------------------
+st.subheader(f"{title_name}")
+
+col1, col2, col3, col4, col5 = st.columns(5)
+
+col1.metric("최근 판매량", f"{latest_row['판매량']:.0f}")
+col2.metric("최근 기초재고", f"{latest_row['기초재고']:.0f}")
+col3.metric("누적 판매량", f"{total_sales:.0f}")
+col4.metric("평균 재고보유주수", f"{avg_cover_weeks:.1f}")
+col5.metric("누적 로스", f"{total_loss:.0f}")
+
+
+# -------------------------------------------------
+# 8. 메인 차트
+# -------------------------------------------------
+left_col, right_col = st.columns([2, 1])
+
+with left_col:
+    st.markdown("### 매출/재고 추이")
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=agg_df["날짜"],
+        y=agg_df["판매량"],
+        mode="lines+markers",
+        name="판매량"
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=agg_df["날짜"],
+        y=agg_df["기초재고"],
+        mode="lines+markers",
+        name="기초재고",
+        yaxis="y2"
+    ))
+
+    fig.update_layout(
+        height=500,
+        hovermode="x unified",
+        xaxis=dict(title="날짜"),
+        yaxis=dict(title="판매량"),
+        yaxis2=dict(
+            title="기초재고",
+            overlaying="y",
+            side="right"
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        ),
+        margin=dict(l=20, r=20, t=20, b=20)
     )
 
-    pivot = (
-        season_sum.pivot(index="item_name", columns="season", values="sales_qty")
-        .fillna(0)
-        .reset_index()
-    )
+    st.plotly_chart(fig, use_container_width=True)
 
-    for col in ["SPRING", "SUMMER", "FALL", "WINTER"]:
-        if col not in pivot.columns:
-            pivot[col] = 0
+with right_col:
+    st.markdown("### 최근 상태")
 
-    pivot["TOTAL_QTY"] = (
-        pivot["SPRING"] + pivot["SUMMER"] + pivot["FALL"] + pivot["WINTER"]
-    )
-
-    total_nonzero = pivot["TOTAL_QTY"].replace(0, pd.NA)
-    pivot["SPRING_RATIO"] = pivot["SPRING"] / total_nonzero
-    pivot["SUMMER_RATIO"] = pivot["SUMMER"] / total_nonzero
-    pivot["FALL_RATIO"] = pivot["FALL"] / total_nonzero
-    pivot["WINTER_RATIO"] = pivot["WINTER"] / total_nonzero
-    pivot = pivot.fillna(0)
-
-    pivot["CATEGORY"] = pivot.apply(classify_item, axis=1)
-
-    result = pivot[
-        [
-            "item_name",
-            "SPRING",
-            "SUMMER",
-            "FALL",
-            "WINTER",
-            "TOTAL_QTY",
-            "SPRING_RATIO",
-            "SUMMER_RATIO",
-            "FALL_RATIO",
-            "WINTER_RATIO",
-            "CATEGORY",
+    latest_status_df = pd.DataFrame({
+        "지표": ["기초재고", "판매량", "분배량", "출고량", "로스", "재고보유주수", "추정기말재고"],
+        "값": [
+            latest_row["기초재고"],
+            latest_row["판매량"],
+            latest_row["분배량"],
+            latest_row["출고량(회전 등)"],
+            latest_row["로스"],
+            round(latest_row["판매가능주차"], 1),
+            latest_row["추정기말재고"],
         ]
-    ].copy()
+    })
 
-    for col in ["SPRING_RATIO", "SUMMER_RATIO", "FALL_RATIO", "WINTER_RATIO"]:
-        result[col] = (result[col] * 100).round(1)
+    st.dataframe(latest_status_df, use_container_width=True, hide_index=True)
 
-    result = result.sort_values(["CATEGORY", "TOTAL_QTY"], ascending=[True, False])
-    return result
 
 # -------------------------------------------------
-# 9. 실행
+# 9. 보조 차트
 # -------------------------------------------------
-if st.button("구글시트 데이터 가져오기"):
-    try:
-        raw_df = load_data_from_gsheet()
-        df = preprocess_data(raw_df)
-        result_df = make_classification_table(df)
+c1, c2 = st.columns(2)
 
-        st.success("구글시트 데이터를 불러왔습니다.")
+with c1:
+    st.markdown("### 흐름 비교")
 
-        st.subheader("분류 결과")
-        st.dataframe(result_df, use_container_width=True)
+    flow_df = agg_df.melt(
+        id_vars="날짜",
+        value_vars=["판매량", "분배량", "출고량(회전 등)", "로스"],
+        var_name="구분",
+        value_name="수량"
+    )
 
-        st.subheader("분류별 건수")
-        summary_df = (
-            result_df.groupby("CATEGORY", as_index=False)
-            .agg(
-                item_count=("item_name", "count"),
-                total_qty=("TOTAL_QTY", "sum"),
-            )
-            .sort_values("item_count", ascending=False)
-        )
-        st.dataframe(summary_df, use_container_width=True)
+    fig_flow = px.bar(
+        flow_df,
+        x="날짜",
+        y="수량",
+        color="구분",
+        barmode="group"
+    )
+    fig_flow.update_layout(height=400, margin=dict(l=20, r=20, t=20, b=20))
+    st.plotly_chart(fig_flow, use_container_width=True)
 
-        st.subheader("아이템 상세 조회")
-        item_list = result_df["item_name"].dropna().unique().tolist()
-        selected_item = st.selectbox("아이템 선택", item_list)
+with c2:
+    st.markdown("### 재고보유주수 추이")
 
-        item_detail = result_df[result_df["item_name"] == selected_item]
-        st.dataframe(item_detail, use_container_width=True)
+    fig_cover = px.line(
+        agg_df,
+        x="날짜",
+        y="판매가능주차",
+        markers=True
+    )
+    fig_cover.update_layout(height=400, margin=dict(l=20, r=20, t=20, b=20))
+    st.plotly_chart(fig_cover, use_container_width=True)
 
-    except Exception as e:
-        st.error(f"구글시트 조회 중 오류가 발생했습니다: {e}")
+
+# -------------------------------------------------
+# 10. 상세 테이블
+# -------------------------------------------------
+st.markdown("### 상세 데이터")
+
+display_df = view_df.copy()
+
+display_cols = [
+    "sku", "sku_name", "item_name", "날짜", "기초재고", "판매량",
+    "분배량", "출고량(회전 등)", "로스", "판매가능주차",
+    "추정기말재고", "판매율", "재고상태"
+]
+
+display_df = display_df[display_cols].sort_values(["날짜", "sku"], ascending=[False, True])
+
+display_df["날짜"] = display_df["날짜"].dt.strftime("%Y-%m-%d")
+display_df["판매율"] = display_df["판매율"].round(1)
+
+st.dataframe(
+    display_df,
+    use_container_width=True,
+    hide_index=True,
+    height=500
+)
+
+
+# -------------------------------------------------
+# 11. 다운로드
+# -------------------------------------------------
+csv_data = display_df.to_csv(index=False).encode("utf-8-sig")
+
+st.download_button(
+    label="현재 화면 데이터 CSV 다운로드",
+    data=csv_data,
+    file_name="item_dashboard_export.csv",
+    mime="text/csv"
+)
