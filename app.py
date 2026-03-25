@@ -174,20 +174,13 @@ def classify_shape(item_name: str, monthly_df: pd.DataFrame) -> Tuple[str, str]:
     y_smooth = smooth_series(y, window=2)
     month_labels = monthly_df["month"].dt.strftime("%Y-%m").tolist()
 
-    is_double, double_peaks = is_double_peak(y_smooth)
-    if is_double:
-        return "쌍봉형", f"로직 판별: 의미 있는 피크 2개 ({[month_labels[i] for i in double_peaks]})"
-
-    is_single, single_peaks = is_single_peak(y_smooth)
-    if is_single:
-        return "단봉형", f"로직 판별: 의미 있는 피크 1개 ({[month_labels[i] for i in single_peaks]})"
-
-    if is_all_season(y_smooth):
-        return "올시즌형", "로직 판별: 큰 피크 없이 전체적으로 고르게 분포"
-
-    # 여기까지도 애매하면 GPT
     prompt = f"""
-아이템의 월별 매출 형태를 아래 4개 중 하나로만 판단하라.
+
+    
+아이템의 월별 매출 형태를 아래 3개 중 하나로만 판단하라.
+
+- 반드시 월별 매출 기준으로만 판단할 것
+- 주차별 매출은 참고하지 말 것
 
 분류 순서
 1. 쌍봉형
@@ -195,11 +188,13 @@ def classify_shape(item_name: str, monthly_df: pd.DataFrame) -> Tuple[str, str]:
 3. 올시즌형
 
 판단 기준
-- 쌍봉형: 의미 있는 피크가 2개 이상이고, 피크 사이에 저점이 존재함
+- 쌍봉형: 의미 있는 피크가 2개 이상이고, 두 피크 사이에 저점이 존재함
 - 단봉형: 의미 있는 큰 피크가 1개임
-- 올시즌형: 쌍봉형과 단봉형이 아닌 그 외 모든 형태로 큰 피크 없이 전체 기간에 비교적 고르게 분포함
+- 올시즌형: 큰 중심 피크 없이 전체 기간에 비교적 고르게 분포함
 
 주의
+- 반드시 월별 매출 기준으로만 판단할 것
+- 주차별 매출은 참고하지 말 것
 - 작은 잡음은 피크로 보지 말 것
 - 반드시 3개 중 하나만 선택할 것
 - reason은 짧고 명확한 한글로 작성할 것
@@ -213,7 +208,7 @@ def classify_shape(item_name: str, monthly_df: pd.DataFrame) -> Tuple[str, str]:
     messages = [
         {
             "role": "developer",
-            "content": "너는 월별 매출 형태를 쌍봉형, 단봉형, 올시즌형 중 하나로만 분류하는 분석가다. 반드시 JSON만 반환한다."
+            "content": "너는 월별 매출 형태를 쌍봉형, 단봉형, 올시즌형 중 하나로만 분류하는 분석가다. 반드시 JSON만 반환한다. 반드시 월별 매출 기준으로만 판단한다."
         },
         {
             "role": "user",
@@ -221,11 +216,26 @@ def classify_shape(item_name: str, monthly_df: pd.DataFrame) -> Tuple[str, str]:
         }
     ]
 
+    # 1차 판단: GPT
     try:
         result = call_openai_chat_json(messages)
-        return result["shape_label"], result["reason"]
+        return result["shape_label"], f"GPT 1차 판별: {result['reason']}"
     except Exception as e:
-        return "기타", f"GPT 실패로 기타 처리: {str(e)}"
+        pass
+
+    # 2차 fallback: 로직
+    is_double, double_peaks = is_double_peak(y_smooth)
+    if is_double:
+        return "쌍봉형", f"GPT 실패, 로직 fallback: 의미 있는 피크 2개 ({[month_labels[i] for i in double_peaks]})"
+
+    is_single, single_peaks = is_single_peak(y_smooth)
+    if is_single:
+        return "단봉형", f"GPT 실패, 로직 fallback: 의미 있는 피크 1개 ({[month_labels[i] for i in single_peaks]})"
+
+    if is_all_season(y_smooth):
+        return "올시즌형", "GPT 실패, 로직 fallback: 큰 피크 없이 전체적으로 고르게 분포"
+
+    return "단봉형", "GPT 실패 및 로직 미확정으로 단봉형 fallback"
 
 # =========================
 # 구글 시트 로딩 함수
