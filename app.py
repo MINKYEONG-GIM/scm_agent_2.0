@@ -413,6 +413,49 @@ def load_final_df() -> pd.DataFrame:
     return load_sheet_as_df(final_sheet)
 
 
+@st.cache_data(ttl=300)
+def load_reorder_df() -> pd.DataFrame:
+    sheets_cfg = get_sheets_config()
+    reorder_sheet = sheets_cfg.get("reorder") or "reorder"
+    return load_sheet_as_df(reorder_sheet)
+
+
+def get_reorder_lead_time_days(reorder_df: pd.DataFrame, sku: str) -> Optional[int]:
+    """
+    reorder 시트에서 선택 SKU에 해당하는 lead_time(일)을 반환합니다.
+    헤더가 sku가 중복이면 make_unique_headers로 sku, sku_2 등이 됩니다.
+    """
+    if reorder_df is None or reorder_df.empty:
+        return None
+
+    sku_key = str(sku).strip()
+    if not sku_key:
+        return None
+
+    lt_col = None
+    for c in reorder_df.columns:
+        if str(c).strip().lower() == "lead_time":
+            lt_col = c
+            break
+    if lt_col is None:
+        return None
+
+    sku_cols = [c for c in reorder_df.columns if str(c).strip().lower().startswith("sku")]
+    if not sku_cols:
+        return None
+
+    for col in sku_cols:
+        mask = reorder_df[col].astype(str).str.strip() == sku_key
+        sub = reorder_df.loc[mask]
+        if sub.empty:
+            continue
+        for _, row in sub.iterrows():
+            v = clean_number(row[lt_col])
+            if pd.notna(v):
+                return int(round(float(v)))
+    return None
+
+
 def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
     """
     구글시트의 특정 워크시트를 DataFrame으로 읽습니다.
@@ -1234,6 +1277,12 @@ def main():
     plc_df = load_plc_df()
     final_df = load_final_df()
 
+    try:
+        reorder_df = load_reorder_df()
+    except Exception as e:
+        reorder_df = pd.DataFrame()
+        st.warning(f"reorder 시트를 불러오지 못했습니다: {e}")
+
     if plc_df.empty:
         st.warning("plc db 데이터가 없습니다.")
         return
@@ -1299,7 +1348,17 @@ def main():
         final_item_df = final_item_df[
             final_item_df["plant_name"].astype(str).str.strip() == selected_plant
         ].copy()
-    
+
+    lead_days = get_reorder_lead_time_days(reorder_df, selected_sku)
+    if lead_days is not None:
+        st.markdown(
+            f"**해당 SKU의 리오더 소요일은 {lead_days}일 입니다.**"
+        )
+    else:
+        st.info(
+            "reorder 시트에서 해당 SKU의 리오더 소요일(lead_time)을 찾지 못했습니다."
+        )
+
     st.write("selected_sku:", selected_sku)
     st.write("final_item_df 건수:", len(final_item_df))
     st.write("날짜 null 개수:", final_item_df["날짜"].isna().sum())
