@@ -1059,13 +1059,8 @@ def build_year_compare_table(
     else:
         last_year_df["last_year_ratio_pct"] = 0.0
 
-    # 주차 라벨: 예) 2025 - 8주차
-    last_year_df["주차"] = (
-        last_year_df["week_start"].dt.year.astype(str)
-        + " - "
-        + last_year_df["week_no"].astype(str)
-        + "주차"
-    )
+    # 주차 라벨: 예) 8주차
+    last_year_df["주차"] = last_year_df["week_no"].astype(str) + "주차"
 
     # -----------------------------
     # 2) 올해 주차별 판매량 계산
@@ -1093,6 +1088,8 @@ def build_year_compare_table(
         on="week_no",
         how="left"
     )
+
+    result = result.sort_values("week_no").reset_index(drop=True)
 
     result["올해 해당 주차 판매량 (장)"] = (
         result["올해 해당 주차 판매량 (장)"]
@@ -1171,18 +1168,25 @@ def main():
     st.write("selected_sku:", selected_sku)
     st.write("final_item_df 건수:", len(final_item_df))
     st.write("날짜 null 개수:", final_item_df["날짜"].isna().sum())
-    
+
+    item_name, weekly_df, monthly_df = prepare_plc_item_timeseries(plc_df, selected_item_code)
+    shape_label, shape_reason = classify_shape(item_name, monthly_df)
+    weekly_df = classify_weekly_stages_by_shape(weekly_df, shape_label)
+
+    compare_table_df = build_year_compare_table(
+        weekly_df=weekly_df,
+        final_item_df=final_item_df,
+        selected_sku=selected_sku,
+        selected_sku_name=selected_sku_name
+    )
+
     st.markdown("### 주차별 작년 비중 / 올해 판매량 비교표")
 
     st.dataframe(
         compare_table_df,
         use_container_width=True,
         hide_index=True
-)
-
-    item_name, weekly_df, monthly_df = prepare_plc_item_timeseries(plc_df, selected_item_code)
-    shape_label, shape_reason = classify_shape(item_name, monthly_df)
-    weekly_df = classify_weekly_stages_by_shape(weekly_df, shape_label)
+    )
 
     forecast_df = forecast_with_gpt(
         item_name,
