@@ -520,10 +520,10 @@ def find_significant_peaks(
 def is_double_peak(values: np.ndarray) -> Tuple[bool, List[int]]:
     peaks = find_significant_peaks(
         values,
-        min_peak_ratio=0.25
-        min_prominence_ratio=0.05
-        min_distance=2
-        strong_peak_ratio=0.60
+        min_peak_ratio=0.25,
+        min_prominence_ratio=0.05,
+        min_distance=2,
+        strong_peak_ratio=0.60,
         peak_gap_min=6
     )
 
