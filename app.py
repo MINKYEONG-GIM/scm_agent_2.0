@@ -985,6 +985,7 @@ def extract_item_code_from_sku(sku: str) -> str:
     return ""
 
 def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
+def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
     df = final_df.copy()
 
     required_cols = ["sku", "sku_name", "날짜", "판매량"]
@@ -992,14 +993,33 @@ def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"final 시트 필수 컬럼이 없습니다: {missing}")
 
+    # sku 문자열 정리
+    df["sku"] = df["sku"].astype(str).str.strip()
+    df["sku_name"] = df["sku_name"].astype(str).str.strip()
+
     df["item_code"] = df["sku"].apply(extract_item_code_from_sku)
     df["판매량"] = df["판매량"].apply(clean_number).fillna(0)
-    df["날짜"] = pd.to_datetime(
-        df["날짜"].astype(str)
-            .str.replace(".", "-", regex=False)
-            .str.replace(" ", "", regex=False),
-        errors="coerce"
-)
+
+    # 날짜 문자열 정리
+    raw_date = (
+        df["날짜"]
+        .astype(str)
+        .str.strip()
+        .str.replace(".", "-", regex=False)
+        .str.replace("/", "-", regex=False)
+        .str.replace(" ", "", regex=False)
+    )
+
+    # 예: 02월25일 -> 2026-02-25 로 변환
+    current_year = pd.Timestamp.today().year
+    raw_date = raw_date.str.replace(
+        r"^(\d{1,2})월(\d{1,2})일$",
+        rf"{current_year}-\1-\2",
+        regex=True
+    )
+
+    df["날짜"] = pd.to_datetime(raw_date, errors="coerce")
+
     return df
 
 
