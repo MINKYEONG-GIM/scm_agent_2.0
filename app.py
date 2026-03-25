@@ -173,7 +173,7 @@ def forecast_with_gpt(
     shape_label: str,
     weekly_df: pd.DataFrame,
     final_item_df: pd.DataFrame
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, str]:
 
     plot_final_df = final_item_df.dropna(subset=["날짜"]).copy()
 
@@ -204,7 +204,13 @@ def forecast_with_gpt(
 - 도입 / 성장 / 피크 / 성숙 / 쇠퇴 구조 유지
 - 피크 위치는 작년과 비슷해야 함
 - 올해 이미 존재하는 실제 매출 구간은 제외하고, 남은 주차만 예측
-- JSON 배열로 반환
+- JSON으로만 반환
+- forecast와 함께 예측 근거(reason)를 한국어로 상세히 작성
+- reason에는 아래를 반드시 포함
+  - 어떤 근거로 피크/성숙/쇠퇴 구간을 잡았는지(단계 흐름 + 작년 패턴 기반)
+  - 올해 실측(this_year) 구간을 어떻게 해석했는지(상승/하락/정체)
+  - 왜 그 수준의 예측치를 선택했는지(작년 대비 스케일/완만함/보수적/공격적 등)
+  - 데이터 한계(실측 주차 수 부족, 0값 많음 등)가 있으면 명시
 
 아이템명:
 {item_name}
@@ -220,7 +226,8 @@ def forecast_with_gpt(
 
 결과 형식:
 {{
-  "forecast":[1,2,3]
+  "forecast":[1,2,3],
+  "reason":"- ...\\n- ..."
 }}
 """.strip()
 
@@ -236,15 +243,19 @@ def forecast_with_gpt(
                 "forecast": {
                     "type": "array",
                     "items": {"type": "number"}
+                },
+                "reason": {
+                    "type": "string"
                 }
             },
-            "required": ["forecast"],
+            "required": ["forecast", "reason"],
             "additionalProperties": False
         }
     }
 
     result = call_openai_chat_json(messages, json_schema=forecast_schema)
     forecast = result["forecast"]
+    reason = str(result.get("reason", "")).strip()
 
     if this_year_weekly.empty:
         start_date = pd.Timestamp.today().normalize()
@@ -253,10 +264,12 @@ def forecast_with_gpt(
 
     forecast_dates = pd.date_range(start=start_date, periods=len(forecast), freq="W")
 
-    return pd.DataFrame({
+    forecast_df = pd.DataFrame({
         "날짜": forecast_dates,
         "forecast": forecast
     })
+
+    return forecast_df, reason
 
 def classify_shape(item_name: str, monthly_df: pd.DataFrame) -> Tuple[str, str]:
     if monthly_df.empty:
@@ -1247,7 +1260,7 @@ def main():
         }
     )
 
-    forecast_df = forecast_with_gpt(
+    forecast_df, forecast_reason = forecast_with_gpt(
         item_name,
         shape_label,
         weekly_df,
@@ -1284,6 +1297,10 @@ def main():
         st.markdown("### 올해 매출 + AI 예측")
     
         fig2 = go.Figure()
+
+        this_year = int(pd.Timestamp.today().year)
+        year_start = pd.Timestamp(this_year, 1, 1)
+        year_end = pd.Timestamp(this_year, 12, 31)
     
         plot_final_df = final_item_df.dropna(subset=["날짜"]).copy()
     
@@ -1296,6 +1313,15 @@ def main():
         )
     
         real_week = real_week[real_week["판매량"] > 0].copy()
+        real_week = real_week[
+            (real_week["날짜"] >= year_start) & (real_week["날짜"] <= year_end)
+        ].copy()
+
+        forecast_plot_df = forecast_df.copy()
+        if not forecast_plot_df.empty:
+            forecast_plot_df = forecast_plot_df[
+                (forecast_plot_df["날짜"] >= year_start) & (forecast_plot_df["날짜"] <= year_end)
+            ].copy()
     
         if real_week.empty:
             st.warning("올해 매출 데이터가 없습니다. final 시트의 날짜 형식 또는 sku 매칭을 확인하세요.")
@@ -1309,11 +1335,11 @@ def main():
                 )
             )
     
-        if not forecast_df.empty:
+        if not forecast_plot_df.empty:
             fig2.add_trace(
                 go.Scatter(
-                    x=forecast_df["날짜"],
-                    y=forecast_df["forecast"],
+                    x=forecast_plot_df["날짜"],
+                    y=forecast_plot_df["forecast"],
                     name="GPT 예측",
                     mode="lines+markers",
                     line=dict(dash="dash")
@@ -1325,10 +1351,15 @@ def main():
             xaxis_title="날짜",
             yaxis_title="판매량",
             height=650,
-            hovermode="x unified"
+            hovermode="x unified",
+            xaxis=dict(range=[year_start, year_end])
         )
     
         st.plotly_chart(fig2, use_container_width=True)
+
+        if str(forecast_reason).strip():
+            st.markdown("### GPT 예측 근거")
+            st.markdown(forecast_reason)
 
 if __name__ == "__main__":
     main()
