@@ -1360,6 +1360,57 @@ def main():
             compare_table_df.loc[predict_mask, "week_no"].astype(int).map(forecast_week_map).fillna(0).astype(int)
         )
 
+    # -----------------------------
+    # 미래 주차 기초재고 예측
+    # 기초재고(t) = 기초재고(t-1) - 판매량(t-1) + 분배량(t-1) - 출고량(t-1)
+    # -----------------------------
+    compare_table_df = compare_table_df.sort_values("week_no").reset_index(drop=True)
+
+    for col in ["기초재고", "올해 해당 주차 판매량 (장)", "분배량", "출고량(회전 등)"]:
+        if col not in compare_table_df.columns:
+            compare_table_df[col] = 0
+        compare_table_df[col] = pd.to_numeric(compare_table_df[col], errors="coerce").fillna(0).astype(int)
+
+    # 기준이 되는 "마지막 실측 기초재고" 주차를 잡는다(현재 주차까지 중, 기초재고>0인 마지막 주차)
+    anchor_candidates = compare_table_df[
+        (compare_table_df["week_no"].astype(int) <= current_week_no)
+        & (compare_table_df["기초재고"].astype(int) > 0)
+    ]
+    if not anchor_candidates.empty:
+        anchor_week = int(anchor_candidates["week_no"].max())
+    else:
+        anchor_week = None
+
+    base_pred_mask = pd.Series(False, index=compare_table_df.index)
+    if anchor_week is not None:
+        week_list = compare_table_df["week_no"].astype(int).tolist()
+        # anchor_week 이후부터 순차 계산(현재 주차 이후는 예측으로 간주)
+        for i in range(1, len(week_list)):
+            w_prev = int(week_list[i - 1])
+            w_cur = int(week_list[i])
+            if w_cur <= anchor_week:
+                continue
+
+            prev_base = int(compare_table_df.loc[i - 1, "기초재고"])
+            prev_sales = int(compare_table_df.loc[i - 1, "올해 해당 주차 판매량 (장)"])
+            prev_dist = int(compare_table_df.loc[i - 1, "분배량"])
+            prev_ship = int(compare_table_df.loc[i - 1, "출고량(회전 등)"])
+
+            predicted_base = prev_base - prev_sales + prev_dist - prev_ship
+            compare_table_df.loc[i, "기초재고"] = int(predicted_base)
+
+            if w_cur > current_week_no:
+                base_pred_mask.iloc[i] = True
+
+    # -----------------------------
+    # 로스 계산(조건부 표시)
+    # - 기초재고 < 판매량일 때만 표시
+    # - 로스 = 기초재고 - 판매량
+    # -----------------------------
+    sales_col = "올해 해당 주차 판매량 (장)"
+    loss = compare_table_df["기초재고"].astype(int) - compare_table_df[sales_col].astype(int)
+    compare_table_df["로스"] = np.where(compare_table_df["기초재고"].astype(int) < compare_table_df[sales_col].astype(int), loss, 0).astype(int)
+
     display_df = compare_table_df[
         [
             "주차",
@@ -1381,6 +1432,7 @@ def main():
 
         # 미래 주차 예측값: 빨강
         styles.loc[predict_mask, "올해 해당 주차 판매량 (장)"] = "color: #C92A2A; font-weight: 800;"
+        styles.loc[base_pred_mask.values, "기초재고"] = "color: #C92A2A; font-weight: 800;"
         return styles
 
     st.dataframe(
