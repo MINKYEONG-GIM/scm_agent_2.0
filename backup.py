@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import re
 import urllib.error
 import urllib.request
@@ -411,6 +412,57 @@ def load_final_df() -> pd.DataFrame:
     sheets_cfg = get_sheets_config()
     final_sheet = sheets_cfg.get("final") or "final"
     return load_sheet_as_df(final_sheet)
+
+
+@st.cache_data(ttl=300)
+def load_reorder_df() -> pd.DataFrame:
+    sheets_cfg = get_sheets_config()
+    reorder_sheet = sheets_cfg.get("reorder") or "reorder"
+    return load_sheet_as_df(reorder_sheet)
+
+
+def get_reorder_lead_time_days(reorder_df: pd.DataFrame, sku: str) -> Optional[int]:
+    """
+    reorder 시트에서 선택 SKU에 해당하는 lead_time(일)을 반환합니다.
+    헤더가 sku가 중복이면 make_unique_headers로 sku, sku_2 등이 됩니다.
+    """
+    if reorder_df is None or reorder_df.empty:
+        return None
+
+    sku_key = str(sku).strip()
+    if not sku_key:
+        return None
+
+    lt_col = None
+    for c in reorder_df.columns:
+        if str(c).strip().lower() == "lead_time":
+            lt_col = c
+            break
+    if lt_col is None:
+        return None
+
+    sku_cols = [c for c in reorder_df.columns if str(c).strip().lower().startswith("sku")]
+    if not sku_cols:
+        return None
+
+    for col in sku_cols:
+        mask = reorder_df[col].astype(str).str.strip() == sku_key
+        sub = reorder_df.loc[mask]
+        if sub.empty:
+            continue
+        for _, row in sub.iterrows():
+            v = clean_number(row[lt_col])
+            if pd.notna(v):
+                return int(round(float(v)))
+    return None
+
+
+def iso_week_monday_month_day(year: int, week_no: int) -> Optional[Tuple[int, int]]:
+    """해당 연도 ISO 주차의 월요일 날짜를 (월, 일)로 반환합니다."""
+    ts = pd.to_datetime(f"{year}-W{int(week_no):02d}-1", format="%G-W%V-%u", errors="coerce")
+    if pd.isna(ts):
+        return None
+    return int(ts.month), int(ts.day)
 
 
 def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
@@ -1234,6 +1286,12 @@ def main():
     plc_df = load_plc_df()
     final_df = load_final_df()
 
+    try:
+        reorder_df = load_reorder_df()
+    except Exception as e:
+        reorder_df = pd.DataFrame()
+        st.warning(f"reorder 시트를 불러오지 못했습니다: {e}")
+
     if plc_df.empty:
         st.warning("plc db 데이터가 없습니다.")
         return
@@ -1299,10 +1357,9 @@ def main():
         final_item_df = final_item_df[
             final_item_df["plant_name"].astype(str).str.strip() == selected_plant
         ].copy()
-    
-    st.write("selected_sku:", selected_sku)
-    st.write("final_item_df 건수:", len(final_item_df))
-    st.write("날짜 null 개수:", final_item_df["날짜"].isna().sum())
+
+    lead_days = get_reorder_lead_time_days(reorder_df, selected_sku)
+    reorder_top_message = st.empty()
 
     item_name, weekly_df, monthly_df = prepare_plc_item_timeseries(plc_df, selected_item_code)
     shape_label, shape_reason = classify_shape(item_name, monthly_df)
@@ -1426,6 +1483,42 @@ def main():
         prev_loss = cur_loss
         loss_vals.append(cur_loss)
     compare_table_df["로스"] = loss_vals
+
+    if lead_days is None:
+        reorder_top_message.info(
+            "reorder 시트에서 해당 SKU의 리오더 소요일(lead_time)을 찾지 못했습니다."
+        )
+    else:
+        neg_loss = compare_table_df[compare_table_df["로스"].astype(float) < 0]
+        if neg_loss.empty:
+            reorder_top_message.info(
+                "표 기준 예측 기간 내에 로스가 0 미만인 주차가 없어, 리오더 발주 권장 시점을 표시할 수 없습니다."
+            )
+        else:
+            loss_start_week = int(neg_loss.iloc[0]["week_no"])
+            weeks_lead = max(1, math.ceil(float(lead_days) / 7.0))
+            rec_week = loss_start_week - weeks_lead
+            md = iso_week_monday_month_day(this_year, rec_week)
+            if md is None or rec_week < 1:
+                reorder_top_message.warning(
+                    f"로스 발생이 시작되는 주차는 {loss_start_week}주차이며, "
+                    f"리오더 소요 {lead_days}일(약 {weeks_lead}주)을 반영한 권장 주차가 "
+                    f"올해 ISO 주차 범위를 벗어납니다."
+                )
+            else:
+                month_i, day_i = md
+                wm = compare_table_df["week_no"].astype(int)
+                qty = int(
+                    compare_table_df.loc[
+                        (wm >= rec_week) & (wm < rec_week + weeks_lead),
+                        sales_col,
+                    ].sum()
+                )
+                if qty < 1:
+                    qty = max(1, abs(int(float(neg_loss.iloc[0]["로스"]))))
+                reorder_top_message.markdown(
+                    f"**{month_i}월 {day_i}일주차에는 {qty}장 리오더 발주 권장합니다.**"
+                )
 
     display_df = compare_table_df[
         [
