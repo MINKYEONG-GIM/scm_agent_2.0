@@ -1103,12 +1103,69 @@ def extract_item_code_from_sku(sku: str) -> str:
 
 
 def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    final 데이터는 운영 중 컬럼 구조가 바뀔 수 있어
+    - 구버전(final 시트): sku / sku_name / 날짜 / 판매량 (+ plant_name 선택)
+    - 신버전(final DB): CALMONTH ... SSTOC_TMP_AMT (18컬럼)
+
+    이 함수는 어떤 구조가 들어와도 아래 "표준 컬럼"으로 정규화해서 반환합니다.
+    표준 컬럼: sku, sku_name, 날짜, 판매량, plant_name, item_code (+ 선택: 기초재고, 분배량, 출고량(회전 등), 로스)
+    """
     df = final_df.copy()
 
+    # --------------------------
+    # 1) 신버전(final DB) 감지
+    # --------------------------
+    new_cols = {"CALDAY", "PLANT", "MATERIAL", "SALE"}
+    is_new_schema = all(c in df.columns for c in new_cols)
+
+    if is_new_schema:
+        # 신 스키마 -> 표준 스키마로 매핑
+        df = df.copy()
+
+        df["sku"] = df["MATERIAL"].astype(str).str.strip()
+        df["sku_name"] = df.get("MATERIAL", "").astype(str).str.strip()
+        df["plant_name"] = df.get("PLANT", "전체").astype(str).str.strip().replace("", "전체")
+
+        # 판매량은 SALE(판매수량)
+        df["판매량"] = df.get("SALE", 0).apply(clean_number).fillna(0)
+
+        # 날짜는 CALDAY(YYYYMMDD) 기반
+        calday = df["CALDAY"].astype(str).str.strip()
+        # 혹시 float로 들어온 20260301.0 같은 값 방지
+        calday = calday.str.replace(r"\.0$", "", regex=True)
+        df["날짜"] = pd.to_datetime(calday, format="%Y%m%d", errors="coerce")
+
+        # 재고/입고/주문을 기존 화면의 보조 지표로 연결(있으면)
+        # - 기초재고: HSTOC_QTY
+        # - 분배량: IPGO_QTY (입고수량을 '들어온 물량'으로 사용)
+        # - 출고량(회전 등): ORDQTY (발주 수량을 참고값으로 사용; 대부분 0이면 영향 없음)
+        if "HSTOC_QTY" in df.columns:
+            df["기초재고"] = df["HSTOC_QTY"].apply(clean_number)
+        if "IPGO_QTY" in df.columns:
+            df["분배량"] = df["IPGO_QTY"].apply(clean_number)
+        if "ORDQTY" in df.columns:
+            df["출고량(회전 등)"] = df["ORDQTY"].apply(clean_number)
+
+        # item_code는 기존 plc db(아이템코드) 매칭용인데,
+        # 신 sku(MATERIAL)가 영문+숫자 조합일 수 있어 기본은 기존 규칙을 유지하되,
+        # 실패 가능성을 낮추기 위해 비어 있으면 sku로 대체한다.
+        df["item_code"] = df["sku"].apply(extract_item_code_from_sku)
+        df.loc[df["item_code"].astype(str).str.strip() == "", "item_code"] = df["sku"]
+
+        # 기존 코드가 기대하는 컬럼만 남기지는 않고, 원본 컬럼은 그대로 둔다(추후 확장 대비)
+        return df
+
+    # --------------------------
+    # 2) 구버전(final 시트) 처리
+    # --------------------------
     required_cols = ["sku", "sku_name", "날짜", "판매량"]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
-        raise ValueError(f"final 시트 필수 컬럼이 없습니다: {missing}")
+        raise ValueError(
+            f"final 시트 필수 컬럼이 없습니다: {missing}. "
+            f"현재 컬럼: {list(df.columns)}"
+        )
 
     # plant_name은 매장 필터용(없으면 '전체'로 처리)
     if "plant_name" not in df.columns:
