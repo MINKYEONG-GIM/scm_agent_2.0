@@ -1127,8 +1127,18 @@ def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
         df["sku_name"] = df.get("MATERIAL", "").astype(str).str.strip()
         df["plant_name"] = df.get("PLANT", "전체").astype(str).str.strip().replace("", "전체")
 
-        # 판매량은 SALE(판매수량)
-        df["판매량"] = df.get("SALE", 0).apply(clean_number).fillna(0)
+        sale_raw = df["SALE"].apply(clean_number).fillna(0)
+        if "SSTOC_TMP_QTY" in df.columns:
+            sstoc = df["SSTOC_TMP_QTY"].apply(clean_number)
+        else:
+            sstoc = pd.Series(np.nan, index=df.index, dtype=float)
+
+        # SSTOC_TMP_QTY 음수 행: 판매량=|SALE|, 출고량(회전 등)=|SSTOC|-|SALE|
+        # (양수 SSTOC는 분배량으로만 반영, 음수 행의 분배량 증분은 없음)
+        mask_sstoc_neg = sstoc.notna() & (sstoc < 0)
+
+        df["판매량"] = sale_raw.astype(float)
+        df.loc[mask_sstoc_neg, "판매량"] = sale_raw.loc[mask_sstoc_neg].abs()
 
         # 날짜는 CALDAY(YYYYMMDD) 기반
         calday = df["CALDAY"].astype(str).str.strip()
@@ -1138,11 +1148,8 @@ def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
 
         # 재고/입고/주문을 기존 화면의 보조 지표로 연결(있으면)
         # - 기초재고: HSTOC_QTY
-        # - 분배량(입고·재고 증가):
-        #   - IPGO_*: 공식 입고
-        #   - SSTOC_TMP_QTY > 0: 초기 재고 등 IPGO에 없는 증가분(동일 행이면 IPGO와 합산)
-        #     판매 등 SSTOC_TMP_QTY < 0 은 제외(감소분은 SALE로 반영)
-        # - 출고량(회전 등): ORDQTY (발주 참고)
+        # - 분배량: IPGO + SSTOC_TMP_QTY(양수만)
+        # - 출고량(회전 등): 기본 ORDQTY, SSTOC 음수 행은 |SSTOC|-|SALE|
         if "HSTOC_QTY" in df.columns:
             df["기초재고"] = df["HSTOC_QTY"].apply(clean_number)
         ipgo = (
@@ -1150,13 +1157,18 @@ def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
             if "IPGO_QTY" in df.columns
             else pd.Series(0.0, index=df.index, dtype=float)
         )
-        sstoc_in = pd.Series(0.0, index=df.index, dtype=float)
-        if "SSTOC_TMP_QTY" in df.columns:
-            sstoc = df["SSTOC_TMP_QTY"].apply(clean_number).fillna(0)
-            sstoc_in = sstoc.clip(lower=0)
-        df["분배량"] = ipgo + sstoc_in
-        if "ORDQTY" in df.columns:
-            df["출고량(회전 등)"] = df["ORDQTY"].apply(clean_number)
+        sstoc_pos = sstoc.fillna(0).clip(lower=0)
+        df["분배량"] = ipgo.astype(float) + sstoc_pos.astype(float)
+
+        ordqty = (
+            df["ORDQTY"].apply(clean_number).fillna(0)
+            if "ORDQTY" in df.columns
+            else pd.Series(0.0, index=df.index, dtype=float)
+        )
+        df["출고량(회전 등)"] = ordqty.astype(float)
+        df.loc[mask_sstoc_neg, "출고량(회전 등)"] = (
+            sstoc.loc[mask_sstoc_neg].abs() - sale_raw.loc[mask_sstoc_neg].abs()
+        ).astype(float)
 
         # item_code는 기존 plc db(아이템코드) 매칭용인데,
         # 신 sku(MATERIAL)가 영문+숫자 조합일 수 있어 기본은 기존 규칙을 유지하되,
