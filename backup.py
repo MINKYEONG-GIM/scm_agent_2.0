@@ -629,10 +629,10 @@ def get_final_item_options(final_df: pd.DataFrame) -> pd.DataFrame:
 
     # plant_name + sku_name + item_code 기준으로 유니크
     options = (
-        df[["plant_name", "sku_name", "item_code", "sku"]]
+        df[["plant_name", "sku_name", "item_code", "sku", "style_code"]]
         .dropna(subset=["sku_name", "plant_name"])
         .drop_duplicates()
-        .sort_values(["plant_name", "sku_name", "sku"])
+        .sort_values(["plant_name", "style_code", "sku_name", "sku"])
         .reset_index(drop=True)
     )
     return options
@@ -1102,13 +1102,100 @@ def extract_item_code_from_sku(sku: str) -> str:
     return ""
 
 
+def style_code_from_material(material: str) -> str:
+    """final의 MATERIAL(또는 sku) 앞 10자리를 스타일코드로 사용합니다."""
+    s = str(material).strip()
+    return s[:10] if s else ""
+
+
 def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    final 데이터는 운영 중 컬럼 구조가 바뀔 수 있어
+    - 구버전(final 시트): sku / sku_name / 날짜 / 판매량 (+ plant_name 선택)
+    - 신버전(final DB): CALMONTH ... SSTOC_TMP_AMT (18컬럼)
+
+    이 함수는 어떤 구조가 들어와도 아래 "표준 컬럼"으로 정규화해서 반환합니다.
+    표준 컬럼: sku, sku_name, style_code, 날짜, 판매량, plant_name, item_code (+ 선택: 기초재고, 분배량, 출고량(회전 등), 로스)
+    """
     df = final_df.copy()
 
+    # --------------------------
+    # 1) 신버전(final DB) 감지
+    # --------------------------
+    new_cols = {"CALDAY", "PLANT", "MATERIAL", "SALE"}
+    is_new_schema = all(c in df.columns for c in new_cols)
+
+    if is_new_schema:
+        # 신 스키마 -> 표준 스키마로 매핑
+        df = df.copy()
+
+        df["sku"] = df["MATERIAL"].astype(str).str.strip()
+        df["sku_name"] = df.get("MATERIAL", "").astype(str).str.strip()
+        df["plant_name"] = df.get("PLANT", "전체").astype(str).str.strip().replace("", "전체")
+
+        sale_raw = df["SALE"].apply(clean_number).fillna(0)
+        if "SSTOC_TMP_QTY" in df.columns:
+            sstoc = df["SSTOC_TMP_QTY"].apply(clean_number)
+        else:
+            sstoc = pd.Series(np.nan, index=df.index, dtype=float)
+
+        # SSTOC_TMP_QTY 음수 행: 판매량=|SALE|, 출고량(회전 등)=|SSTOC|-|SALE|
+        # (양수 SSTOC는 분배량으로만 반영, 음수 행의 분배량 증분은 없음)
+        mask_sstoc_neg = sstoc.notna() & (sstoc < 0)
+
+        df["판매량"] = sale_raw.astype(float)
+        df.loc[mask_sstoc_neg, "판매량"] = sale_raw.loc[mask_sstoc_neg].abs()
+
+        # 날짜는 CALDAY(YYYYMMDD) 기반
+        calday = df["CALDAY"].astype(str).str.strip()
+        # 혹시 float로 들어온 20260301.0 같은 값 방지
+        calday = calday.str.replace(r"\.0$", "", regex=True)
+        df["날짜"] = pd.to_datetime(calday, format="%Y%m%d", errors="coerce")
+
+        # 재고/입고/주문을 기존 화면의 보조 지표로 연결(있으면)
+        # - 기초재고: HSTOC_QTY
+        # - 분배량: IPGO + SSTOC_TMP_QTY(양수만)
+        # - 출고량(회전 등): 기본 ORDQTY, SSTOC 음수 행은 |SSTOC|-|SALE|
+        if "HSTOC_QTY" in df.columns:
+            df["기초재고"] = df["HSTOC_QTY"].apply(clean_number)
+        ipgo = (
+            df["IPGO_QTY"].apply(clean_number).fillna(0)
+            if "IPGO_QTY" in df.columns
+            else pd.Series(0.0, index=df.index, dtype=float)
+        )
+        sstoc_pos = sstoc.fillna(0).clip(lower=0)
+        df["분배량"] = ipgo.astype(float) + sstoc_pos.astype(float)
+
+        ordqty = (
+            df["ORDQTY"].apply(clean_number).fillna(0)
+            if "ORDQTY" in df.columns
+            else pd.Series(0.0, index=df.index, dtype=float)
+        )
+        df["출고량(회전 등)"] = ordqty.astype(float)
+        df.loc[mask_sstoc_neg, "출고량(회전 등)"] = (
+            sstoc.loc[mask_sstoc_neg].abs() - sale_raw.loc[mask_sstoc_neg].abs()
+        ).astype(float)
+
+        # item_code는 기존 plc db(아이템코드) 매칭용인데,
+        # 신 sku(MATERIAL)가 영문+숫자 조합일 수 있어 기본은 기존 규칙을 유지하되,
+        # 실패 가능성을 낮추기 위해 비어 있으면 sku로 대체한다.
+        df["item_code"] = df["sku"].apply(extract_item_code_from_sku)
+        df.loc[df["item_code"].astype(str).str.strip() == "", "item_code"] = df["sku"]
+        df["style_code"] = df["sku"].map(style_code_from_material)
+
+        # 기존 코드가 기대하는 컬럼만 남기지는 않고, 원본 컬럼은 그대로 둔다(추후 확장 대비)
+        return df
+
+    # --------------------------
+    # 2) 구버전(final 시트) 처리
+    # --------------------------
     required_cols = ["sku", "sku_name", "날짜", "판매량"]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
-        raise ValueError(f"final 시트 필수 컬럼이 없습니다: {missing}")
+        raise ValueError(
+            f"final 시트 필수 컬럼이 없습니다: {missing}. "
+            f"현재 컬럼: {list(df.columns)}"
+        )
 
     # plant_name은 매장 필터용(없으면 '전체'로 처리)
     if "plant_name" not in df.columns:
@@ -1147,6 +1234,8 @@ def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     df["날짜"] = pd.to_datetime(raw_date, errors="coerce")
+
+    df["style_code"] = df["sku"].map(style_code_from_material)
 
     return df
 
@@ -1263,6 +1352,19 @@ def build_year_compare_table(
     # last_year_ratio_pct 는 이미 0~100(%) 단위로 계산됨
     result["작년의 해당 주차 판매비중(%)"] = result["last_year_ratio_pct"].round(1)
 
+    # 일부 데이터 소스에서는 아래 컬럼이 없을 수 있어(스키마 변경/부분 적재),
+    # 표 생성 단계에서 항상 존재하도록 0으로 보정한다.
+    ensure_cols_defaults = {
+        "기초재고": 0,
+        "올해 해당 주차 판매량 (장)": 0,
+        "분배량": 0,
+        "출고량(회전 등)": 0,
+        "로스": 0,
+    }
+    for c, default_v in ensure_cols_defaults.items():
+        if c not in result.columns:
+            result[c] = default_v
+
     result = result[
         [
             "SKU",
@@ -1335,7 +1437,7 @@ def main():
         axis=1
     )
 
-    col_a, col_b = st.columns([1, 3])
+    col_a, col_b, col_c = st.columns([1, 1, 2])
 
     with col_a:
         plant_values = options_df["plant_name"].dropna().astype(str).str.strip()
@@ -1347,10 +1449,30 @@ def main():
             options=plant_options
         )
 
+    plant_filtered = options_df.copy()
+    if selected_plant != "전체":
+        plant_filtered = plant_filtered[plant_filtered["plant_name"] == selected_plant].copy()
+
+    style_vals = plant_filtered["style_code"].dropna().astype(str).str.strip()
+    style_vals = style_vals[style_vals != ""]
+    style_options = ["전체"] + sorted(style_vals.unique().tolist())
+
     with col_b:
-        filtered_options_df = options_df.copy()
-        if selected_plant != "전체":
-            filtered_options_df = filtered_options_df[filtered_options_df["plant_name"] == selected_plant].copy()
+        selected_style = st.selectbox(
+            "스타일코드 (MATERIAL 앞 10자리)",
+            options=style_options,
+        )
+
+    with col_c:
+        filtered_options_df = plant_filtered.copy()
+        if selected_style != "전체":
+            filtered_options_df = filtered_options_df[
+                filtered_options_df["style_code"].astype(str).str.strip() == selected_style
+            ].copy()
+
+        if filtered_options_df.empty:
+            st.warning("선택한 매장·스타일코드에 해당하는 상품이 없습니다.")
+            return
 
         selected_option_id = st.selectbox(
             "개별 차트 확인할 상품",
@@ -1406,10 +1528,19 @@ def main():
     # -----------------------------
     # 주차별 작년 비중 / 올해 판매량 비교표
     # - 미래 주차(현재 주차 이후)는 GPT 예측값으로 채우고 빨간색 표시
+    # - 주차(week_no)는 항상 오름차순 고정(ISO 주차 기준)
     # -----------------------------
-    st.markdown("### 주차별 작년 비중 / 올해 판매량 비교표")
-
     current_week_no = int(pd.Timestamp.today().isocalendar().week)
+
+    title_col, btn_col = st.columns([4, 1])
+    with title_col:
+        st.markdown("### 주차별 작년 비중 / 올해 판매량 비교표")
+    with btn_col:
+        if st.button("이번주로 가기", use_container_width=True):
+            st.info(
+                f"이번 주는 **{format_calendar_week_label(this_year, current_week_no)}** 입니다. "
+                "표는 주차 오름차순이며, 해당 행은 노란색으로 표시됩니다."
+            )
 
     forecast_week_map = {}
     if not forecast_df.empty and "날짜" in forecast_df.columns and "forecast" in forecast_df.columns:
@@ -1425,7 +1556,7 @@ def main():
                 )
 
     compare_table_df = compare_table_df.copy()
-    compare_table_df = compare_table_df.sort_values("week_no").reset_index(drop=True)
+    compare_table_df = compare_table_df.sort_values("week_no", ascending=True, kind="mergesort").reset_index(drop=True)
 
     is_future_week = compare_table_df["week_no"].astype(int) > current_week_no
     has_forecast = compare_table_df["week_no"].astype(int).map(lambda w: w in forecast_week_map)
@@ -1446,36 +1577,30 @@ def main():
             compare_table_df[col] = 0
         compare_table_df[col] = pd.to_numeric(compare_table_df[col], errors="coerce").fillna(0).astype(int)
 
-    # 기준이 되는 "마지막 실측 기초재고" 주차를 잡는다(현재 주차까지 중, 기초재고>0인 마지막 주차)
-    anchor_candidates = compare_table_df[
-        (compare_table_df["week_no"].astype(int) <= current_week_no)
-        & (compare_table_df["기초재고"].astype(int) > 0)
-    ]
-    if not anchor_candidates.empty:
-        anchor_week = int(anchor_candidates["week_no"].max())
-    else:
-        anchor_week = None
-
+    # 기초재고 롤링 계산
+    # - 실측 기초재고가 있으면 그 주차 값은 존중(현재 주차 이하 + 값이 0이 아닌 경우)
+    # - 없으면 첫 주차는 현재 값(대개 0)에서 시작해, 규칙대로 모든 주차를 순차 계산
     base_pred_mask = pd.Series(False, index=compare_table_df.index)
-    if anchor_week is not None:
-        week_list = compare_table_df["week_no"].astype(int).tolist()
-        # anchor_week 이후부터 순차 계산(현재 주차 이후는 예측으로 간주)
-        for i in range(1, len(week_list)):
-            w_prev = int(week_list[i - 1])
-            w_cur = int(week_list[i])
-            if w_cur <= anchor_week:
-                continue
+    week_list = compare_table_df["week_no"].astype(int).tolist()
 
-            prev_base = int(compare_table_df.loc[i - 1, "기초재고"])
-            prev_sales = int(compare_table_df.loc[i - 1, "올해 해당 주차 판매량 (장)"])
-            prev_dist = int(compare_table_df.loc[i - 1, "분배량"])
-            prev_ship = int(compare_table_df.loc[i - 1, "출고량(회전 등)"])
+    for i in range(1, len(week_list)):
+        w_cur = int(week_list[i])
 
-            predicted_base = prev_base - prev_sales + prev_dist - prev_ship
-            compare_table_df.loc[i, "기초재고"] = int(predicted_base)
+        # 실측 기초재고가 있는 주차는 덮어쓰지 않음(0이 아닌 경우만)
+        observed_base = int(compare_table_df.loc[i, "기초재고"])
+        if (w_cur <= current_week_no) and (observed_base != 0):
+            continue
 
-            if w_cur > current_week_no:
-                base_pred_mask.iloc[i] = True
+        prev_base = int(compare_table_df.loc[i - 1, "기초재고"])
+        prev_sales = int(compare_table_df.loc[i - 1, "올해 해당 주차 판매량 (장)"])
+        prev_dist = int(compare_table_df.loc[i - 1, "분배량"])
+        prev_ship = int(compare_table_df.loc[i - 1, "출고량(회전 등)"])
+
+        predicted_base = prev_base - prev_sales + prev_dist - prev_ship
+        compare_table_df.loc[i, "기초재고"] = int(predicted_base)
+
+        if w_cur > current_week_no:
+            base_pred_mask.iloc[i] = True
 
     # 기초재고는 음수일 수 없음(표시는 0). 롤링·로스 판단은 클립 전 값(base_raw) 사용.
     sales_col = "올해 해당 주차 판매량 (장)"
@@ -1555,9 +1680,10 @@ def main():
     def _style_compare_table(_):
         styles = pd.DataFrame("", index=display_df.index, columns=display_df.columns)
 
-        # 현재 주차: 강조(노랑)
-        mask_current = compare_table_df["week_no"].astype(int) == current_week_no
-        styles.loc[mask_current, "올해 해당 주차 판매량 (장)"] = "background-color: #FFF3BF; font-weight: 700;"
+        # 현재 주차: 강조(노랑) — '주차' 표시 라벨과 ISO 주차 라벨이 일치하는 행
+        current_week_label = format_calendar_week_label(this_year, int(current_week_no))
+        mask_current = display_df["주차"].astype(str) == str(current_week_label)
+        styles.loc[mask_current, :] = "background-color: #FFF3BF; font-weight: 700;"
 
         # 미래 주차 예측값: 빨강
         styles.loc[predict_mask, "올해 해당 주차 판매량 (장)"] = "color: #C92A2A; font-weight: 800;"
