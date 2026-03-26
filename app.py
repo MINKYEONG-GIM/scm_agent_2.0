@@ -1568,36 +1568,30 @@ def main():
             compare_table_df[col] = 0
         compare_table_df[col] = pd.to_numeric(compare_table_df[col], errors="coerce").fillna(0).astype(int)
 
-    # 기준이 되는 "마지막 실측 기초재고" 주차를 잡는다(현재 주차까지 중, 기초재고>0인 마지막 주차)
-    anchor_candidates = compare_table_df[
-        (compare_table_df["week_no"].astype(int) <= current_week_no)
-        & (compare_table_df["기초재고"].astype(int) > 0)
-    ]
-    if not anchor_candidates.empty:
-        anchor_week = int(anchor_candidates["week_no"].max())
-    else:
-        anchor_week = None
-
+    # 기초재고 롤링 계산
+    # - 실측 기초재고가 있으면 그 주차 값은 존중(현재 주차 이하 + 값이 0이 아닌 경우)
+    # - 없으면 첫 주차는 현재 값(대개 0)에서 시작해, 규칙대로 모든 주차를 순차 계산
     base_pred_mask = pd.Series(False, index=compare_table_df.index)
-    if anchor_week is not None:
-        week_list = compare_table_df["week_no"].astype(int).tolist()
-        # anchor_week 이후부터 순차 계산(현재 주차 이후는 예측으로 간주)
-        for i in range(1, len(week_list)):
-            w_prev = int(week_list[i - 1])
-            w_cur = int(week_list[i])
-            if w_cur <= anchor_week:
-                continue
+    week_list = compare_table_df["week_no"].astype(int).tolist()
 
-            prev_base = int(compare_table_df.loc[i - 1, "기초재고"])
-            prev_sales = int(compare_table_df.loc[i - 1, "올해 해당 주차 판매량 (장)"])
-            prev_dist = int(compare_table_df.loc[i - 1, "분배량"])
-            prev_ship = int(compare_table_df.loc[i - 1, "출고량(회전 등)"])
+    for i in range(1, len(week_list)):
+        w_cur = int(week_list[i])
 
-            predicted_base = prev_base - prev_sales + prev_dist - prev_ship
-            compare_table_df.loc[i, "기초재고"] = int(predicted_base)
+        # 실측 기초재고가 있는 주차는 덮어쓰지 않음(0이 아닌 경우만)
+        observed_base = int(compare_table_df.loc[i, "기초재고"])
+        if (w_cur <= current_week_no) and (observed_base != 0):
+            continue
 
-            if w_cur > current_week_no:
-                base_pred_mask.iloc[i] = True
+        prev_base = int(compare_table_df.loc[i - 1, "기초재고"])
+        prev_sales = int(compare_table_df.loc[i - 1, "올해 해당 주차 판매량 (장)"])
+        prev_dist = int(compare_table_df.loc[i - 1, "분배량"])
+        prev_ship = int(compare_table_df.loc[i - 1, "출고량(회전 등)"])
+
+        predicted_base = prev_base - prev_sales + prev_dist - prev_ship
+        compare_table_df.loc[i, "기초재고"] = int(predicted_base)
+
+        if w_cur > current_week_no:
+            base_pred_mask.iloc[i] = True
 
     # 기초재고는 음수일 수 없음(표시는 0). 롤링·로스 판단은 클립 전 값(base_raw) 사용.
     sales_col = "올해 해당 주차 판매량 (장)"
