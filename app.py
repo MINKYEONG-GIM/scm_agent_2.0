@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import re
 import urllib.error
 import urllib.request
@@ -454,6 +455,14 @@ def get_reorder_lead_time_days(reorder_df: pd.DataFrame, sku: str) -> Optional[i
             if pd.notna(v):
                 return int(round(float(v)))
     return None
+
+
+def iso_week_monday_month_day(year: int, week_no: int) -> Optional[Tuple[int, int]]:
+    """해당 연도 ISO 주차의 월요일 날짜를 (월, 일)로 반환합니다."""
+    ts = pd.to_datetime(f"{year}-W{int(week_no):02d}-1", format="%G-W%V-%u", errors="coerce")
+    if pd.isna(ts):
+        return None
+    return int(ts.month), int(ts.day)
 
 
 def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
@@ -1350,14 +1359,7 @@ def main():
         ].copy()
 
     lead_days = get_reorder_lead_time_days(reorder_df, selected_sku)
-    if lead_days is not None:
-        st.markdown(
-            f"**해당 SKU의 리오더 소요일은 {lead_days}일 입니다.**"
-        )
-    else:
-        st.info(
-            "reorder 시트에서 해당 SKU의 리오더 소요일(lead_time)을 찾지 못했습니다."
-        )
+    reorder_top_message = st.empty()
 
     item_name, weekly_df, monthly_df = prepare_plc_item_timeseries(plc_df, selected_item_code)
     shape_label, shape_reason = classify_shape(item_name, monthly_df)
@@ -1481,6 +1483,42 @@ def main():
         prev_loss = cur_loss
         loss_vals.append(cur_loss)
     compare_table_df["로스"] = loss_vals
+
+    if lead_days is None:
+        reorder_top_message.info(
+            "reorder 시트에서 해당 SKU의 리오더 소요일(lead_time)을 찾지 못했습니다."
+        )
+    else:
+        neg_loss = compare_table_df[compare_table_df["로스"].astype(float) < 0]
+        if neg_loss.empty:
+            reorder_top_message.info(
+                "표 기준 예측 기간 내에 로스가 0 미만인 주차가 없어, 리오더 발주 권장 시점을 표시할 수 없습니다."
+            )
+        else:
+            loss_start_week = int(neg_loss.iloc[0]["week_no"])
+            weeks_lead = max(1, math.ceil(float(lead_days) / 7.0))
+            rec_week = loss_start_week - weeks_lead
+            md = iso_week_monday_month_day(this_year, rec_week)
+            if md is None or rec_week < 1:
+                reorder_top_message.warning(
+                    f"로스 발생이 시작되는 주차는 {loss_start_week}주차이며, "
+                    f"리오더 소요 {lead_days}일(약 {weeks_lead}주)을 반영한 권장 주차가 "
+                    f"올해 ISO 주차 범위를 벗어납니다."
+                )
+            else:
+                month_i, day_i = md
+                wm = compare_table_df["week_no"].astype(int)
+                qty = int(
+                    compare_table_df.loc[
+                        (wm >= rec_week) & (wm < rec_week + weeks_lead),
+                        sales_col,
+                    ].sum()
+                )
+                if qty < 1:
+                    qty = max(1, abs(int(float(neg_loss.iloc[0]["로스"]))))
+                reorder_top_message.markdown(
+                    f"**{month_i}월 {day_i}일주차에는 {qty}장 리오더 발주 권장합니다.**"
+                )
 
     display_df = compare_table_df[
         [
