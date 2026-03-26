@@ -1609,7 +1609,7 @@ def main():
         st.warning("final에서 선택 가능한 SKU 데이터가 없습니다.")
         return
 
-    st.markdown("## 리오더 확인 대시보드 (스타일/SKU 전체)")
+    st.markdown("## 리오더 확인 대시보드 ")
 
     # SKU 단위로 유니크(매장 필터 제거)
     sku_option_df = (
@@ -1756,6 +1756,7 @@ def main():
 
     # 섹터별 출력(모든 SKU가 4개 중 하나에 반드시 포함)
     st.markdown("### 1) 확인 시급 스타일")
+    st.caption("마감까지 2주 이하(또는 lead_time 누락으로 즉시 확인 필요)인 스타일/SKU와 권장 수량(장)")
     df1 = result_df[result_df["섹터"].astype(str).str.startswith("1.")].copy()
     st.dataframe(
         df1[["style_code", "sku", "sku_name", "lead_time_days", "reorder_deadline", "weeks_left", "reorder_qty", "loss_start_week"]],
@@ -1764,6 +1765,7 @@ def main():
     )
 
     st.markdown("### 2) 후순위 확인 스타일")
+    st.caption("마감까지 3~5주 남아 있어, 선행 섹터 처리 후 확인하면 되는 스타일/SKU")
     df2 = result_df[result_df["섹터"].astype(str).str.startswith("2.")].copy()
     st.dataframe(
         df2[["style_code", "sku", "sku_name", "lead_time_days", "reorder_deadline", "weeks_left", "reorder_qty", "loss_start_week"]],
@@ -1772,6 +1774,7 @@ def main():
     )
 
     st.markdown("### 3) 6주 이상 후 리오더 스타일")
+    st.caption("마감까지 6주 이상 남았거나, 예측기간 내 로스가 없어 당장 리오더 우선순위가 낮은 스타일/SKU")
     df3 = result_df[result_df["섹터"].astype(str).str.startswith("3.")].copy()
     st.dataframe(
         df3[["style_code", "sku", "sku_name", "lead_time_days", "reorder_deadline", "weeks_left", "reorder_qty", "loss_start_week"]],
@@ -1780,29 +1783,13 @@ def main():
     )
 
     st.markdown("### 4) 확인 불필요 스타일(쇠퇴기)")
+    st.caption("현재 주차 기준 단계가 '쇠퇴'로 분류되어, 추가 발주를 보지 않는 스타일/SKU")
     df4 = result_df[result_df["섹터"].astype(str).str.startswith("4.")].copy()
     st.dataframe(
         df4[["style_code", "sku", "sku_name", "current_stage", "shape_label"]],
         use_container_width=True,
         hide_index=True,
     )
-
-    with st.expander("분류/계산 로직(요약) 보기", expanded=False):
-        st.markdown(
-            """
-- **섹터 분류(모든 SKU가 정확히 1개 섹터로 배정)**:
-  - `현재 단계(current_stage) == 쇠퇴` → **4. 확인 불필요 스타일**
-  - 그 외:
-    - `lead_time(lead_days)`가 없음 → **1. 확인 시급(리드타임 확인 필요)**
-    - 로스가 예측기간에 발생하지 않음(마감일/수량 산출 불가) → **3. 6주 이상 후 리오더**
-    - 마감일이 계산되면 \((deadline - today)\) 주차 기준:
-      - **≤ 2주**: 1. 확인 시급
-      - **3~5주**: 2. 후순위 확인
-      - **≥ 6주**: 3. 6주 이상 후 리오더
-
-- **리오더 수량**: `lead_time`을 주 단위로 환산한 기간(약 \(ceil(lead\_time/7)\)주) 동안의 **예측 판매량 합**.
-            """.strip()
-        )
 
     return
 
