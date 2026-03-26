@@ -465,6 +465,20 @@ def iso_week_monday_month_day(year: int, week_no: int) -> Optional[Tuple[int, in
     return int(ts.month), int(ts.day)
 
 
+def format_calendar_week_label(calendar_year: int, iso_week_no: int) -> str:
+    """
+    기준 연도(예: 2026)의 ISO 주차를 '26년 M월 W주차'로 표시합니다.
+    W는 해당 달에서 월요일이 속한 '몇 번째 주'(1~5)입니다.
+    """
+    ts = pd.to_datetime(f"{calendar_year}-W{int(iso_week_no):02d}-1", format="%G-W%V-%u", errors="coerce")
+    if pd.isna(ts):
+        return f"{iso_week_no}주차"
+    yy = calendar_year % 100
+    m = int(ts.month)
+    week_in_month = (int(ts.day) - 1) // 7 + 1
+    return f"{yy:02d}년 {m}월 {week_in_month}주차"
+
+
 def load_sheet_as_df(worksheet_name: str) -> pd.DataFrame:
     """
     구글시트의 특정 워크시트를 DataFrame으로 읽습니다.
@@ -1141,11 +1155,13 @@ def build_year_compare_table(
     weekly_df: pd.DataFrame,
     final_item_df: pd.DataFrame,
     selected_sku: str,
-    selected_sku_name: str
+    selected_sku_name: str,
+    week_label_year: int,
 ) -> pd.DataFrame:
     """
     표 컬럼:
     SKU / SKU_NAME / 주차 / 작년의 해당 주차 판매비중(%) / 올해 해당 주차 판매량 (장)
+    week_label_year: 주차 열을 'YY년 M월 W주차'로 만들 때 사용할 기준 연도(보통 올해).
     """
 
     # -----------------------------
@@ -1165,8 +1181,9 @@ def build_year_compare_table(
     else:
         last_year_df["last_year_ratio_pct"] = 0.0
 
-    # 주차 라벨: 예) 8주차
-    last_year_df["주차"] = last_year_df["week_no"].astype(str) + "주차"
+    last_year_df["주차"] = last_year_df["week_no"].astype(int).map(
+        lambda w: format_calendar_week_label(week_label_year, int(w))
+    )
 
     # -----------------------------
     # 2) 올해 주차별 지표 계산
@@ -1361,6 +1378,8 @@ def main():
     lead_days = get_reorder_lead_time_days(reorder_df, selected_sku)
     reorder_top_message = st.empty()
 
+    this_year = int(pd.Timestamp.today().year)
+
     item_name, weekly_df, monthly_df = prepare_plc_item_timeseries(plc_df, selected_item_code)
     shape_label, shape_reason = classify_shape(item_name, monthly_df)
     weekly_df = classify_weekly_stages_by_shape(weekly_df, shape_label)
@@ -1369,7 +1388,8 @@ def main():
         weekly_df=weekly_df,
         final_item_df=final_item_df,
         selected_sku=selected_sku,
-        selected_sku_name=selected_sku_name
+        selected_sku_name=selected_sku_name,
+        week_label_year=this_year,
     )
 
     try:
@@ -1389,7 +1409,6 @@ def main():
     # -----------------------------
     st.markdown("### 주차별 작년 비중 / 올해 판매량 비교표")
 
-    this_year = int(pd.Timestamp.today().year)
     current_week_no = int(pd.Timestamp.today().isocalendar().week)
 
     forecast_week_map = {}
@@ -1498,15 +1517,15 @@ def main():
             loss_start_week = int(neg_loss.iloc[0]["week_no"])
             weeks_lead = max(1, math.ceil(float(lead_days) / 7.0))
             rec_week = loss_start_week - weeks_lead
-            md = iso_week_monday_month_day(this_year, rec_week)
-            if md is None or rec_week < 1:
+            if rec_week < 1 or iso_week_monday_month_day(this_year, rec_week) is None:
+                loss_lbl = format_calendar_week_label(this_year, loss_start_week)
                 reorder_top_message.warning(
-                    f"로스 발생이 시작되는 주차는 {loss_start_week}주차이며, "
+                    f"로스 발생이 시작되는 주차는 {loss_lbl}이며, "
                     f"리오더 소요 {lead_days}일(약 {weeks_lead}주)을 반영한 권장 주차가 "
                     f"올해 ISO 주차 범위를 벗어납니다."
                 )
             else:
-                month_i, day_i = md
+                rec_label = format_calendar_week_label(this_year, rec_week)
                 wm = compare_table_df["week_no"].astype(int)
                 qty = int(
                     compare_table_df.loc[
@@ -1517,7 +1536,7 @@ def main():
                 if qty < 1:
                     qty = max(1, abs(int(float(neg_loss.iloc[0]["로스"]))))
                 reorder_top_message.markdown(
-                    f"**{month_i}월 {day_i}일주차에는 {qty}장 리오더 발주 권장합니다.**"
+                    f"**{rec_label}에는 {qty}장 리오더 발주 권장합니다.**"
                 )
 
     display_df = compare_table_df[
