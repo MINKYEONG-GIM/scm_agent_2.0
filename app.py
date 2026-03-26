@@ -1320,6 +1320,19 @@ def build_year_compare_table(
     # last_year_ratio_pct 는 이미 0~100(%) 단위로 계산됨
     result["작년의 해당 주차 판매비중(%)"] = result["last_year_ratio_pct"].round(1)
 
+    # 일부 데이터 소스에서는 아래 컬럼이 없을 수 있어(스키마 변경/부분 적재),
+    # 표 생성 단계에서 항상 존재하도록 0으로 보정한다.
+    ensure_cols_defaults = {
+        "기초재고": 0,
+        "올해 해당 주차 판매량 (장)": 0,
+        "분배량": 0,
+        "출고량(회전 등)": 0,
+        "로스": 0,
+    }
+    for c, default_v in ensure_cols_defaults.items():
+        if c not in result.columns:
+            result[c] = default_v
+
     result = result[
         [
             "SKU",
