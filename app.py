@@ -1628,11 +1628,9 @@ def main():
     style_vals = style_vals[style_vals != ""]
     style_options = ["전체"] + sorted(style_vals.unique().tolist())
 
-    col_a, col_b = st.columns([1, 2])
+    col_a, _ = st.columns([1, 2])
     with col_a:
         selected_style = st.selectbox("스타일코드 필터", options=style_options)
-    with col_b:
-        gpt_toggle = st.checkbox("월별 형태 판별에 GPT 사용(느려질 수 있음)", value=False)
 
     if selected_style != "전체":
         sku_option_df = sku_option_df[sku_option_df["style_code"].astype(str).str.strip() == selected_style].copy()
@@ -1666,7 +1664,7 @@ def main():
 
         try:
             item_name, weekly_df, monthly_df = prepare_plc_item_timeseries(plc_df, item_code)
-            shape_label, shape_reason = classify_shape(item_name, monthly_df, use_gpt=bool(gpt_toggle))
+            shape_label, shape_reason = classify_shape(item_name, monthly_df, use_gpt=True)
             weekly_df_staged = classify_weekly_stages_by_shape(weekly_df, shape_label)
             current_stage = get_current_stage_label(weekly_df_staged, current_week_no)
         except Exception as e:
