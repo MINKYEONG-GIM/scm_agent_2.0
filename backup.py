@@ -1608,14 +1608,21 @@ def main():
     compare_table_df["기초재고"] = np.maximum(base_raw, 0).astype(int)
 
     # -----------------------------
-    # 로스 계산
-    # - 기초재고(raw) > 0: 기존과 같이 재고 < 판매일 때만 로스 = 재고 - 판매
-    # - 기초재고(raw) <= 0: 이번주 로스 = 지난주 로스 - 이번주 판매량
+    # 로스 계산 (미래 주차 예측 전용)
+    # - 지난·현재 주차(week_no <= current_week_no): 항상 0 (실적 구간에는 표시 안 함)
+    # - 미래 주차만: 기초재고(raw) 기반 예측 로스 누적
+    #   - raw > 0 & raw < 판매: 로스 = raw - 판매
+    #   - raw <= 0: 로스 = 지난주 로스 - 이번주 판매
     # -----------------------------
     n_rows = len(compare_table_df)
     loss_vals = []
     prev_loss = 0
     for i in range(n_rows):
+        w = int(compare_table_df.loc[i, "week_no"])
+        if w <= current_week_no:
+            loss_vals.append(0)
+            continue
+
         raw_b = int(base_raw.iloc[i])
         sales = int(compare_table_df.loc[i, sales_col])
         if raw_b <= 0:
@@ -1633,7 +1640,10 @@ def main():
             "reorder 시트에서 해당 SKU의 리오더 소요일(lead_time)을 찾지 못했습니다."
         )
     else:
-        neg_loss = compare_table_df[compare_table_df["로스"].astype(float) < 0]
+        neg_loss = compare_table_df[
+            (compare_table_df["week_no"].astype(int) > current_week_no)
+            & (compare_table_df["로스"].astype(float) < 0)
+        ]
         if neg_loss.empty:
             reorder_top_message.info(
                 "표 기준 예측 기간 내에 로스가 0 미만인 주차가 없어, 리오더 발주 권장 시점을 표시할 수 없습니다."
