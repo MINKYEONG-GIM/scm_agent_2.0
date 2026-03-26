@@ -1138,12 +1138,23 @@ def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
 
         # 재고/입고/주문을 기존 화면의 보조 지표로 연결(있으면)
         # - 기초재고: HSTOC_QTY
-        # - 분배량: IPGO_QTY (입고수량을 '들어온 물량'으로 사용)
-        # - 출고량(회전 등): ORDQTY (발주 수량을 참고값으로 사용; 대부분 0이면 영향 없음)
+        # - 분배량(입고·재고 증가):
+        #   - IPGO_*: 공식 입고
+        #   - SSTOC_TMP_QTY > 0: 초기 재고 등 IPGO에 없는 증가분(동일 행이면 IPGO와 합산)
+        #     판매 등 SSTOC_TMP_QTY < 0 은 제외(감소분은 SALE로 반영)
+        # - 출고량(회전 등): ORDQTY (발주 참고)
         if "HSTOC_QTY" in df.columns:
             df["기초재고"] = df["HSTOC_QTY"].apply(clean_number)
-        if "IPGO_QTY" in df.columns:
-            df["분배량"] = df["IPGO_QTY"].apply(clean_number)
+        ipgo = (
+            df["IPGO_QTY"].apply(clean_number).fillna(0)
+            if "IPGO_QTY" in df.columns
+            else pd.Series(0.0, index=df.index, dtype=float)
+        )
+        sstoc_in = pd.Series(0.0, index=df.index, dtype=float)
+        if "SSTOC_TMP_QTY" in df.columns:
+            sstoc = df["SSTOC_TMP_QTY"].apply(clean_number).fillna(0)
+            sstoc_in = sstoc.clip(lower=0)
+        df["분배량"] = ipgo + sstoc_in
         if "ORDQTY" in df.columns:
             df["출고량(회전 등)"] = df["ORDQTY"].apply(clean_number)
 
