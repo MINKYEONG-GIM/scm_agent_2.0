@@ -1624,50 +1624,178 @@ def main():
             qty = max(1, abs(int(float(neg_loss.iloc[0]["로스"]))))
         return int(qty)
 
-    # 매장별 추가 필요 수량 산출(계산방식 유지, UI만 변경)
-    plant_list = (
-        final_item_all_plants_df["plant_name"].dropna().astype(str).str.strip().replace("", "전체").unique().tolist()
-        if "plant_name" in final_item_all_plants_df.columns
-        else ["전체"]
-    )
-    plant_list = sorted([p for p in plant_list if p], key=lambda x: (x == "전체", x))
+    def compute_reorder_summary(final_df_scope: pd.DataFrame) -> dict:
+        """
+        기존 계산 흐름을 유지하면서, 화면 표시는 아래 값만 만들기:
+        - deadline_date: 로스 시작(해당 주 월요일) - lead_time(일)
+        - qty: 리오더 권장 수량(장)
+        """
+        if lead_days is None:
+            return {"deadline_date": None, "qty": 0, "loss_start_week": None}
 
-    plant_rows = []
-    for plant in plant_list:
-        plant_df = final_item_all_plants_df.copy()
-        if "plant_name" in plant_df.columns:
-            plant_df = plant_df[plant_df["plant_name"].astype(str).str.strip().replace("", "전체") == plant].copy()
-        qty = compute_reorder_qty_for_plant(plant_df)
-        plant_rows.append({"매장": plant, "추가 필요 수량(장)": int(qty)})
+        compare_table_df_local = build_year_compare_table(
+            weekly_df=weekly_df,
+            final_item_df=final_df_scope,
+            selected_sku=selected_sku,
+            selected_sku_name=selected_sku_name,
+            week_label_year=this_year,
+        )
 
-    plant_need_df = pd.DataFrame(plant_rows)
-    if not plant_need_df.empty:
-        plant_need_df["추가 필요 수량(장)"] = pd.to_numeric(plant_need_df["추가 필요 수량(장)"], errors="coerce").fillna(0).astype(int)
-        total_need_qty = int(plant_need_df["추가 필요 수량(장)"].sum())
-    else:
-        total_need_qty = 0
+        try:
+            forecast_df_local = forecast_with_gpt(
+                item_name,
+                shape_label,
+                weekly_df,
+                final_df_scope,
+            )
+        except Exception:
+            forecast_df_local = pd.DataFrame(columns=["날짜", "forecast"])
+
+        current_week_no_local = int(pd.Timestamp.today().isocalendar().week)
+        sales_col = "올해 해당 주차 판매량 (장)"
+
+        forecast_week_map = {}
+        if not forecast_df_local.empty and "날짜" in forecast_df_local.columns and "forecast" in forecast_df_local.columns:
+            tmp_fc = forecast_df_local.dropna(subset=["날짜"]).copy()
+            if not tmp_fc.empty:
+                tmp_fc["year"] = tmp_fc["날짜"].dt.isocalendar().year.astype(int)
+                tmp_fc = tmp_fc[tmp_fc["year"] == this_year].copy()
+                if not tmp_fc.empty:
+                    tmp_fc["week_no"] = tmp_fc["날짜"].dt.isocalendar().week.astype(int)
+                    tmp_fc["forecast"] = pd.to_numeric(tmp_fc["forecast"], errors="coerce").fillna(0)
+                    forecast_week_map = (
+                        tmp_fc.groupby("week_no")["forecast"].sum().round().astype(int).to_dict()
+                    )
+
+        compare_table_df_local = compare_table_df_local.copy()
+        compare_table_df_local = compare_table_df_local.sort_values("week_no", ascending=True, kind="mergesort").reset_index(drop=True)
+        is_future_week = compare_table_df_local["week_no"].astype(int) > current_week_no_local
+        has_forecast = compare_table_df_local["week_no"].astype(int).map(lambda w: w in forecast_week_map)
+        predict_mask = is_future_week & has_forecast
+
+        if predict_mask.any():
+            compare_table_df_local.loc[predict_mask, sales_col] = (
+                compare_table_df_local.loc[predict_mask, "week_no"].astype(int).map(forecast_week_map).fillna(0).astype(int)
+            )
+
+        for col in ["기초재고", sales_col, "분배량", "출고량(회전 등)"]:
+            if col not in compare_table_df_local.columns:
+                compare_table_df_local[col] = 0
+            compare_table_df_local[col] = pd.to_numeric(compare_table_df_local[col], errors="coerce").fillna(0).astype(int)
+
+        week_list = compare_table_df_local["week_no"].astype(int).tolist()
+        for i in range(1, len(week_list)):
+            w_cur = int(week_list[i])
+
+            observed_base = int(compare_table_df_local.loc[i, "기초재고"])
+            if (w_cur <= current_week_no_local) and (observed_base != 0):
+                continue
+
+            prev_base = int(compare_table_df_local.loc[i - 1, "기초재고"])
+            prev_sales = int(compare_table_df_local.loc[i - 1, sales_col])
+            prev_dist = int(compare_table_df_local.loc[i - 1, "분배량"])
+            prev_ship = int(compare_table_df_local.loc[i - 1, "출고량(회전 등)"])
+
+            predicted_base = prev_base - prev_sales + prev_dist - prev_ship
+            compare_table_df_local.loc[i, "기초재고"] = int(predicted_base)
+
+        base_raw = compare_table_df_local["기초재고"].astype(int).copy()
+        compare_table_df_local["기초재고"] = np.maximum(base_raw, 0).astype(int)
+
+        n_rows = len(compare_table_df_local)
+        loss_vals = []
+        prev_loss = 0
+        for i in range(n_rows):
+            w = int(compare_table_df_local.loc[i, "week_no"])
+            if w <= current_week_no_local:
+                loss_vals.append(0)
+                continue
+
+            raw_b = int(base_raw.iloc[i])
+            sales = int(compare_table_df_local.loc[i, sales_col])
+            if raw_b <= 0:
+                cur_loss = prev_loss - sales
+            elif raw_b < sales:
+                cur_loss = raw_b - sales
+            else:
+                cur_loss = 0
+            prev_loss = cur_loss
+            loss_vals.append(cur_loss)
+        compare_table_df_local["로스"] = loss_vals
+
+        neg_loss = compare_table_df_local[
+            (compare_table_df_local["week_no"].astype(int) > current_week_no_local)
+            & (compare_table_df_local["로스"].astype(float) < 0)
+        ]
+        if neg_loss.empty:
+            return {"deadline_date": None, "qty": 0, "loss_start_week": None}
+
+        loss_start_week = int(neg_loss.iloc[0]["week_no"])
+        loss_start_monday = pd.to_datetime(
+            f"{this_year}-W{loss_start_week:02d}-1",
+            format="%G-W%V-%u",
+            errors="coerce",
+        )
+        if pd.isna(loss_start_monday):
+            deadline_date = None
+        else:
+            deadline_date = (loss_start_monday - pd.Timedelta(days=int(lead_days))).normalize()
+
+        weeks_lead = max(1, math.ceil(float(lead_days) / 7.0))
+        rec_week = loss_start_week - weeks_lead
+
+        wm = compare_table_df_local["week_no"].astype(int)
+        qty = int(
+            compare_table_df_local.loc[
+                (wm >= rec_week) & (wm < rec_week + weeks_lead),
+                sales_col,
+            ].sum()
+        )
+        if qty < 1:
+            qty = max(1, abs(int(float(neg_loss.iloc[0]["로스"]))))
+
+        return {
+            "deadline_date": deadline_date,
+            "qty": int(qty),
+            "loss_start_week": int(loss_start_week),
+        }
+
+    summary = compute_reorder_summary(final_item_all_plants_df)
 
     if lead_days is None:
         reorder_top_message.info("reorder 시트에서 해당 SKU의 리오더 소요일(lead_time)을 찾지 못했습니다.")
     else:
-        reorder_top_message.markdown(
-            f"### **{lead_days}일 전에 추가로 요청해야 하는 수량은 {total_need_qty}장입니다**"
-        )
+        deadline = summary.get("deadline_date")
+        qty = int(summary.get("qty") or 0)
+        if deadline is None or pd.isna(deadline) or qty <= 0:
+            reorder_top_message.info(
+                "예측 기간 내에 로스가 0 미만으로 예상되는 구간이 없어, 리오더 권장 시점/수량을 표시할 수 없습니다."
+            )
+        else:
+            mm = int(pd.Timestamp(deadline).month)
+            dd = int(pd.Timestamp(deadline).day)
+            reorder_top_message.markdown(
+                f"### **{mm:02d}월 {dd:02d}일까지 리오더 권장되는 수량은 {qty} 장입니다.**"
+            )
 
-    st.markdown("### 매장별 추가 필요 수량")
-    if plant_need_df.empty:
-        st.info("매장별 수량을 계산할 데이터가 없습니다.")
-    else:
-        st.dataframe(
-            plant_need_df.sort_values(["추가 필요 수량(장)", "매장"], ascending=[False, True]).reset_index(drop=True),
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "추가 필요 수량(장)": st.column_config.NumberColumn("추가 필요 수량(장)", format="%d"),
-            },
-        )
+    st.markdown("### 계산 로직(요약)")
+    st.markdown(
+        """
+- **입력 데이터**: `final`(올해 매출/재고/분배/출고) + `plc db`(작년 주차별 판매 패턴) + `reorder`(SKU별 `lead_time`).
+- **올해 주차별 판매량 구성**:
+  - 현재 주차까지는 `final` 실적을 주차 합산.
+  - 현재 주차 이후(미래 주차)는 작년 주차별 비중(패턴)을 바탕으로 남은 판매량을 배분해 **예측 판매량**으로 채움.
+- **미래 기초재고 롤링(주차 단위)**:
+  - \(기초재고_{t} = 기초재고_{t-1} - 판매량_{t-1} + 분배량_{t-1} - 출고량_{t-1}\)
+  - 실측 기초재고가 있는 주차는 가능한 범위에서 그대로 사용.
+- **로스(부족) 발생 주차 탐지**:
+  - 미래 주차에서 재고가 판매를 못 따라가면 `로스 < 0`가 시작되는 **첫 주차**를 찾음.
+- **리드타임 반영 발주 마감일/수량**:
+  - `lead_time`(일)을 로스 시작 주차(월요일 기준)에서 **그만큼 이전**으로 당겨 **발주 마감일**을 계산.
+  - 권장 수량은 `lead_time`을 주 단위로 환산한 구간(약 \(ceil(lead\_time/7)\)주) 동안의 **예측 판매량 합**으로 산정.
+        """.strip()
+    )
 
-    # 요청 사항: 아래(아이템 상세/차트 등) 화면은 불필요하므로 제거
     return
 
 if __name__ == "__main__":
