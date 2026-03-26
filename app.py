@@ -629,10 +629,10 @@ def get_final_item_options(final_df: pd.DataFrame) -> pd.DataFrame:
 
     # plant_name + sku_name + item_code 기준으로 유니크
     options = (
-        df[["plant_name", "sku_name", "item_code", "sku"]]
+        df[["plant_name", "sku_name", "item_code", "sku", "style_code"]]
         .dropna(subset=["sku_name", "plant_name"])
         .drop_duplicates()
-        .sort_values(["plant_name", "sku_name", "sku"])
+        .sort_values(["plant_name", "style_code", "sku_name", "sku"])
         .reset_index(drop=True)
     )
     return options
@@ -1102,6 +1102,12 @@ def extract_item_code_from_sku(sku: str) -> str:
     return ""
 
 
+def style_code_from_material(material: str) -> str:
+    """final의 MATERIAL(또는 sku) 앞 10자리를 스타일코드로 사용합니다."""
+    s = str(material).strip()
+    return s[:10] if s else ""
+
+
 def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
     """
     final 데이터는 운영 중 컬럼 구조가 바뀔 수 있어
@@ -1109,7 +1115,7 @@ def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
     - 신버전(final DB): CALMONTH ... SSTOC_TMP_AMT (18컬럼)
 
     이 함수는 어떤 구조가 들어와도 아래 "표준 컬럼"으로 정규화해서 반환합니다.
-    표준 컬럼: sku, sku_name, 날짜, 판매량, plant_name, item_code (+ 선택: 기초재고, 분배량, 출고량(회전 등), 로스)
+    표준 컬럼: sku, sku_name, style_code, 날짜, 판매량, plant_name, item_code (+ 선택: 기초재고, 분배량, 출고량(회전 등), 로스)
     """
     df = final_df.copy()
 
@@ -1175,6 +1181,7 @@ def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
         # 실패 가능성을 낮추기 위해 비어 있으면 sku로 대체한다.
         df["item_code"] = df["sku"].apply(extract_item_code_from_sku)
         df.loc[df["item_code"].astype(str).str.strip() == "", "item_code"] = df["sku"]
+        df["style_code"] = df["sku"].map(style_code_from_material)
 
         # 기존 코드가 기대하는 컬럼만 남기지는 않고, 원본 컬럼은 그대로 둔다(추후 확장 대비)
         return df
@@ -1227,6 +1234,8 @@ def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     df["날짜"] = pd.to_datetime(raw_date, errors="coerce")
+
+    df["style_code"] = df["sku"].map(style_code_from_material)
 
     return df
 
@@ -1428,7 +1437,7 @@ def main():
         axis=1
     )
 
-    col_a, col_b = st.columns([1, 3])
+    col_a, col_b, col_c = st.columns([1, 1, 2])
 
     with col_a:
         plant_values = options_df["plant_name"].dropna().astype(str).str.strip()
@@ -1440,10 +1449,30 @@ def main():
             options=plant_options
         )
 
+    plant_filtered = options_df.copy()
+    if selected_plant != "전체":
+        plant_filtered = plant_filtered[plant_filtered["plant_name"] == selected_plant].copy()
+
+    style_vals = plant_filtered["style_code"].dropna().astype(str).str.strip()
+    style_vals = style_vals[style_vals != ""]
+    style_options = ["전체"] + sorted(style_vals.unique().tolist())
+
     with col_b:
-        filtered_options_df = options_df.copy()
-        if selected_plant != "전체":
-            filtered_options_df = filtered_options_df[filtered_options_df["plant_name"] == selected_plant].copy()
+        selected_style = st.selectbox(
+            "스타일코드 (MATERIAL 앞 10자리)",
+            options=style_options,
+        )
+
+    with col_c:
+        filtered_options_df = plant_filtered.copy()
+        if selected_style != "전체":
+            filtered_options_df = filtered_options_df[
+                filtered_options_df["style_code"].astype(str).str.strip() == selected_style
+            ].copy()
+
+        if filtered_options_df.empty:
+            st.warning("선택한 매장·스타일코드에 해당하는 상품이 없습니다.")
+            return
 
         selected_option_id = st.selectbox(
             "개별 차트 확인할 상품",
