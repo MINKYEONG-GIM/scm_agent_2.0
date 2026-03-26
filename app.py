@@ -1528,18 +1528,19 @@ def main():
     # -----------------------------
     # 주차별 작년 비중 / 올해 판매량 비교표
     # - 미래 주차(현재 주차 이후)는 GPT 예측값으로 채우고 빨간색 표시
-    # - "이번주로 가기" 버튼을 누르면 현재 주차 행이 표 상단으로 오게 정렬
+    # - 주차(week_no)는 항상 오름차순 고정(ISO 주차 기준)
     # -----------------------------
+    current_week_no = int(pd.Timestamp.today().isocalendar().week)
+
     title_col, btn_col = st.columns([4, 1])
     with title_col:
         st.markdown("### 주차별 작년 비중 / 올해 판매량 비교표")
     with btn_col:
-        if "focus_current_week" not in st.session_state:
-            st.session_state["focus_current_week"] = False
         if st.button("이번주로 가기", use_container_width=True):
-            st.session_state["focus_current_week"] = True
-
-    current_week_no = int(pd.Timestamp.today().isocalendar().week)
+            st.info(
+                f"이번 주는 **{format_calendar_week_label(this_year, current_week_no)}** 입니다. "
+                "표는 주차 오름차순이며, 해당 행은 노란색으로 표시됩니다."
+            )
 
     forecast_week_map = {}
     if not forecast_df.empty and "날짜" in forecast_df.columns and "forecast" in forecast_df.columns:
@@ -1555,7 +1556,7 @@ def main():
                 )
 
     compare_table_df = compare_table_df.copy()
-    compare_table_df = compare_table_df.sort_values("week_no").reset_index(drop=True)
+    compare_table_df = compare_table_df.sort_values("week_no", ascending=True, kind="mergesort").reset_index(drop=True)
 
     is_future_week = compare_table_df["week_no"].astype(int) > current_week_no
     has_forecast = compare_table_df["week_no"].astype(int).map(lambda w: w in forecast_week_map)
@@ -1676,23 +1677,10 @@ def main():
         ]
     ].copy()
 
-    # 버튼을 누른 경우: 현재 주차 행이 표 상단으로 오도록 회전 정렬
-    # (Streamlit에서 테이블 스크롤을 강제로 이동시키기 어렵기 때문에, 가시성을 확보하는 방식)
-    if st.session_state.get("focus_current_week", False):
-        tmp = compare_table_df.copy().reset_index(drop=True)
-        idx_list = tmp.index[tmp["week_no"].astype(int) == current_week_no].tolist()
-        if idx_list:
-            start = int(idx_list[0])
-            tmp2 = pd.concat([tmp.iloc[start:], tmp.iloc[:start]], ignore_index=True)
-            display_df = tmp2[display_df.columns].copy()
-            # 1회 동작 후 자동 해제(원하면 계속 True로 두세요)
-            st.session_state["focus_current_week"] = False
-
     def _style_compare_table(_):
         styles = pd.DataFrame("", index=display_df.index, columns=display_df.columns)
 
-        # 현재 주차: 강조(노랑)
-        # display_df는 회전 정렬될 수 있으므로 '주차' 문자열로 현재 주차 행을 찾는다.
+        # 현재 주차: 강조(노랑) — '주차' 표시 라벨과 ISO 주차 라벨이 일치하는 행
         current_week_label = format_calendar_week_label(this_year, int(current_week_no))
         mask_current = display_df["주차"].astype(str) == str(current_week_label)
         styles.loc[mask_current, :] = "background-color: #FFF3BF; font-weight: 700;"
