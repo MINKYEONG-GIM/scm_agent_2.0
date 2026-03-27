@@ -59,6 +59,48 @@ def load_sheet_as_df(sheet_id: str, worksheet_name: str) -> pd.DataFrame:
     return pd.DataFrame(normalized_rows, columns=headers)
 
 
+def get_spreadsheet(sheet_id: str):
+    client = get_gspread_client()
+    return client.open_by_key(sheet_id)
+
+
+def get_available_sheet_names(sh) -> List[str]:
+    return [ws.title for ws in sh.worksheets()]
+
+
+def load_sheet_as_df_from_spreadsheet(sh, worksheet_name: str, fallback_first: bool = False) -> pd.DataFrame:
+    try:
+        ws = sh.worksheet(worksheet_name)
+    except Exception:
+        if not fallback_first:
+            available = ", ".join(get_available_sheet_names(sh))
+            raise ValueError(f"시트 '{worksheet_name}'를 찾지 못했습니다. 사용 가능 시트: [{available}]")
+        worksheets = sh.worksheets()
+        if not worksheets:
+            raise ValueError("스프레드시트에 워크시트가 없습니다.")
+        ws = worksheets[0]
+        st.warning(f"'{worksheet_name}' 시트를 찾지 못해 첫 번째 시트('{ws.title}')를 사용합니다.")
+
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame()
+    headers = make_unique_headers(values[0])
+    rows = values[1:] if len(values) > 1 else []
+    if not rows:
+        return pd.DataFrame(columns=headers)
+
+    max_cols = len(headers)
+    normalized_rows = []
+    for row in rows:
+        r = list(row)
+        if len(r) < max_cols:
+            r += [""] * (max_cols - len(r))
+        elif len(r) > max_cols:
+            r = r[:max_cols]
+        normalized_rows.append(r)
+    return pd.DataFrame(normalized_rows, columns=headers)
+
+
 def normalize_value(value):
     # pandas/numpy scalar -> python scalar, NaN -> None
     if pd.isna(value):
@@ -141,9 +183,10 @@ def run_from_google_sheet():
     monthly_sheet = sheets_cfg.get("monthly_sheet", "monthly_forecast")
     weekly_sheet = sheets_cfg.get("weekly_sheet", "weekly_forecast")
 
-    run_df = load_sheet_as_df(sheet_id, run_sheet)
-    monthly_df = load_sheet_as_df(sheet_id, monthly_sheet)
-    weekly_df = load_sheet_as_df(sheet_id, weekly_sheet)
+    sh = get_spreadsheet(sheet_id)
+    run_df = load_sheet_as_df_from_spreadsheet(sh, run_sheet, fallback_first=True)
+    monthly_df = load_sheet_as_df_from_spreadsheet(sh, monthly_sheet, fallback_first=False)
+    weekly_df = load_sheet_as_df_from_spreadsheet(sh, weekly_sheet, fallback_first=False)
 
     if run_df.empty:
         raise ValueError(f"'{run_sheet}' 시트가 비어 있습니다.")
