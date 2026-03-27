@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Dict, List
 
 import gspread
@@ -113,6 +114,137 @@ def normalize_value(value):
     return value
 
 
+def clean_number(value) -> float:
+    if pd.isna(value):
+        return 0.0
+    s = str(value).strip().replace(",", "")
+    if s == "":
+        return 0.0
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def parse_yearweek_to_date(yearweek: str) -> pd.Timestamp:
+    s = str(yearweek).strip()
+    if not re.match(r"^\d{4}-\d{1,2}$", s):
+        return pd.NaT
+    y, w = s.split("-")
+    return pd.to_datetime(f"{int(y)}-W{int(w):02d}-1", format="%G-W%V-%u", errors="coerce")
+
+
+def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
+    required = ["CALDAY", "PLANT", "MATERIAL", "SALE"]
+    missing = [c for c in required if c not in final_df.columns]
+    if missing:
+        raise ValueError(f"final 시트 컬럼 누락: {missing}")
+
+    df = final_df.copy()
+    df["sku"] = df["MATERIAL"].astype(str).str.strip()
+    df["sty"] = df["sku"].str[:10]
+    df["style_code"] = df["sty"]
+    df["plant"] = df["PLANT"].astype(str).str.strip()
+    df["item_code"] = df["sku"].astype(str).str[2:4].fillna("")
+    df["sale"] = df["SALE"].apply(clean_number)
+    calday = df["CALDAY"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    df["date"] = pd.to_datetime(calday, format="%Y%m%d", errors="coerce")
+    return df
+
+
+def plc_item_weekly(plc_df: pd.DataFrame, item_code: str) -> pd.DataFrame:
+    if "아이템코드" not in plc_df.columns:
+        raise ValueError("plc db 시트에 '아이템코드' 컬럼이 없습니다.")
+
+    tmp = plc_df.copy()
+    tmp["아이템코드"] = tmp["아이템코드"].astype(str).str.strip()
+    matched = tmp[tmp["아이템코드"] == str(item_code).strip()]
+    if matched.empty:
+        return pd.DataFrame(columns=["year_week", "week_start", "sales"])
+    row = matched.iloc[0]
+
+    week_cols = [c for c in tmp.columns if re.match(r"^\d{4}-\d{1,2}$", str(c).strip())]
+    records = []
+    for col in week_cols:
+        d = parse_yearweek_to_date(col)
+        if pd.isna(d):
+            continue
+        records.append(
+            {
+                "year_week": str(col).strip(),
+                "week_start": d,
+                "sales": clean_number(row[col]),
+            }
+        )
+    if not records:
+        return pd.DataFrame(columns=["year_week", "week_start", "sales"])
+    return pd.DataFrame(records).sort_values("week_start").reset_index(drop=True)
+
+
+def forecast_weekly_from_ratio(plc_weekly: pd.DataFrame, final_item_df: pd.DataFrame) -> pd.DataFrame:
+    if plc_weekly.empty:
+        return pd.DataFrame(columns=["year_week", "forecast_qty", "is_peak_week"])
+
+    base = plc_weekly.copy()
+    base["week_no"] = base["week_start"].dt.isocalendar().week.astype(int)
+    base["sales"] = pd.to_numeric(base["sales"], errors="coerce").fillna(0.0)
+    total = float(base["sales"].sum())
+    if total <= 0:
+        return pd.DataFrame(columns=["year_week", "forecast_qty", "is_peak_week"])
+
+    ratio_by_week = (base.groupby("week_no")["sales"].sum() / total).to_dict()
+    last_by_week = base.groupby("week_no")["sales"].sum().to_dict()
+
+    this_year = int(pd.Timestamp.today().year)
+    cur_week = int(pd.Timestamp.today().isocalendar().week)
+    fi = final_item_df.dropna(subset=["date"]).copy()
+    fi["week_no"] = fi["date"].dt.isocalendar().week.astype(int)
+    fi["iso_year"] = fi["date"].dt.isocalendar().year.astype(int)
+    fi = fi[fi["iso_year"] == this_year]
+    this_by_week = fi.groupby("week_no")["sale"].sum().to_dict()
+
+    this_to_date = float(sum(v for w, v in this_by_week.items() if int(w) <= cur_week))
+    last_to_date = float(sum(v for w, v in last_by_week.items() if int(w) <= cur_week))
+    if last_to_date <= 0:
+        return pd.DataFrame(columns=["year_week", "forecast_qty", "is_peak_week"])
+
+    expected_total = total * (this_to_date / last_to_date)
+    remaining_total = max(0.0, expected_total - this_to_date)
+    rem_weeks = sorted([w for w in ratio_by_week.keys() if int(w) > cur_week])
+    if not rem_weeks:
+        return pd.DataFrame(columns=["year_week", "forecast_qty", "is_peak_week"])
+    rem_ratio_sum = float(sum(ratio_by_week[w] for w in rem_weeks))
+    if rem_ratio_sum <= 0:
+        return pd.DataFrame(columns=["year_week", "forecast_qty", "is_peak_week"])
+
+    peak_week = int(base.sort_values(["sales", "week_no"], ascending=[False, True]).iloc[0]["week_no"])
+    rows = []
+    for w in rem_weeks:
+        qty = float(round(remaining_total * (ratio_by_week[w] / rem_ratio_sum), 2))
+        rows.append(
+            {
+                "year_week": f"{this_year}-{int(w):02d}",
+                "forecast_qty": qty,
+                "is_peak_week": bool(int(w) == peak_week),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def to_monthly_from_weekly(weekly_df: pd.DataFrame) -> pd.DataFrame:
+    if weekly_df.empty:
+        return pd.DataFrame(columns=["year_month", "forecast_qty", "is_peak_month"])
+    tmp = weekly_df.copy()
+    tmp["date"] = tmp["year_week"].apply(parse_yearweek_to_date)
+    tmp["year_month"] = pd.to_datetime(tmp["date"]).dt.strftime("%Y-%m")
+    m = tmp.groupby("year_month", as_index=False)["forecast_qty"].sum().sort_values("year_month")
+    if m.empty:
+        return pd.DataFrame(columns=["year_month", "forecast_qty", "is_peak_month"])
+    peak_ym = str(m.sort_values(["forecast_qty", "year_month"], ascending=[False, True]).iloc[0]["year_month"])
+    m["is_peak_month"] = m["year_month"].astype(str) == peak_ym
+    return m
+
+
 def create_forecast_run(row: Dict) -> int:
     data = {
         "SKU": normalize_value(row["sku"]),
@@ -179,35 +311,38 @@ def save_to_supabase(run_info: Dict, monthly_df: pd.DataFrame, weekly_df: pd.Dat
 def run_from_google_sheet():
     sheets_cfg = dict(st.secrets["sheets"])
     sheet_id = sheets_cfg["sheet_id"]
-    run_sheet = sheets_cfg.get("run_sheet", "run_info")
-    monthly_sheet = sheets_cfg.get("monthly_sheet", "monthly_forecast")
-    weekly_sheet = sheets_cfg.get("weekly_sheet", "weekly_forecast")
+    final_sheet = sheets_cfg.get("final_sheet", "final")
+    plc_sheet = sheets_cfg.get("plc_sheet", "plc db")
+    center_stock_sheet = sheets_cfg.get("center_stock_sheet", "center_stock")
+    reorder_sheet = sheets_cfg.get("reorder_sheet", "reorder")
 
     sh = get_spreadsheet(sheet_id)
-    run_df = load_sheet_as_df_from_spreadsheet(sh, run_sheet, fallback_first=True)
-    monthly_df = load_sheet_as_df_from_spreadsheet(sh, monthly_sheet, fallback_first=False)
-    weekly_df = load_sheet_as_df_from_spreadsheet(sh, weekly_sheet, fallback_first=False)
+    final_df = load_sheet_as_df_from_spreadsheet(sh, final_sheet, fallback_first=False)
+    plc_df = load_sheet_as_df_from_spreadsheet(sh, plc_sheet, fallback_first=False)
+    # optional sheets (for future extension)
+    try:
+        _center_stock_df = load_sheet_as_df_from_spreadsheet(sh, center_stock_sheet, fallback_first=False)
+    except Exception:
+        _center_stock_df = pd.DataFrame()
+    try:
+        _reorder_df = load_sheet_as_df_from_spreadsheet(sh, reorder_sheet, fallback_first=False)
+    except Exception:
+        _reorder_df = pd.DataFrame()
 
+    if final_df.empty:
+        raise ValueError(f"'{final_sheet}' 시트가 비어 있습니다.")
+    if plc_df.empty:
+        raise ValueError(f"'{plc_sheet}' 시트가 비어 있습니다.")
+
+    final_prepared = prepare_final_df(final_df)
+    run_df = (
+        final_prepared[["sku", "sty", "style_code", "plant", "item_code"]]
+        .dropna(subset=["sku"])
+        .drop_duplicates(subset=["sku", "style_code", "plant"])
+        .reset_index(drop=True)
+    )
     if run_df.empty:
-        raise ValueError(f"'{run_sheet}' 시트가 비어 있습니다.")
-    if monthly_df.empty:
-        raise ValueError(f"'{monthly_sheet}' 시트가 비어 있습니다.")
-    if weekly_df.empty:
-        raise ValueError(f"'{weekly_sheet}' 시트가 비어 있습니다.")
-
-    required_run_cols = ["sku"]
-    required_monthly_cols = ["sku", "year_month", "forecast_qty"]
-    required_weekly_cols = ["sku", "year_week", "forecast_qty"]
-
-    for c in required_run_cols:
-        if c not in run_df.columns:
-            raise ValueError(f"run 시트 필수 컬럼 누락: {c}")
-    for c in required_monthly_cols:
-        if c not in monthly_df.columns:
-            raise ValueError(f"monthly 시트 필수 컬럼 누락: {c}")
-    for c in required_weekly_cols:
-        if c not in weekly_df.columns:
-            raise ValueError(f"weekly 시트 필수 컬럼 누락: {c}")
+        raise ValueError("final 시트에서 처리할 SKU가 없습니다.")
 
     success = 0
     fail = 0
@@ -216,25 +351,40 @@ def run_from_google_sheet():
     for _, run_row in run_df.iterrows():
         try:
             sku = normalize_value(run_row["sku"])
-            sty = normalize_value(run_row.get("style_code") or run_row.get("sty"))
+            sty = normalize_value(run_row["style_code"])
+            plant = normalize_value(run_row["plant"])
+            item_code = normalize_value(run_row["item_code"])
+            final_item_df = final_prepared[
+                (final_prepared["sku"].astype(str) == str(sku))
+                & (final_prepared["style_code"].astype(str) == str(sty))
+            ].copy()
+            plc_weekly = plc_item_weekly(plc_df, str(item_code))
+            weekly_fc = forecast_weekly_from_ratio(plc_weekly, final_item_df)
+            monthly_fc = to_monthly_from_weekly(weekly_fc)
 
-            m = monthly_df[monthly_df["sku"].astype(str) == str(sku)].copy()
-            w = weekly_df[weekly_df["sku"].astype(str) == str(sku)].copy()
+            if weekly_fc.empty:
+                raise ValueError("주차 예측 데이터가 비어 있습니다.")
 
-            if sty is not None:
-                if "style_code" in m.columns:
-                    m = m[m["style_code"].astype(str) == str(sty)]
-                elif "sty" in m.columns:
-                    m = m[m["sty"].astype(str) == str(sty)]
-                if "style_code" in w.columns:
-                    w = w[w["style_code"].astype(str) == str(sty)]
-                elif "sty" in w.columns:
-                    w = w[w["sty"].astype(str) == str(sty)]
+            run_info = {
+                "sku": sku,
+                "style_code": sty,
+                "plant": plant,
+                "shape_type": None,
+                "shape_reason": None,
+                "peak_week": None,
+                "peak_month": None,
+                "season_start_week": None,
+                "season_end_week": None,
+            }
 
-            if m.empty or w.empty:
-                raise ValueError("해당 SKU의 monthly/weekly 데이터가 없습니다.")
+            weekly_fc["sku"] = sku
+            weekly_fc["sty"] = sty
+            weekly_fc["stage"] = None
+            monthly_fc["sku"] = sku
+            monthly_fc["sty"] = sty
+            monthly_fc["stage"] = None
 
-            save_to_supabase(dict(run_row), m, w)
+            save_to_supabase(run_info, monthly_fc, weekly_fc)
             success += 1
             logs.append({"sku": sku, "status": "success", "message": ""})
         except Exception as e:
