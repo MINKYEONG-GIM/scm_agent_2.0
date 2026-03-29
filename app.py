@@ -12,7 +12,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from streamlit_gsheets import GSheetsConnection
 from typing import List, Optional, Tuple
-
+from supabase import create_client
 
 
 
