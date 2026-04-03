@@ -12,8 +12,11 @@ SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# 회전 출고(잉여 재고) 판단: PLC(주) = 기초재고÷주간예측이 이 값을 넘는 매장에서 잉여 계산. 사이드바에서 변경 가능.
+# 회전 출고(잉여 재고) 판단: PLC(주) = 기초재고÷주간예측이 이 값을 넘는 매장에서 잉여 계산. 화면에서 변경하지 않음.
 DEFAULT_PLC_WEEKS: float = 4.0
+
+# True면 is_forecast=true 행만 사용. 화면에서 변경하지 않음.
+FORECAST_ROWS_ONLY: bool = True
 
 # 리오더 제안 수량: (해당 SKU 주간 예측 합) × 이 주수. 웹에서 선택하지 않으며 코드만 수정.
 DEFAULT_REORDER_SALES_WEEKS: float = 4.0
@@ -537,11 +540,6 @@ def main():
 
     st.title("결품 예측 · 매장 회전 · 물류센터 반영 발주")
     reorder_headline_ph = st.empty()
-    st.caption(
-        "선택 주차 기준으로 매장별 주간 예측 대비 기초재고를 비교합니다. "
-        "PLC(재고÷주간예측)가 긴 매장은 회전 출고 가능 잉여로 보고, "
-        "물류센터 재고와 합산해 **추가 발주** 추정치를 냅니다."
-    )
 
     weekly_raw = pd.DataFrame()
     center_df = pd.DataFrame()
@@ -567,25 +565,18 @@ def main():
         st.warning("`public.sku_weekly_forecast` 테이블에 **데이터 행이 없습니다**.")
         return
 
-    st.sidebar.markdown("### 데이터 범위")
-
     norm = normalize_weekly_slice(weekly_raw.copy())
     if norm.empty:
         st.warning(diagnose_sku_weekly_forecast_unusable(weekly_raw))
         return
 
     norm_before_fc = norm.copy()
-    fc_only = st.sidebar.checkbox(
-        "미래 예측 행만(is_forecast=true)",
-        value=True,
-        help="기본: 켜 둠. DB에 is_forecast=true 행이 없으면 이 옵션을 끄거나 데이터를 확인하세요.",
-    )
-    if fc_only:
+    if FORECAST_ROWS_ONLY:
         norm = norm_before_fc[norm_before_fc["_is_fc"] == True].copy()  # noqa: E712
         if norm.empty and not norm_before_fc.empty:
             st.warning(
                 "`public.sku_weekly_forecast`에 **`is_forecast` = true** 인 행이 없어 필터 결과가 비었습니다. "
-                "위 옵션을 끄거나 DB의 `is_forecast` 값을 확인하세요."
+                "코드 상수 `FORECAST_ROWS_ONLY`를 `False`로 두거나 DB의 `is_forecast` 값을 확인하세요."
             )
             norm = norm_before_fc.copy()
 
@@ -601,21 +592,7 @@ def main():
 
     # 주차 선택 없음: 데이터에 있는 year_week 중 정렬상 가장 최신 1개만 사용 (발주 시점 산출용 단일 스냅샷)
     year_week = yw_list[0]
-    plc_thr = st.sidebar.number_input(
-        "회전 출고 판단 PLC(주) 기준",
-        min_value=1.0,
-        max_value=52.0,
-        value=float(DEFAULT_PLC_WEEKS),
-        step=0.5,
-        help=(
-            f"재고÷주간예측(주)이 이 값보다 크면 회전 출고 후보로 잉여를 계산합니다. "
-            f"앱 기본값은 코드 상수 DEFAULT_PLC_WEEKS(={DEFAULT_PLC_WEEKS:g}주)입니다."
-        ),
-    )
-
-    if st.sidebar.button("데이터 새로고침"):
-        st.cache_data.clear()
-        st.rerun()
+    plc_thr = float(DEFAULT_PLC_WEEKS)
 
     center_by_sku = center_stock_by_sku(center_df)
     moq_df = reorder_params_by_sku(reorder_df)
@@ -638,7 +615,7 @@ def main():
 
     summary = aggregate_sku_summary(store_level, center_by_sku, moq_df)
 
-    st.sidebar.markdown("### 리오더 안내")
+    st.sidebar.markdown("### 리오더 (style_code)")
     sku_opts_headline = summary["sku"].tolist()
     if not sku_opts_headline:
         sku_opts_headline = sorted(store_level["sku"].unique().tolist())
@@ -647,43 +624,18 @@ def main():
         "style_code" in store_level.columns
         and (store_level["style_code"].astype(str).str.strip() != "").any()
     )
-    if has_style:
-        guidance_mode = st.sidebar.radio(
-            "리오더 안내 기준",
-            options=["SKU", "style_code"],
-            horizontal=True,
-        )
-    else:
-        guidance_mode = "SKU"
-        st.sidebar.caption("`style_code`(또는 유사 컬럼)이 없거나 비어 있어 **SKU**만 선택할 수 있습니다.")
 
     scope_prefix = ""
     sl_headline = pd.DataFrame()
-    if guidance_mode == "SKU":
-        guidance_sku = st.sidebar.selectbox(
-            "SKU (리오더 문구·상세 표)",
-            options=sku_opts_headline,
-            index=0,
-        )
-        sl_headline = store_level[store_level["sku"].astype(str) == str(guidance_sku)].copy()
-        g_row = summary[summary["sku"] == guidance_sku]
-        if not g_row.empty:
-            _lt = int(g_row["리드타임_일"].iloc[0])
-            _moq = int(g_row["MOQ(참고)"].iloc[0])
-        else:
-            _lt = 0
-            _moq = 0
-            if not moq_df.empty and str(guidance_sku) in moq_df["sku"].astype(str).values:
-                m = moq_df[moq_df["sku"].astype(str) == str(guidance_sku)].iloc[-1]
-                _lt = int(m["lead_time_days"])
-                _moq = int(m["minimum_capacity"])
-        pick = str(guidance_sku)
-    else:
+    _lt, _moq = 0, 0
+    pick = str(sku_opts_headline[0]) if sku_opts_headline else ""
+
+    if has_style:
         style_opts = sorted(
             {str(x).strip() for x in store_level["style_code"].tolist() if str(x).strip() != ""}
         )
         guidance_style = st.sidebar.selectbox(
-            "style_code (리오더 문구)",
+            "style_code",
             options=style_opts,
             index=0,
         )
@@ -693,11 +645,25 @@ def main():
         sk_list = sorted(sl_headline["sku"].astype(str).unique().tolist())
         _lt, _moq = reorder_lt_moq_for_skus(sk_list, moq_df, summary)
         scope_prefix = f"[style_code <strong>{guidance_style}</strong>] "
-        pick = st.sidebar.selectbox(
-            "상세 표용 SKU (동일 스타일)",
-            options=sk_list if sk_list else sku_opts_headline,
-            index=0,
+        pick = str(sk_list[0]) if sk_list else (str(sku_opts_headline[0]) if sku_opts_headline else "")
+    else:
+        st.sidebar.caption(
+            "`style_code`가 없으면 이 항목을 고를 수 없습니다. 리오더·하단 상세는 첫 SKU로 자동 표시합니다."
         )
+        if pick:
+            sl_headline = store_level[store_level["sku"].astype(str) == pick].copy()
+            g_row = summary[summary["sku"] == pick]
+            if not g_row.empty:
+                _lt = int(g_row["리드타임_일"].iloc[0])
+                _moq = int(g_row["MOQ(참고)"].iloc[0])
+            elif not moq_df.empty and pick in moq_df["sku"].astype(str).values:
+                m = moq_df[moq_df["sku"].astype(str) == str(pick)].iloc[-1]
+                _lt = int(m["lead_time_days"])
+                _moq = int(m["minimum_capacity"])
+
+    if st.sidebar.button("데이터 새로고침"):
+        st.cache_data.clear()
+        st.rerun()
 
     headline_txt = reorder_guidance_for_store_slice(
         sl_headline,
@@ -715,11 +681,6 @@ def main():
     total_extra = int(summary["물류+회전_반영_추가발주"].sum())
     total_short_stores = int(store_level[store_level["역할"] == "결품위험"]["매장"].nunique())
     skus_at_risk = int((summary["결품위험_매장수"] > 0).sum())
-
-    st.caption(
-        f"예측·재고 비교에 사용한 주간 라벨: `{year_week}` — 데이터상 가장 최신 `year_week`를 자동 적용합니다. "
-        "주차를 고르지 않아도 됩니다."
-    )
 
     m1, m2, m3, m4 = st.columns(4)
     with m1:
@@ -834,21 +795,6 @@ def main():
         st.info(
             "선택한 SKU가 `public.sku_weekly_forecast` 기준 상단 취합에 없을 수 있습니다. "
             "아래는 동일 테이블의 매장별 행입니다."
-        )
-
-    with st.expander("계산 로직 요약"):
-        st.markdown(
-            f"""
-            1. DB `year_week` 값 중 **정렬상 가장 최신 한 주차**만 자동 선택해, 그 `sale_qty`(또는 `forecast_qty`)를 주간 예측 수요로 사용합니다. (사이드바에서 주차를 고르지 않습니다.)
-            2. **기초재고**는 `begin_stock`을 사용합니다.
-            3. **결품 위험**: 예측 수요 > 기초재고 인 매장. 부족분 = 예측 − 재고.
-            4. **PLC(주)** = 기초재고 ÷ 주간예측 (예측이 0이면 해석 제한).
-            5. **회전 출고**: PLC > 사이드바 **PLC 기준주(현재 {plc_thr:g}주)** 인 매장에서, 잉여 = 재고 − 기준주×예측 (0 이상). 앱 코드 기본은 `DEFAULT_PLC_WEEKS`={DEFAULT_PLC_WEEKS:g}주.
-            6. **SKU 추가 발주** = 먼저 `center_stock`으로 부족을 충당한 뒤, 남은 부족에 대해 회전 잉여로 `min(회전 잉여, 남은 부족)` 만큼 차감합니다.
-            7. `reorder.minimum_capacity`가 있으면 발주가 필요한 경우에만 max(추정, MOQ)를 **제안**으로 표시합니다.
-            8. 상단 **리오더 문구**: `reorder.lead_time`·`minimum_capacity`와 (매장 기초재고 합+물류센터)÷주간예측합으로 **가용 일수**를 잡고, `가용 일수 − 리드타임` 만큼 오늘부터 일수를 더한 날짜를 **발주 기한(월·일)** 으로 표시합니다. 발주 수량은 코드 상수 **`DEFAULT_REORDER_SALES_WEEKS`** (= {DEFAULT_REORDER_SALES_WEEKS:g}주) × **주간 예측 합**이며 MOQ 이상으로 맞춥니다. 안내 기준을 **SKU** 또는 **`style_code`** 로 고를 수 있으며, 스타일 선택 시 해당 스타일에 속한 **모든 SKU 행을 합산**하고 리드타임·MOQ는 스타일 내 SKU별 값의 **최댓값**을 사용합니다.
-            9. **매장** 드롭다운은 하단 상세 표 **조회용**이며, 취합·이동·결품 판단 계산에는 사용하지 않습니다. (스타일 등 다른 차원 필터를 두는 경우에도 매장만큼은 계산 파이프라인에 넣지 않는 것이 안전합니다.)
-            """
         )
 
 
