@@ -1,6 +1,6 @@
 
 import re
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -18,7 +18,6 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # 공통 유틸
 # =========================
 def first_existing_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    """Supabase/Postgres 컬럼 대소문자 차이를 흡수합니다."""
     if df is None or df.empty:
         return None
     for c in candidates:
@@ -31,7 +30,7 @@ def first_existing_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]
     return None
 
 
-def clean_number(value):
+def clean_number(value) -> float:
     if pd.isna(value):
         return np.nan
     s = str(value).strip()
@@ -44,59 +43,19 @@ def clean_number(value):
         return np.nan
 
 
-def parse_yearweek_to_date(yearweek: str) -> pd.Timestamp:
-    s = str(yearweek).strip()
-    if not re.match(r"^\d{4}-\d{1,2}$", s):
-        return pd.NaT
-    year_str, week_str = s.split("-")
-    year = int(year_str)
-    week = int(week_str)
-    try:
-        return pd.to_datetime(f"{year}-W{week:02d}-1", format="%G-W%V-%u", errors="coerce")
-    except Exception:
-        return pd.NaT
+def to_int_safe(x, default: int = 0) -> int:
+    v = clean_number(x)
+    if pd.isna(v):
+        return default
+    return int(round(v))
 
 
-def parse_year_month_to_timestamp(ym: str) -> pd.Timestamp:
-    """year_month: '2025-01', '2025-03', '202503' 등."""
-    s = str(ym).strip().replace(".", "")
-    if re.match(r"^\d{6}$", s):
-        s = f"{s[:4]}-{s[4:6]}"
-    ts = pd.to_datetime(s + "-01", errors="coerce")
-    return ts if pd.notna(ts) else pd.NaT
-
-
-def iso_week_monday_month_day(year: int, week_no: int) -> Optional[Tuple[int, int]]:
-    ts = pd.to_datetime(f"{year}-W{int(week_no):02d}-1", format="%G-W%V-%u", errors="coerce")
-    if pd.isna(ts):
-        return None
-    return int(ts.month), int(ts.day)
-
-
-def format_calendar_week_label(calendar_year: int, iso_week_no: int) -> str:
-    ts = pd.to_datetime(f"{calendar_year}-W{int(iso_week_no):02d}-1", format="%G-W%V-%u", errors="coerce")
-    if pd.isna(ts):
-        return f"{iso_week_no}주차"
-    yy = calendar_year % 100
-    m = int(ts.month)
-    week_in_month = (int(ts.day) - 1) // 7 + 1
-    return f"{yy:02d}년 {m}월 {week_in_month}주차"
-
-
-# =========================
-# Supabase 로딩
-# =========================
 def load_supabase_table(table_name: str, page_size: int = 1000) -> pd.DataFrame:
     all_rows = []
     start = 0
     while True:
         end = start + page_size - 1
-        res = (
-            supabase.table(table_name)
-            .select("*")
-            .range(start, end)
-            .execute()
-        )
+        res = supabase.table(table_name).select("*").range(start, end).execute()
         rows = res.data or []
         if not rows:
             break
@@ -108,42 +67,34 @@ def load_supabase_table(table_name: str, page_size: int = 1000) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
-def load_sku_forecast_run_df() -> pd.DataFrame:
-    return load_supabase_table("sku_forecast_run")
-
-
-@st.cache_data(ttl=300)
 def load_sku_weekly_forecast_df() -> pd.DataFrame:
     return load_supabase_table("sku_weekly_forecast")
 
 
 @st.cache_data(ttl=300)
-def load_sku_monthly_forecast_df() -> pd.DataFrame:
-    return load_supabase_table("sku_monthly_forecast")
+def load_center_stock_df() -> pd.DataFrame:
+    return load_supabase_table("center_stock")
+
+
+@st.cache_data(ttl=300)
+def load_reorder_df() -> pd.DataFrame:
+    return load_supabase_table("reorder")
 
 
 def infer_run_batch_key(runs_df: pd.DataFrame) -> str:
-    """자식 테이블 forecast_run_id와 맞출 부모 쪽 키 컬럼명."""
     fr = first_existing_col(runs_df, ["forecast_run_id", "forecast_runid"])
     if fr and runs_df[fr].notna().any():
         return fr
     return "id"
 
 
-def list_run_batches(
-    runs_df: pd.DataFrame,
-    weekly_df: pd.DataFrame,
-) -> List[Tuple[object, pd.Timestamp, int]]:
-    """
-    (batch_key, 대표 run_date, 해당 배치 주간 행 수) 목록. 최신 run_date 우선.
-    sku_forecast_run이 비어 있으면 weekly의 forecast_run_id만으로 배치를 만듭니다.
-    """
+def list_run_batches(runs_df: pd.DataFrame, weekly_df: pd.DataFrame) -> List[Tuple[Any, pd.Timestamp, int]]:
     wk_fr = first_existing_col(weekly_df, ["forecast_run_id", "forecast_runid"])
     if weekly_df.empty or wk_fr is None:
         return []
 
     keys_in_weekly = weekly_df[wk_fr].dropna().astype(object).unique().tolist()
-    parts: List[Tuple[object, pd.Timestamp, int]] = []
+    parts: List[Tuple[Any, pd.Timestamp, int]] = []
 
     if runs_df.empty:
         for k in keys_in_weekly:
@@ -153,7 +104,7 @@ def list_run_batches(
         return parts
 
     parent_key = infer_run_batch_key(runs_df)
-    rd_col = first_existing_col(runs_df, ["run_date", "rundate"])
+    rd_col = first_existing_col(runs_df, ["run_date", "rundate", "created_at"])
     if not rd_col:
         rd_col = runs_df.columns[0]
 
@@ -184,464 +135,460 @@ def filter_by_run_key(df: pd.DataFrame, run_key_col: str, batch_key: object) -> 
     return df[df[run_key_col] == batch_key].copy()
 
 
-STAGE_COLORS = {
-    "도입": "#1f77b4",
-    "성장": "#2ca02c",
-    "피크": "#d62728",
-    "피크2": "#d62728",
-    "성숙": "#9467bd",
-    "비시즌": "#7f7f7f",
-    "쇠퇴": "#8c564b",
-}
+def normalize_weekly_slice(weekly_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    sku_weekly_forecast → 표준 컬럼: sku, store, year_week, demand_w, begin_stock,
+    is_forecast, sku_name, created_at, forecast_run_id(optional)
+    """
+    if weekly_df.empty:
+        return pd.DataFrame()
 
-
-def build_dual_line_chart(
-    title_name: str,
-    weekly_df: pd.DataFrame,
-    monthly_df: pd.DataFrame,
-) -> go.Figure:
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Scatter(
-            x=weekly_df["week_start"],
-            y=weekly_df["sales"],
-            mode="lines",
-            name="주차별 예측(연결선)",
-            line=dict(color="#b0b0b0", width=2),
-            hoverinfo="skip",
-            showlegend=False,
-            connectgaps=True,
-        )
+    sku_c = first_existing_col(weekly_df, ["sku", "SKU"])
+    store_c = first_existing_col(
+        weekly_df, ["store_name", "storename", "매장", "plant", "PLANT"]
     )
-
-    stage_df = weekly_df.copy().reset_index(drop=True)
-    stage_df["week_no"] = stage_df["week_start"].dt.isocalendar().week.astype(int)
-
-    if "stage" in stage_df.columns:
-        current_stage = None
-        segment_x, segment_y, segment_week = [], [], []
-
-        for _, row in stage_df.iterrows():
-            stage = row["stage"]
-            x, y, w = row["week_start"], row["sales"], int(row["week_no"])
-
-            if current_stage is None:
-                current_stage = stage
-                segment_x, segment_y, segment_week = [x], [y], [w]
-            elif stage == current_stage:
-                segment_x.append(x)
-                segment_y.append(y)
-                segment_week.append(w)
-            else:
-                st_name = str(current_stage)
-                fig.add_trace(
-                    go.Scatter(
-                        x=segment_x,
-                        y=segment_y,
-                        customdata=segment_week,
-                        mode="lines+markers",
-                        name=st_name,
-                        line=dict(color=STAGE_COLORS.get(st_name, "#333"), width=3),
-                        marker=dict(size=7),
-                        hovertemplate=(
-                            "주차: %{customdata}주차<br>주차 시작일: %{x|%Y-%m-%d}<br>예측 수량: %{y:,.0f}<br>단계: "
-                            + st_name
-                            + "<extra></extra>"
-                        ),
-                        showlegend=True,
-                    )
-                )
-                current_stage = stage
-                segment_x, segment_y, segment_week = [x], [y], [w]
-
-        if segment_x:
-            st_name = str(current_stage)
-            fig.add_trace(
-                go.Scatter(
-                    x=segment_x,
-                    y=segment_y,
-                    customdata=segment_week,
-                    mode="lines+markers",
-                    name=st_name,
-                    line=dict(color=STAGE_COLORS.get(st_name, "#333"), width=3),
-                    marker=dict(size=7),
-                    hovertemplate=(
-                        "주차: %{customdata}주차<br>주차 시작일: %{x|%Y-%m-%d}<br>예측 수량: %{y:,.0f}<br>단계: "
-                        + st_name
-                        + "<extra></extra>"
-                    ),
-                    showlegend=True,
-                )
-            )
-
-    fig.add_trace(
-        go.Scatter(
-            x=monthly_df["month"],
-            y=monthly_df["sales"],
-            customdata=monthly_df["month"].dt.isocalendar().week.astype(int),
-            mode="lines+markers",
-            name="월별 예측",
-            line=dict(width=3, color="#bfbfbf"),
-            marker=dict(size=7, color="#bfbfbf"),
-            fill="tozeroy",
-            fillcolor="rgba(191, 191, 191, 0.25)",
-            connectgaps=True,
-            yaxis="y2",
-            hovertemplate="월: %{x|%Y-%m}<br>(참고) %{customdata}주차<br>예측 수량: %{y:,.0f}<extra></extra>",
-        )
+    yw_c = first_existing_col(weekly_df, ["year_week", "yearweek"])
+    dem_c = first_existing_col(
+        weekly_df, ["sale_qty", "forecast_qty", "forecastqty", "saleqty"]
     )
+    st_c = first_existing_col(weekly_df, ["begin_stock", "beginstock", "stock_qty"])
+    fc_c = first_existing_col(weekly_df, ["is_forecast", "isforecast"])
+    name_c = first_existing_col(weekly_df, ["sku_name", "skuname", "SKU_NAME"])
+    ca_c = first_existing_col(weekly_df, ["created_at", "createdat"])
+    fr_c = first_existing_col(weekly_df, ["forecast_run_id", "forecast_runid"])
 
-    fig.update_layout(
-        title=f"{title_name} 주차별 단계 / 월별 예측 추이",
-        xaxis_title="날짜",
-        yaxis_title="주차별 예측 수량",
-        yaxis2=dict(title="월별 예측 수량", overlaying="y", side="right", showgrid=False),
-        height=650,
-        hovermode="x unified",
-        margin=dict(l=30, r=30, t=70, b=30),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    if not sku_c or not yw_c or not dem_c:
+        return pd.DataFrame()
+
+    out = weekly_df.copy()
+    out["_sku"] = out[sku_c].astype(str).str.strip()
+    out["_store"] = (
+        out[store_c].astype(str).str.strip()
+        if store_c
+        else pd.Series("_unknown", index=out.index)
     )
-    fig.update_yaxes(tickformat=",.0f", rangemode="tozero")
-    fig.update_layout(yaxis=dict(rangemode="tozero"), yaxis2=dict(rangemode="tozero"))
-    return fig
-
-
-def weekly_rows_to_timeseries(weekly_slice: pd.DataFrame) -> pd.DataFrame:
-    """sku_weekly_forecast 행 → week_start, sales(=forecast_qty), stage."""
-    yw = first_existing_col(weekly_slice, ["year_week", "yearweek"])
-    fq = first_existing_col(weekly_slice, ["forecast_qty", "forecastqty"])
-    stg = first_existing_col(weekly_slice, ["stage"])
-    if not yw or not fq:
-        return pd.DataFrame(columns=["week_start", "sales", "stage"])
-
-    rows = []
-    for _, r in weekly_slice.iterrows():
-        ws = parse_yearweek_to_date(r[yw])
-        if pd.isna(ws):
-            continue
-        qty = clean_number(r[fq])
-        rows.append(
-            {
-                "week_start": ws,
-                "sales": 0.0 if pd.isna(qty) else float(qty),
-                "stage": str(r[stg]).strip() if stg and pd.notna(r.get(stg)) else "",
-            }
+    out["_year_week"] = out[yw_c].astype(str).str.strip()
+    out["_demand"] = out[dem_c].apply(clean_number)
+    out["_stock"] = out[st_c].apply(to_int_safe) if st_c else 0
+    if fc_c:
+        out["_is_fc"] = out[fc_c].apply(
+            lambda x: bool(x) if pd.notna(x) else True
         )
-    out = pd.DataFrame(rows).sort_values("week_start").reset_index(drop=True)
+    else:
+        out["_is_fc"] = True
+    out["_sku_name"] = (
+        out[name_c].astype(str).str.strip()
+        if name_c
+        else out["_sku"]
+    )
+    if ca_c:
+        out["_created"] = pd.to_datetime(out[ca_c], errors="coerce")
+    else:
+        out["_created"] = pd.NaT
+    if fr_c:
+        out["_frid"] = out[fr_c]
+    else:
+        out["_frid"] = np.nan
+
+    out = out[out["_sku"] != ""].copy()
+    out = out[out["_year_week"] != ""].copy()
     return out
 
 
-def monthly_rows_to_timeseries(monthly_slice: pd.DataFrame) -> pd.DataFrame:
-    ym = first_existing_col(monthly_slice, ["year_month", "yearmonth"])
-    fq = first_existing_col(monthly_slice, ["forecast_qty", "forecastqty"])
-    if not ym or not fq:
-        return pd.DataFrame(columns=["month", "sales"])
-
-    rows = []
-    for _, r in monthly_slice.iterrows():
-        m = parse_year_month_to_timestamp(r[ym])
-        if pd.isna(m):
-            continue
-        qty = clean_number(r[fq])
-        rows.append({"month": m, "sales": 0.0 if pd.isna(qty) else float(qty)})
-    return pd.DataFrame(rows).sort_values("month").reset_index(drop=True)
+def dedupe_weekly_latest(df: pd.DataFrame) -> pd.DataFrame:
+    """동일 (sku, store, year_week) 최신 행만."""
+    if df.empty:
+        return df
+    df = df.sort_values(["_sku", "_store", "_year_week", "_created"], na_position="last")
+    return df.drop_duplicates(subset=["_sku", "_store", "_year_week"], keep="last")
 
 
-def build_forecast_weekly_table(
-    weekly_ts: pd.DataFrame,
-    sku: str,
-    sku_label: str,
-    label_year: int,
+def center_stock_by_sku(center_df: pd.DataFrame) -> pd.Series:
+    if center_df.empty:
+        return pd.Series(dtype=float)
+    sku_c = first_existing_col(center_df, ["sku", "SKU"])
+    qty_c = first_existing_col(center_df, ["stock_qty", "stockqty", "qty"])
+    if not sku_c or not qty_c:
+        return pd.Series(dtype=float)
+    g = (
+        center_df.groupby(sku_c.astype(str).str.strip())[qty_c]
+        .apply(lambda s: sum(to_int_safe(x) for x in s))
+    )
+    return g
+
+
+def reorder_params_by_sku(reorder_df: pd.DataFrame) -> pd.DataFrame:
+    if reorder_df.empty:
+        return pd.DataFrame(columns=["sku", "lead_time_days", "minimum_capacity"])
+    sku_c = first_existing_col(reorder_df, ["sku", "SKU"])
+    lt_c = first_existing_col(reorder_df, ["lead_time", "leadtime"])
+    moq_c = first_existing_col(reorder_df, ["minimum_capacity", "minimumcapacity", "moq"])
+    if not sku_c:
+        return pd.DataFrame(columns=["sku", "lead_time_days", "minimum_capacity"])
+    r = reorder_df.copy()
+    r["_sku"] = r[sku_c].astype(str).str.strip()
+    r["_lt"] = r[lt_c].apply(to_int_safe) if lt_c else 0
+    r["_moq"] = r[moq_c].apply(to_int_safe) if moq_c else 0
+    r = r.sort_values("_sku").drop_duplicates(subset=["_sku"], keep="last")
+    return r[["_sku", "_lt", "_moq"]].rename(
+        columns={"_sku": "sku", "_lt": "lead_time_days", "_moq": "minimum_capacity"}
+    )
+
+
+def compute_store_rows_for_week(
+    slice_norm: pd.DataFrame,
+    year_week: str,
+    plc_weeks_threshold: float,
 ) -> pd.DataFrame:
-    """주차별 예측 비중·수량·단계 표 (DB 예측만 사용)."""
-    if weekly_ts.empty:
+    """
+    한 주차 기준 매장별: 수요, 재고, PLC(주), 역할, 결품부족분, 회전가능 잉여.
+    """
+    w = slice_norm[slice_norm["_year_week"] == str(year_week).strip()].copy()
+    if w.empty:
         return pd.DataFrame()
 
-    df = weekly_ts.copy()
-    df["week_no"] = df["week_start"].dt.isocalendar().week.astype(int)
-    total = float(df["sales"].sum())
-    if total > 0:
-        df["ratio_pct"] = df["sales"] / total * 100.0
-    else:
-        df["ratio_pct"] = 0.0
+    rows = []
+    for _, r in w.iterrows():
+        sku = r["_sku"]
+        store = r["_store"]
+        d = float(r["_demand"]) if pd.notna(r["_demand"]) else 0.0
+        stock = int(r["_stock"])
+        sku_name = r["_sku_name"]
 
-    df["주차"] = df["week_no"].astype(int).map(lambda w: format_calendar_week_label(label_year, int(w)))
-    df["예측 단계"] = df["stage"].replace({"피크": "성숙", "피크2": "성숙"}).fillna("").astype(str)
+        eps = 1e-6
+        weekly_sales = max(d, 0.0)
+        plc = (stock / weekly_sales) if weekly_sales > eps else (np.inf if stock > 0 else 0.0)
 
-    out = df.rename(columns={"sales": "주차별 예측 수량"}).copy()
-    out["SKU"] = sku
-    out["SKU_NAME"] = sku_label
-    out["주차별 예측 비중(%)"] = out["ratio_pct"].round(1)
-    return out[
-        ["SKU", "SKU_NAME", "week_no", "주차", "주차별 예측 비중(%)", "주차별 예측 수량", "예측 단계"]
-    ].reset_index(drop=True)
+        shortage = weekly_sales > stock + eps
+        deficit = max(0.0, weekly_sales - stock) if shortage else 0.0
 
+        is_source = weekly_sales > eps and plc > plc_weeks_threshold
+        excess_transfer = max(0.0, stock - plc_weeks_threshold * weekly_sales) if is_source else 0.0
 
-def get_run_meta_for_sku(
-    runs_df: pd.DataFrame,
-    batch_key: object,
-    sku: str,
-    plant: Optional[str],
-) -> Tuple[str, str]:
-    """(shape_type, shape_reason) — sku_forecast_run 행 매칭."""
-    parent_key = infer_run_batch_key(runs_df)
-    sku_c = first_existing_col(runs_df, ["SKU", "sku"])
-    pl_c = first_existing_col(runs_df, ["plant", "PLANT"])
-    st_c = first_existing_col(runs_df, ["shape_type", "shapetype"])
-    sr_c = first_existing_col(runs_df, ["shape_reason", "shapereason"])
+        if shortage:
+            role = "결품위험"
+        elif is_source:
+            role = "회전출고(판매부진)"
+        else:
+            role = "정상"
 
-    if not sku_c:
-        return "—", "sku_forecast_run에 SKU 컬럼이 없습니다."
-
-    m = runs_df[runs_df[parent_key] == batch_key].copy()
-    if m.empty:
-        m = runs_df.copy()
-
-    m = m[m[sku_c].astype(str).str.strip() == str(sku).strip()]
-    if plant and pl_c and pl_c in m.columns:
-        m = m[m[pl_c].astype(str).str.strip() == str(plant).strip()]
-
-    if m.empty:
-        return "—", "해당 배치·SKU의 sku_forecast_run 메타를 찾지 못했습니다."
-
-    row = m.iloc[0]
-    sl = str(row[st_c]).strip() if st_c and pd.notna(row.get(st_c)) else "—"
-    reason = str(row[sr_c]).strip() if sr_c and pd.notna(row.get(sr_c)) else ""
-    return sl, reason or "(사유 없음)"
+        rows.append(
+            {
+                "sku": sku,
+                "sku_name": sku_name,
+                "매장": store,
+                "주차": year_week,
+                "주간예측수요": round(weekly_sales, 2),
+                "기초재고": stock,
+                "PLC_주": round(float(plc), 2) if np.isfinite(plc) else None,
+                "역할": role,
+                "결품부족분": int(round(deficit)),
+                "회전가능잉여": int(round(excess_transfer)),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
-# =========================
-# 메인 화면
-# =========================
+def aggregate_sku_summary(store_df: pd.DataFrame, center_by_sku: pd.Series, moq_df: pd.DataFrame) -> pd.DataFrame:
+    if store_df.empty:
+        return pd.DataFrame()
+
+    moq_map = (
+        moq_df.set_index("sku")["minimum_capacity"].to_dict()
+        if not moq_df.empty and "sku" in moq_df.columns
+        else {}
+    )
+    lt_map = (
+        moq_df.set_index("sku")["lead_time_days"].to_dict()
+        if not moq_df.empty and "sku" in moq_df.columns
+        else {}
+    )
+
+    parts = []
+    for sku, g in store_df.groupby("sku"):
+        total_deficit = int(g["결품부족분"].sum())
+        total_rotation = int(g["회전가능잉여"].sum())
+        n_short = int((g["역할"] == "결품위험").sum())
+        n_source = int((g["역할"] == "회전출고(판매부진)").sum())
+        if isinstance(center_by_sku, pd.Series) and sku in center_by_sku.index:
+            center_qty = int(to_int_safe(center_by_sku.loc[sku]))
+        else:
+            center_qty = 0
+
+        after_center = max(0, total_deficit - center_qty)
+        pool_use = min(total_rotation, after_center)
+        after_all = max(0, after_center - pool_use)
+
+        moq = int(moq_map.get(sku, 0))
+        suggested_order = max(after_all, moq) if after_all > 0 and moq > 0 else after_all
+
+        parts.append(
+            {
+                "sku": sku,
+                "sku_name": g["sku_name"].iloc[0],
+                "결품위험_매장수": n_short,
+                "회전출고_매장수": n_source,
+                "매장결품부족_합": total_deficit,
+                "물류센터_재고": center_qty,
+                "회전가능잉여_합": total_rotation,
+                "회전으로_충당(상한)": int(pool_use),
+                "물류+회전_반영_추가발주": int(after_all),
+                "MOQ(참고)": moq,
+                "MOQ반영_제안발주": int(suggested_order),
+                "리드타임_일": int(lt_map.get(sku, 0)),
+            }
+        )
+    out = pd.DataFrame(parts).sort_values("물류+회전_반영_추가발주", ascending=False)
+    return out.reset_index(drop=True)
+
+
+def inject_theme_css():
+    st.markdown(
+        """
+        <style>
+        .block-container { padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1400px; }
+        div[data-testid="stMetric"] {
+            background: linear-gradient(145deg, #0f172a 0%, #1e293b 100%);
+            border: 1px solid #334155;
+            border-radius: 12px;
+            padding: 14px 16px;
+        }
+        div[data-testid="stMetric"] label { color: #94a3b8 !important; }
+        div[data-testid="stMetric"] [data-testid="stMetricValue"] { color: #f8fafc !important; }
+        h1 { font-weight: 700; letter-spacing: -0.02em; }
+        .hl-short { color: #f87171; font-weight: 600; }
+        .hl-ok { color: #34d399; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+@st.cache_data(ttl=300)
+def load_sku_forecast_run_df() -> pd.DataFrame:
+    return load_supabase_table("sku_forecast_run")
+
+
 def main():
-    st.set_page_config(page_title="SKU 예측 대시보드", layout="wide")
+    st.set_page_config(
+        page_title="결품·발주 취합",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    inject_theme_css()
+
+    st.title("결품 예측 · 매장 회전 · 물류센터 반영 발주")
+    st.caption(
+        "선택 주차 기준으로 매장별 주간 예측 대비 기초재고를 비교합니다. "
+        "PLC(재고÷주간예측)가 긴 매장은 회전 출고 가능 잉여로 보고, "
+        "물류센터 재고와 합산해 **추가 발주** 추정치를 냅니다."
+    )
 
     try:
+        weekly_raw = load_sku_weekly_forecast_df()
+        center_df = load_center_stock_df()
+        reorder_df = load_reorder_df()
         runs_df = load_sku_forecast_run_df()
-        weekly_df = load_sku_weekly_forecast_df()
-        monthly_df = load_sku_monthly_forecast_df()
     except Exception as e:
         st.error(f"Supabase 테이블을 불러오지 못했습니다: {e}")
         return
 
-    wk_fr = first_existing_col(weekly_df, ["forecast_run_id", "forecast_runid"])
-    mo_fr = first_existing_col(monthly_df, ["forecast_run_id", "forecast_runid"])
-
-    if weekly_df.empty:
-        st.warning("sku_weekly_forecast 테이블에 데이터가 없습니다.")
-        return
-    if wk_fr is None:
-        st.warning("sku_weekly_forecast에 forecast_run_id 컬럼이 없습니다.")
+    if weekly_raw.empty:
+        st.warning("sku_weekly_forecast에 데이터가 없습니다.")
         return
 
-    batches = list_run_batches(runs_df, weekly_df)
-    if not batches:
+    wk_fr = first_existing_col(weekly_raw, ["forecast_run_id", "forecast_runid"])
+    weekly_filtered = weekly_raw.copy()
+
+    st.sidebar.markdown("### 데이터 범위")
+    use_batch = False
+    selected_batch_key: Optional[Any] = None
+    if wk_fr and weekly_raw[wk_fr].notna().any():
+        batches = list_run_batches(runs_df, weekly_raw)
+        if batches:
+            use_batch = st.sidebar.checkbox("예측 배치(forecast_run_id)로 필터", value=True)
+            if use_batch:
+                batch_labels = {
+                    str(k): f"{pd.Timestamp(rd).strftime('%Y-%m-%d %H:%M')} · batch={k} · {n}행"
+                    for k, rd, n in batches
+                }
+                batch_keys_ordered = [b[0] for b in batches]
+                selected_batch_str = st.sidebar.selectbox(
+                    "실행 배치",
+                    options=[batch_labels[str(k)] for k in batch_keys_ordered],
+                    index=0,
+                )
+                inv_lbl = {v: k for k, v in batch_labels.items()}
+                selected_batch_key = inv_lbl[selected_batch_str]
+                try:
+                    selected_batch_key = type(batch_keys_ordered[0])(selected_batch_key)
+                except (ValueError, TypeError, IndexError):
+                    pass
+                weekly_filtered = filter_by_run_key(weekly_raw, wk_fr, selected_batch_key)
+
+    norm = normalize_weekly_slice(weekly_filtered)
+    if norm.empty:
         st.warning(
-            "예측 배치를 식별할 수 없습니다. sku_weekly_forecast.forecast_run_id와 "
-            "sku_forecast_run의 id 또는 forecast_run_id가 일치하는지 확인하세요."
+            "sku_weekly_forecast에서 필수 컬럼(sku, year_week, sale_qty 또는 forecast_qty)을 찾지 못했습니다."
         )
         return
 
-    batch_labels = {
-        str(k): f"{pd.Timestamp(rd).strftime('%Y-%m-%d %H:%M')} · batch={k} · 주간행 {n}건"
-        for k, rd, n in batches
-    }
-    batch_keys_ordered = [b[0] for b in batches]
+    fc_only = st.sidebar.checkbox("미래 예측 행만(is_forecast=true)", value=True)
+    if fc_only:
+        norm = norm[norm["_is_fc"] == True].copy()  # noqa: E712
 
-    st.sidebar.markdown("### 예측 배치")
-    selected_batch_str = st.sidebar.selectbox(
-        "실행 배치 선택",
-        options=[batch_labels[str(k)] for k in batch_keys_ordered],
-        index=0,
-    )
-    inv_lbl = {v: k for k, v in batch_labels.items()}
-    selected_batch_key = inv_lbl[selected_batch_str]
-    try:
-        selected_batch_key = type(batch_keys_ordered[0])(selected_batch_key)
-    except (ValueError, TypeError, IndexError):
-        pass
+    norm = dedupe_weekly_latest(norm)
 
-    weekly_run = filter_by_run_key(weekly_df, wk_fr, selected_batch_key)
-    monthly_run = (
-        filter_by_run_key(monthly_df, mo_fr, selected_batch_key) if mo_fr else pd.DataFrame()
-    )
-
-    sku_w = first_existing_col(weekly_run, ["sku", "SKU"])
-    pl_w = first_existing_col(weekly_run, ["plant", "PLANT"])
-    sty_w = first_existing_col(weekly_run, ["sty", "style_code", "stylecode"])
-
-    if not sku_w:
-        st.warning("sku_weekly_forecast에서 sku 컬럼을 찾을 수 없습니다.")
+    yw_list = sorted(norm["_year_week"].unique().tolist(), reverse=True)
+    if not yw_list:
+        st.warning("주차(year_week) 값이 없습니다.")
         return
 
-    opt_rows = (
-        weekly_run[[c for c in [sku_w, pl_w, sty_w] if c]]
-        .drop_duplicates()
-        .sort_values([sku_w] + ([pl_w] if pl_w else []) + ([sty_w] if sty_w else []))
-        .reset_index(drop=True)
+    year_week = st.sidebar.selectbox("기준 주차 (year_week)", options=yw_list, index=0)
+    plc_thr = st.sidebar.number_input(
+        "회전 출고 판단 PLC(주) 기준",
+        min_value=1.0,
+        max_value=52.0,
+        value=4.0,
+        step=0.5,
+        help="재고÷주간예측이 이 값보다 크면 판매 부진·회전 출고 후보로 잉여 수량을 계산합니다.",
     )
 
-    if pl_w:
-        opt_rows["plant_name"] = (
-            opt_rows[pl_w].fillna("").astype(str).str.strip().replace("", "전체")
-        )
-    else:
-        opt_rows["plant_name"] = "전체"
-    opt_rows["style_code"] = (
-        opt_rows[sty_w].astype(str).str.strip() if sty_w else opt_rows[sku_w].astype(str).str.slice(0, 10)
-    )
-    opt_rows["sku"] = opt_rows[sku_w].astype(str).str.strip()
-    opt_rows["sku_name"] = opt_rows["sku"]
-    opt_rows["option_id"] = opt_rows.apply(
-        lambda r: f"{r['plant_name']}||{r['sku']}",
-        axis=1,
-    )
-    opt_rows["display_label"] = opt_rows.apply(
-        lambda r: f"{r['sku_name']} | 매장:{r['plant_name']} | 스타일:{r['style_code']}",
-        axis=1,
-    )
+    if st.sidebar.button("데이터 새로고침"):
+        st.cache_data.clear()
+        st.rerun()
 
-    if opt_rows.empty:
-        st.warning("선택한 배치에 SKU 행이 없습니다.")
+    center_by_sku = center_stock_by_sku(center_df)
+    moq_df = reorder_params_by_sku(reorder_df)
+
+    store_level = compute_store_rows_for_week(norm, year_week, plc_thr)
+    if store_level.empty:
+        st.warning(f"선택한 주차 **{year_week}** 에 해당하는 행이 없습니다.")
         return
 
-    col_a, col_b, col_c = st.columns([1, 1, 2])
+    summary = aggregate_sku_summary(store_level, center_by_sku, moq_df)
 
-    with col_a:
-        plants = sorted(opt_rows["plant_name"].dropna().astype(str).unique().tolist())
-        plant_options = ["전체"] + [p for p in plants if p and p != "전체"]
-        if not plant_options:
-            plant_options = ["전체"]
-        selected_plant = st.selectbox("매장 선택", options=plant_options)
+    total_extra = int(summary["물류+회전_반영_추가발주"].sum())
+    total_short_stores = int(store_level[store_level["역할"] == "결품위험"]["매장"].nunique())
+    skus_at_risk = int((summary["결품위험_매장수"] > 0).sum())
 
-    pf = opt_rows.copy()
-    if selected_plant != "전체":
-        pf = pf[pf["plant_name"] == selected_plant].copy()
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("추가 발주 필요 SKU 수", f"{skus_at_risk}")
+    with m2:
+        st.metric("결품 위험 매장·SKU 건수", f"{len(store_level[store_level['역할'] == '결품위험'])}")
+    with m3:
+        st.metric("고유 결품위험 매장 수", f"{total_short_stores}")
+    with m4:
+        st.metric("전체 SKU 추가발주(추정)", f"{total_extra:,}")
 
-    with col_b:
-        styles = sorted(pf["style_code"].dropna().astype(str).str.strip().unique().tolist())
-        style_options = ["전체"] + [s for s in styles if s]
-        selected_style = st.selectbox("스타일(sty / 앞 10자)", options=style_options)
-
-    with col_c:
-        fo = pf.copy()
-        if selected_style != "전체":
-            fo = fo[fo["style_code"].astype(str).str.strip() == selected_style].copy()
-        if fo.empty:
-            st.warning("선택한 매장·스타일에 해당하는 상품이 없습니다.")
-            return
-        oid = st.selectbox(
-            "상품 선택",
-            options=fo["option_id"].tolist(),
-            format_func=lambda x: fo.loc[fo["option_id"] == x, "display_label"].iloc[0],
-        )
-
-    sel = fo[fo["option_id"] == oid].iloc[0]
-    selected_sku = str(sel["sku"]).strip()
-    selected_plant_val = str(sel["plant_name"]).strip()
-    plant_for_filter = None if selected_plant_val in ("", "전체") else selected_plant_val
-
-    w_slice = weekly_run[weekly_run[sku_w].astype(str).str.strip() == selected_sku]
-    if pl_w and plant_for_filter:
-        w_slice = w_slice[w_slice[pl_w].astype(str).str.strip() == plant_for_filter]
-
-    m_slice = pd.DataFrame()
-    sku_m = first_existing_col(monthly_run, ["sku", "SKU"]) if not monthly_run.empty else None
-    pl_m = first_existing_col(monthly_run, ["plant", "PLANT"]) if not monthly_run.empty else None
-    if mo_fr and not monthly_run.empty and sku_m:
-        m_slice = monthly_run[monthly_run[sku_m].astype(str).str.strip() == selected_sku]
-        if pl_m and plant_for_filter:
-            m_slice = m_slice[m_slice[pl_m].astype(str).str.strip() == plant_for_filter]
-
-    weekly_ts = weekly_rows_to_timeseries(w_slice)
-    monthly_ts = monthly_rows_to_timeseries(m_slice)
-
-    if weekly_ts.empty:
-        st.warning("선택한 SKU의 주간 예측 데이터가 없습니다.")
-        return
-
-    if monthly_ts.empty:
-        monthly_ts = (
-            weekly_ts.assign(month=weekly_ts["week_start"].dt.to_period("M").dt.to_timestamp())
-            .groupby("month", as_index=False)["sales"]
-            .sum()
-            .sort_values("month")
-            .reset_index(drop=True)
-        )
-
-    shape_label, shape_reason = get_run_meta_for_sku(
-        runs_df, selected_batch_key, selected_sku, plant_for_filter
+    st.markdown("---")
+    st.subheader("SKU별 취합")
+    st.caption(
+        "매장결품부족_합: 결품 위험 매장의 max(예측−기초재고) 합. "
+        "회전가능잉여_합: PLC 기준 초과 재고. "
+        "물류+회전_반영_추가발주 = max(0, 부족합−물류센터) − min(회전잉여, 그 잔여)."
     )
 
-    label_year = int(pd.Timestamp.today().year)
-    compare_table_df = build_forecast_weekly_table(
-        weekly_ts, selected_sku, selected_sku, label_year
-    )
-
-    st.markdown("### 주차별 예측 비중 · 예측 수량")
+    display_cols = [
+        "sku",
+        "sku_name",
+        "결품위험_매장수",
+        "회전출고_매장수",
+        "매장결품부족_합",
+        "물류센터_재고",
+        "회전가능잉여_합",
+        "회전으로_충당(상한)",
+        "물류+회전_반영_추가발주",
+        "MOQ(참고)",
+        "MOQ반영_제안발주",
+        "리드타임_일",
+    ]
     st.dataframe(
-        compare_table_df.drop(columns=["SKU", "SKU_NAME"], errors="ignore"),
+        summary[display_cols],
         use_container_width=True,
         hide_index=True,
         column_config={
-            "주차별 예측 비중(%)": st.column_config.NumberColumn(
-                "주차별 예측 비중(%)",
-                format="%.2f%%",
-            ),
-            "주차별 예측 수량": st.column_config.NumberColumn(
-                "주차별 예측 수량",
-                format="%.0f",
-            ),
+            "sku": st.column_config.TextColumn("SKU"),
+            "sku_name": st.column_config.TextColumn("상품명"),
+            "매장결품부족_합": st.column_config.NumberColumn("매장 부족 합", format="%d"),
+            "물류센터_재고": st.column_config.NumberColumn("물류센터", format="%d"),
+            "회전가능잉여_합": st.column_config.NumberColumn("회전 잉여 합", format="%d"),
+            "물류+회전_반영_추가발주": st.column_config.NumberColumn("추가 발주", format="%d"),
+            "MOQ반영_제안발주": st.column_config.NumberColumn("MOQ 반영 제안", format="%d"),
         },
     )
 
-    st.markdown(f"### SKU: **{selected_sku}**")
-    st.markdown(f"### 형태(메타): **{shape_label}**")
-    st.caption(shape_reason)
+    st.markdown("---")
+    st.subheader("매장별 상세 (드릴다운)")
 
-    if shape_label in ("단봉형",):
-        st.markdown("**참고 단계 순서(단봉):** 도입 > 성장 > 피크 > 성숙 > 쇠퇴")
-    elif shape_label in ("쌍봉형",):
-        st.markdown("**참고 단계 순서(쌍봉):** 도입 > 성장 > 피크 > 성숙 > 비시즌 > 성숙 > 피크2 > 성숙 > 쇠퇴")
-    elif shape_label not in ("—", "판단불가"):
-        st.markdown("**참고 단계 순서(올시즌 등):** 도입 > 성장 > 성숙 > 쇠퇴")
+    sku_options = summary["sku"].tolist()
+    if not sku_options:
+        sku_options = sorted(store_level["sku"].unique().tolist())
 
-    col1, col2 = st.columns([1, 1])
-
-    with col1:
-        st.markdown("### 주차·월별 예측 추이")
-        fig1 = build_dual_line_chart(selected_sku, weekly_ts, monthly_ts)
-        st.plotly_chart(fig1, use_container_width=True)
-
-    with col2:
-        st.markdown("### 주차별 예측 수량")
-        fig2 = go.Figure()
-        tw = weekly_ts.copy()
-        tw["week_no"] = tw["week_start"].dt.isocalendar().week.astype(int)
-        fig2.add_trace(
-            go.Scatter(
-                x=tw["week_start"],
-                y=tw["sales"],
-                customdata=tw["week_no"].values.reshape(-1, 1),
-                name="주간 예측",
-                mode="lines+markers",
-                hovertemplate=(
-                    "주차: %{customdata[0]}주차<br>날짜: %{x|%Y-%m-%d}<br>예측 수량: %{y:,.0f}<extra></extra>"
-                ),
-            )
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        pick = st.selectbox("SKU 선택", options=sku_options, index=0)
+    with c2:
+        role_filter = st.multiselect(
+            "역할 필터",
+            options=["결품위험", "회전출고(판매부진)", "정상"],
+            default=["결품위험", "회전출고(판매부진)"],
         )
-        y0, y1 = tw["week_start"].min(), tw["week_start"].max()
-        fig2.update_layout(
-            title=f"{selected_sku} 주차별 예측 수량",
-            xaxis_title="날짜",
-            yaxis_title="예측 수량",
-            height=650,
-            hovermode="x unified",
-            xaxis=dict(range=[y0, y1] if pd.notna(y0) else None),
-            yaxis=dict(rangemode="tozero"),
+
+    det = store_level[store_level["sku"] == pick].copy()
+    if role_filter:
+        det = det[det["역할"].isin(role_filter)].copy()
+
+    det_display = det[
+        [
+            "매장",
+            "주간예측수요",
+            "기초재고",
+            "PLC_주",
+            "역할",
+            "결품부족분",
+            "회전가능잉여",
+        ]
+    ].sort_values(["역할", "결품부족분"], ascending=[True, False])
+
+    st.dataframe(
+        det_display,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "주간예측수요": st.column_config.NumberColumn("주간 예측", format="%.2f"),
+            "PLC_주": st.column_config.NumberColumn("PLC(주)", format="%.2f"),
+            "결품부족분": st.column_config.NumberColumn("결품 부족", format="%d"),
+            "회전가능잉여": st.column_config.NumberColumn("회전 잉여", format="%d"),
+        },
+    )
+
+    sub_sum = summary[summary["sku"] == pick]
+    if not sub_sum.empty:
+        row = sub_sum.iloc[0]
+        st.markdown(
+            f"**선택 SKU 요약** — 부족 합: **{int(row['매장결품부족_합']):,}**, "
+            f"물류센터: **{int(row['물류센터_재고']):,}**, "
+            f"회전 잉여 합: **{int(row['회전가능잉여_합']):,}**, "
+            f"<span class='hl-short'>추가 발주(추정): **{int(row['물류+회전_반영_추가발주']):,}**</span>",
+            unsafe_allow_html=True,
         )
-        st.plotly_chart(fig2, use_container_width=True)
+    elif pick:
+        st.info("선택한 SKU는 상단 취합표에 없을 수 있습니다. 아래 표는 매장별 원시 행입니다.")
+
+    with st.expander("계산 로직 요약"):
+        st.markdown(
+            """
+            1. **기준 주차** `year_week`의 `sale_qty`(또는 `forecast_qty`)를 주간 예측 수요로 사용합니다.
+            2. **기초재고**는 `begin_stock`을 사용합니다.
+            3. **결품 위험**: 예측 수요 > 기초재고 인 매장. 부족분 = 예측 − 재고.
+            4. **PLC(주)** = 기초재고 ÷ 주간예측 (예측이 0이면 해석 제한).
+            5. **회전 출고**: PLC > 기준주(기본 4주)인 매장에서, 잉여 = 재고 − 기준주×예측 (0 이상).
+            6. **SKU 추가 발주** = 먼저 `center_stock`으로 부족을 충당한 뒤, 남은 부족에 대해 회전 잉여로 `min(회전 잉여, 남은 부족)` 만큼 차감합니다.
+            7. `reorder.minimum_capacity`가 있으면 발주가 필요한 경우에만 max(추정, MOQ)를 **제안**으로 표시합니다.
+            """
+        )
 
 
 if __name__ == "__main__":
