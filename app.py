@@ -92,6 +92,19 @@ def sort_year_week_labels(labels: List[str]) -> List[str]:
     return sorted(uniq, key=year_week_sort_key, reverse=True)
 
 
+def sort_year_week_labels_asc(labels: List[str]) -> List[str]:
+    """주차 라벨 정렬: 과거 → 최신 (스프레드시트 타임라인 행 순서)."""
+    seen = set()
+    uniq: List[str] = []
+    for x in labels:
+        t = str(x).strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        uniq.append(t)
+    return sorted(uniq, key=year_week_sort_key, reverse=False)
+
+
 def diagnose_sku_weekly_forecast_unusable(weekly_df: pd.DataFrame) -> str:
     """
     normalize_weekly_slice 결과가 비었을 때, 테이블·원인을 문장으로 설명.
@@ -303,6 +316,121 @@ def center_stock_by_sku(center_df: pd.DataFrame) -> pd.Series:
         lambda s: sum(to_int_safe(x) for x in s)
     )
     return g
+
+
+def center_two_bucket_qty(center_df: pd.DataFrame, sku: str) -> Tuple[Tuple[str, int], Tuple[str, int]]:
+    """
+    와이드 표용 물류 재고 2열: (라벨1, 수량1), (라벨2, 수량2).
+    창고/센터 컬럼이 있으면 재고 큰 순 1위 + 나머지 합(또는 2위), 없으면 전체→첫 열, 둘째는 0.
+    """
+    sku_key = str(sku).strip()
+    sku_c = first_existing_col(center_df, ["sku", "SKU"])
+    qty_c = first_existing_col(center_df, ["stock_qty", "stockqty", "qty"])
+    if center_df.empty or not sku_key or not sku_c or not qty_c:
+        return (("center 1", 0), ("center 2", 0))
+    loc_c = first_existing_col(
+        center_df,
+        [
+            "warehouse",
+            "center_name",
+            "dc_code",
+            "dc",
+            "center",
+            "plant",
+            "location",
+            "물류센터",
+            "창고",
+        ],
+    )
+    csub = center_df[center_df[sku_c].astype(str).str.strip() == sku_key]
+    if csub.empty:
+        return (("center 1", 0), ("center 2", 0))
+
+    def sum_qty(frame: pd.DataFrame) -> int:
+        return int(sum(to_int_safe(x) for x in frame[qty_c]))
+
+    if loc_c:
+        g = csub.groupby(csub[loc_c].astype(str).str.strip(), dropna=False)[qty_c].apply(
+            lambda s: sum(to_int_safe(x) for x in s)
+        )
+        items = sorted(
+            ((str(name), int(to_int_safe(q))) for name, q in g.items()),
+            key=lambda x: -x[1],
+        )
+        if len(items) >= 2:
+            a, qa = items[0]
+            rest = sum(q for _, q in items[1:])
+            if len(items) == 2:
+                b, qb = items[1]
+                return ((a, qa), (b, qb))
+            return ((a, qa), ("기타센터 합", rest))
+        if len(items) == 1:
+            return (items[0], ("center 2", 0))
+    total = sum_qty(csub)
+    return (("물류(전체)", total), ("—", 0))
+
+
+def _sale_qty_from_norm_row(r: pd.Series) -> float:
+    """표시용 판매량: 예측 전용(_fc_sale) 우선, 없으면 주간 수요(_demand)."""
+    fc_raw = r["_fc_sale"] if "_fc_sale" in r.index else np.nan
+    d = r["_demand"] if "_demand" in r.index else 0.0
+    if pd.notna(fc_raw):
+        return round(max(float(fc_raw), 0.0), 2)
+    dd = float(d) if pd.notna(d) else 0.0
+    return round(max(dd, 0.0), 2)
+
+
+def build_sku_week_wide_table(
+    norm: pd.DataFrame,
+    sku: str,
+    center_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, str]:
+    """
+    스프레드시트형: 행=주차(과거→최신), 열=물류 2개(재고량) + 매장별 판매량·기초재고량.
+    center_stock에 주차가 없으면 물류 재고는 현재 스냅샷을 모든 주차 행에 동일 반복.
+    """
+    sku_key = str(sku).strip()
+    if norm.empty or not sku_key:
+        return pd.DataFrame(), ""
+    sub = norm[norm["_sku"].astype(str).str.strip() == sku_key].copy()
+    if sub.empty:
+        return pd.DataFrame(), ""
+
+    weeks = sort_year_week_labels_asc(sub["_year_week"].tolist())
+    stores = sorted(
+        {str(s).strip() for s in sub["_store"].tolist() if str(s).strip() and str(s).strip() != "_unknown"}
+    )
+    if not stores:
+        stores = sorted({str(s).strip() for s in sub["_store"].tolist() if str(s).strip()})
+
+    key_df = sub.sort_values("_created", na_position="last").drop_duplicates(
+        subset=["_year_week", "_store"], keep="last"
+    )
+
+    (n1, q1), (n2, q2) = center_two_bucket_qty(center_df, sku_key)
+    c1_col = f"{n1} · 재고량"
+    c2_col = f"{n2} · 재고량"
+
+    rows_out: List[dict] = []
+    for yw in weeks:
+        row: dict = {"주차": yw, c1_col: q1, c2_col: q2}
+        sl = key_df[key_df["_year_week"].astype(str).str.strip() == str(yw).strip()]
+        for st in stores:
+            m = sl[sl["_store"].astype(str).str.strip() == st]
+            if m.empty:
+                row[f"{st} · 판매량"] = 0.0
+                row[f"{st} · 기초재고량"] = 0
+            else:
+                r0 = m.iloc[0]
+                row[f"{st} · 판매량"] = _sale_qty_from_norm_row(r0)
+                row[f"{st} · 기초재고량"] = int(to_int_safe(r0.get("_stock", 0)))
+        rows_out.append(row)
+
+    note = (
+        "물류 **재고량**은 `center_stock` 기준입니다(테이블에 **주차**가 없으면 모든 주차 행에 **동일 값**을 둡니다). "
+        "매장 **판매량**은 예측 컬럼(`forecast_qty` 등)이 있으면 그 값, 없으면 PLC·결품에 쓰는 주간 수요와 동일합니다."
+    )
+    return pd.DataFrame(rows_out), note
 
 
 def reorder_lt_moq_for_skus(
@@ -809,64 +937,37 @@ def main():
     )
 
     st.markdown("---")
-    st.subheader("선택 SKU · 매장별 판매·재고 전개")
-    st.caption(
-        "`sku_weekly_forecast`에서 매장별 **기판매량**(실적·기반 컬럼)과 **예측판매량**(예측 전용 컬럼)을 읽어 표시합니다. "
-        "예측 전용 컬럼이 없으면 예측 열은 PLC·결품 계산에 쓰인 주간 수요와 동일하게 둡니다."
-    )
-    spread = store_level[store_level["sku"].astype(str) == str(detail_sku)].copy()
-    if spread.empty and detail_sku:
-        st.warning(f"SKU **`{detail_sku}`** 에 해당하는 매장 행이 없습니다.")
-    else:
-        spread_cols = [
-            "매장",
-            "기판매량",
-            "예측판매량",
-            "주간예측수요",
-            "기초재고",
-            "PLC_주",
-            "역할",
-            "결품부족분",
-            "회전가능잉여",
-        ]
-        spread_display = spread[spread_cols].sort_values(
-            ["역할", "결품부족분"], ascending=[True, False]
+    st.subheader("선택 SKU · 주차×물류×매장 와이드 표")
+    wide_df, wide_note = build_sku_week_wide_table(norm, str(detail_sku), center_df)
+    if wide_df.empty:
+        st.warning(
+            f"SKU **`{detail_sku}`** 에 해당하는 `sku_weekly_forecast` 행이 없어 와이드 표를 만들 수 없습니다."
         )
+    else:
+        st.caption(
+            "**행:** 주차(과거→최신) · **열:** 물류 2곳 `재고량` + 매장(plant)마다 `판매량`·`기초재고량`. "
+            + wide_note
+        )
+        num_cols: dict = {"주차": st.column_config.TextColumn("주차")}
+        for c in wide_df.columns:
+            if c == "주차":
+                continue
+            if "재고량" in c:
+                num_cols[c] = st.column_config.NumberColumn(c, format="%d")
+            elif "판매량" in c:
+                num_cols[c] = st.column_config.NumberColumn(c, format="%.2f")
+            elif "기초재고량" in c:
+                num_cols[c] = st.column_config.NumberColumn(c, format="%d")
+            else:
+                num_cols[c] = st.column_config.NumberColumn(c)
         st.dataframe(
-            spread_display,
+            wide_df,
             use_container_width=True,
             hide_index=True,
-            column_config={
-                "기판매량": st.column_config.NumberColumn("기판매량", format="%.2f"),
-                "예측판매량": st.column_config.NumberColumn("예측판매량", format="%.2f"),
-                "주간예측수요": st.column_config.NumberColumn("주간수요(계산)", format="%.2f"),
-                "PLC_주": st.column_config.NumberColumn("PLC(주)", format="%.2f"),
-                "결품부족분": st.column_config.NumberColumn("결품 부족", format="%d"),
-                "회전가능잉여": st.column_config.NumberColumn("회전 잉여", format="%d"),
-            },
+            column_config=num_cols,
         )
 
-    st.markdown("---")
-    st.subheader("물류센터 재고 · 동일 SKU (2행)")
-    st.caption(
-        "① 센터 **보유** ② 매장 **결품 부족 합**을 센터 재고로 먼저 충당했다고 가정한 뒤 **센터 잔여**입니다. "
-        "(실제 배분·출고 규칙과 다르면 수치는 참고용입니다.)"
-    )
     sum_detail = summary[summary["sku"].astype(str) == str(detail_sku)]
-    if sum_detail.empty:
-        st.info("선택 SKU가 취합 요약에 없어 물류 2행을 표시하지 않습니다.")
-    else:
-        r_sum = sum_detail.iloc[0]
-        logistics_df = logistics_stock_two_rows(
-            int(r_sum["물류센터_재고"]),
-            int(r_sum["매장결품부족_합"]),
-        )
-        st.dataframe(
-            logistics_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={"수량": st.column_config.NumberColumn("수량", format="%d")},
-        )
 
     st.markdown("---")
     st.subheader("최종: 물류·회전 반영 후 추가 발주")
