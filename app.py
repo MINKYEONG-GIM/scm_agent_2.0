@@ -380,21 +380,61 @@ def _sale_qty_from_norm_row(r: pd.Series) -> float:
     return round(max(dd, 0.0), 2)
 
 
+def _format_hist_fc_sale_cell(r0: Optional[pd.Series]) -> str:
+    """
+    매장 열 1칸: 기판매량 / 예측판매량 (sku_weekly_forecast의 실적·예측 컬럼 매핑 결과).
+    비어 있으면 '—' 와 주간 수요 기반 예측 표시를 조합.
+    """
+    if r0 is None or r0.empty:
+        return "— / —"
+    hist_raw = r0["_hist_sale"] if "_hist_sale" in r0.index else np.nan
+    fc_raw = r0["_fc_sale"] if "_fc_sale" in r0.index else np.nan
+    d = r0["_demand"] if "_demand" in r0.index else 0.0
+    dem = float(d) if pd.notna(d) else 0.0
+    dem_r = round(max(dem, 0.0), 2)
+
+    if pd.notna(hist_raw):
+        h_txt = str(round(max(float(hist_raw), 0.0), 2))
+    else:
+        h_txt = "—"
+
+    if pd.notna(fc_raw):
+        f_txt = str(round(max(float(fc_raw), 0.0), 2))
+    else:
+        f_txt = str(dem_r) if dem_r > 0 or h_txt != "—" else "—"
+
+    return f"{h_txt} / {f_txt}"
+
+
+def build_sku_logistics_two_rows(center_df: pd.DataFrame, sku: str) -> pd.DataFrame:
+    """물류 재고 2행: 센터(또는 창고) 단위 재고량 — 주차 표와 분리해 상단에 둠."""
+    sku_key = str(sku).strip()
+    (n1, q1), (n2, q2) = center_two_bucket_qty(center_df, sku_key)
+    return pd.DataFrame(
+        [
+            {"구분": f"{n1} · 재고량", "수량": int(q1)},
+            {"구분": f"{n2} · 재고량", "수량": int(q2)},
+        ]
+    )
+
+
 def build_sku_week_wide_table(
     norm: pd.DataFrame,
     sku: str,
     center_df: pd.DataFrame,
-) -> Tuple[pd.DataFrame, str]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
     """
-    스프레드시트형: 행=주차(과거→최신), 열=물류 2개(재고량) + 매장별 판매량·기초재고량.
-    center_stock에 주차가 없으면 물류 재고는 현재 스냅샷을 모든 주차 행에 동일 반복.
+    스프레드시트형:
+    - 물류: `build_sku_logistics_two_rows` — 2행(센터별 재고), `center_stock` 스냅샷.
+    - 주차 표: 행=주차(과거→최신), 열=매장별 '판매(기판매/예측)' 한 칸 + 기초재고량.
     """
     sku_key = str(sku).strip()
+    log_df = build_sku_logistics_two_rows(center_df, sku_key)
     if norm.empty or not sku_key:
-        return pd.DataFrame(), ""
+        return log_df, pd.DataFrame(), ""
     sub = norm[norm["_sku"].astype(str).str.strip() == sku_key].copy()
     if sub.empty:
-        return pd.DataFrame(), ""
+        return log_df, pd.DataFrame(), ""
 
     weeks = sort_year_week_labels_asc(sub["_year_week"].tolist())
     stores = sorted(
@@ -407,30 +447,27 @@ def build_sku_week_wide_table(
         subset=["_year_week", "_store"], keep="last"
     )
 
-    (n1, q1), (n2, q2) = center_two_bucket_qty(center_df, sku_key)
-    c1_col = f"{n1} · 재고량"
-    c2_col = f"{n2} · 재고량"
-
     rows_out: List[dict] = []
     for yw in weeks:
-        row: dict = {"주차": yw, c1_col: q1, c2_col: q2}
+        row: dict = {"주차": yw}
         sl = key_df[key_df["_year_week"].astype(str).str.strip() == str(yw).strip()]
         for st in stores:
             m = sl[sl["_store"].astype(str).str.strip() == st]
             if m.empty:
-                row[f"{st} · 판매량"] = 0.0
+                row[f"{st} · 판매(기판매/예측)"] = "— / —"
                 row[f"{st} · 기초재고량"] = 0
             else:
                 r0 = m.iloc[0]
-                row[f"{st} · 판매량"] = _sale_qty_from_norm_row(r0)
+                row[f"{st} · 판매(기판매/예측)"] = _format_hist_fc_sale_cell(r0)
                 row[f"{st} · 기초재고량"] = int(to_int_safe(r0.get("_stock", 0)))
         rows_out.append(row)
 
     note = (
-        "물류 **재고량**은 `center_stock` 기준입니다(테이블에 **주차**가 없으면 모든 주차 행에 **동일 값**을 둡니다). "
-        "매장 **판매량**은 예측 컬럼(`forecast_qty` 등)이 있으면 그 값, 없으면 PLC·결품에 쓰는 주간 수요와 동일합니다."
+        "**물류**는 `center_stock` 기준 **2행**(센터·창고별 재고)으로만 표시합니다. "
+        "**매장 판매** 열은 `sku_weekly_forecast`에서 읽은 **기판매량 / 예측판매량** 문자열이며, "
+        "예측 컬럼이 없으면 주간 수요(`sale_qty` 등)를 예측 쪽에 씁니다."
     )
-    return pd.DataFrame(rows_out), note
+    return log_df, pd.DataFrame(rows_out), note
 
 
 def reorder_lt_moq_for_skus(
@@ -864,7 +901,7 @@ def main():
         "매장 전개 · 물류 · 최종 발주 SKU",
         options=sku_choices or [""],
         index=min(_detail_ix, max(0, len(sku_choices) - 1)) if sku_choices else 0,
-        help="매장별 판매·재고 표, 물류 2행, 최종 추가 발주 요약에 쓰는 SKU입니다.",
+        help="물류 2행 + 매장별 판매(기판매/예측)·기초재고 주차 표, 최종 추가 발주 요약에 쓰는 SKU입니다.",
     )
 
     if st.sidebar.button("데이터 새로고침"):
@@ -937,29 +974,38 @@ def main():
     )
 
     st.markdown("---")
-    st.subheader("선택 SKU · 주차×물류×매장 와이드 표")
-    wide_df, wide_note = build_sku_week_wide_table(norm, str(detail_sku), center_df)
+    st.subheader("선택 SKU · 물류 2행 + 주차×매장 와이드 표")
+    log_wide, wide_df, wide_note = build_sku_week_wide_table(norm, str(detail_sku), center_df)
+    st.caption(
+        "**물류:** `center_stock` 기준 **2행**. **주차 표:** 행=주차(과거→최신), 열=매장마다 "
+        "`판매(기판매/예측)` + `기초재고량`. " + wide_note
+    )
+    st.markdown("**물류 재고 (2행)**")
+    st.dataframe(
+        log_wide,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "구분": st.column_config.TextColumn("구분"),
+            "수량": st.column_config.NumberColumn("수량", format="%d"),
+        },
+    )
     if wide_df.empty:
         st.warning(
-            f"SKU **`{detail_sku}`** 에 해당하는 `sku_weekly_forecast` 행이 없어 와이드 표를 만들 수 없습니다."
+            f"SKU **`{detail_sku}`** 에 해당하는 `sku_weekly_forecast` 행이 없어 주차·매장 표를 만들 수 없습니다."
         )
     else:
-        st.caption(
-            "**행:** 주차(과거→최신) · **열:** 물류 2곳 `재고량` + 매장(plant)마다 `판매량`·`기초재고량`. "
-            + wide_note
-        )
+        st.markdown("**주차 × 매장**")
         num_cols: dict = {"주차": st.column_config.TextColumn("주차")}
         for c in wide_df.columns:
             if c == "주차":
                 continue
-            if "재고량" in c:
-                num_cols[c] = st.column_config.NumberColumn(c, format="%d")
-            elif "판매량" in c:
-                num_cols[c] = st.column_config.NumberColumn(c, format="%.2f")
+            if "판매(기판매/예측)" in c:
+                num_cols[c] = st.column_config.TextColumn(c, width="medium")
             elif "기초재고량" in c:
                 num_cols[c] = st.column_config.NumberColumn(c, format="%d")
             else:
-                num_cols[c] = st.column_config.NumberColumn(c)
+                num_cols[c] = st.column_config.TextColumn(c)
         st.dataframe(
             wide_df,
             use_container_width=True,
