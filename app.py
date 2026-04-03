@@ -815,6 +815,51 @@ def aggregate_sku_summary(store_df: pd.DataFrame, center_by_sku: pd.Series, moq_
     return out.reset_index(drop=True)
 
 
+def overview_kpis(
+    store_level: pd.DataFrame,
+    summary: pd.DataFrame,
+    stockout_horizon_weeks: float = 2.0,
+) -> dict:
+    """
+    상단 4메트릭.
+    - 분배된 매장수: 선택 주차에서 기초재고 > 0 인 매장·SKU 중 고유 매장 수.
+    - 누판율: 실적 기판매 합이 있으면 100×(실적합/총기초재고), 없으면 주간수요 합으로 동일 식 근사(%).
+    - 2주 내 결품 위험 매장 수: 주간수요>0 이고 기초재고/주간수요 < 2 인 행이 하나라도 있는 고유 매장 수.
+    - 추가 발주량: SKU 취합 표의 물류+회전_반영_추가발주 합.
+    """
+    out = {
+        "분배된_매장수": 0,
+        "누판율_퍼센트": 0.0,
+        "주차내_결품위험_매장수": 0,
+        "추가_발주량": 0,
+    }
+    if store_level.empty:
+        return out
+
+    inv = pd.to_numeric(store_level["기초재고"], errors="coerce").fillna(0)
+    distributed_mask = inv > 0
+    out["분배된_매장수"] = int(store_level.loc[distributed_mask, "매장"].nunique())
+
+    hist = pd.to_numeric(store_level["기판매량"], errors="coerce")
+    hist_sum = float(hist.sum()) if hist.notna().any() else 0.0
+    dem = pd.to_numeric(store_level["주간예측수요"], errors="coerce").fillna(0.0)
+    dem_sum = float(dem.sum())
+    inv_sum = float(inv.sum())
+    eps = 1e-6
+    num = hist_sum if hist_sum > eps else dem_sum
+    out["누판율_퍼센트"] = round(100.0 * num / max(inv_sum, 1.0), 2)
+
+    d = pd.to_numeric(store_level["주간예측수요"], errors="coerce").fillna(0.0)
+    s = pd.to_numeric(store_level["기초재고"], errors="coerce").fillna(0.0)
+    risk = (d > eps) & (s / d < float(stockout_horizon_weeks))
+    out["주차내_결품위험_매장수"] = int(store_level.loc[risk, "매장"].nunique())
+
+    if summary is not None and not summary.empty and "물류+회전_반영_추가발주" in summary.columns:
+        out["추가_발주량"] = int(pd.to_numeric(summary["물류+회전_반영_추가발주"], errors="coerce").fillna(0).sum())
+
+    return out
+
+
 def logistics_stock_two_rows(center_qty: int, store_deficit_total: int) -> pd.DataFrame:
     """
     물류 재고를 2행으로 표시: ① 센터 보유 합 ② 매장 결품 부족 충당 가정 후 센터 잔여.
@@ -873,7 +918,7 @@ def main():
     )
     inject_theme_css()
 
-    st.title("결품 예측 · 매장 회전 · 물류센터 반영 발주")
+    st.title("스파오 리오더 의사결정 Agent")
     reorder_headline_ph = st.empty()
 
     weekly_raw = pd.DataFrame()
@@ -994,7 +1039,7 @@ def main():
         "매장 전개 · 물류 · 최종 발주 SKU",
         options=sku_choices or [""],
         index=min(_detail_ix, max(0, len(sku_choices) - 1)) if sku_choices else 0,
-        help="물류 2행 + 매장별 판매(기판매/예측)·기초재고 주차 표, 최종 추가 발주 요약에 쓰는 SKU입니다.",
+        help="주차×매장 표(물류재고 열·판매·기초재고), 최종 추가 발주 요약에 쓰는 SKU입니다.",
     )
 
     if st.sidebar.button("데이터 새로고침"):
@@ -1014,19 +1059,17 @@ def main():
         unsafe_allow_html=True,
     )
 
-    total_extra = int(summary["물류+회전_반영_추가발주"].sum())
-    total_short_stores = int(store_level[store_level["역할"] == "결품위험"]["매장"].nunique())
-    skus_at_risk = int((summary["결품위험_매장수"] > 0).sum())
+    ov = overview_kpis(store_level, summary, stockout_horizon_weeks=2.0)
 
     m1, m2, m3, m4 = st.columns(4)
     with m1:
-        st.metric("추가 발주 필요 SKU 수", f"{skus_at_risk}")
+        st.metric("분배된 매장수", f"{ov['분배된_매장수']:,}")
     with m2:
-        st.metric("결품 위험 매장·SKU 건수", f"{len(store_level[store_level['역할'] == '결품위험'])}")
+        st.metric("누판율", f"{ov['누판율_퍼센트']:.1f}%")
     with m3:
-        st.metric("고유 결품위험 매장 수", f"{total_short_stores}")
+        st.metric("2주 내 결품 위험 매장 수", f"{ov['주차내_결품위험_매장수']:,}")
     with m4:
-        st.metric("전체 SKU 추가발주(추정)", f"{total_extra:,}")
+        st.metric("추가 발주량", f"{ov['추가_발주량']:,}")
 
     st.markdown("---")
     st.subheader("SKU별 취합")
