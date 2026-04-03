@@ -345,6 +345,75 @@ def center_stock_by_sku(center_df: pd.DataFrame) -> pd.Series:
     return g
 
 
+def reorder_guidance_for_sku(
+    sku: str,
+    store_level: pd.DataFrame,
+    center_by_sku: pd.Series,
+    lead_time_days: int,
+    minimum_capacity: int,
+    sales_weeks: float,
+    ref_date: Optional[pd.Timestamp] = None,
+) -> str:
+    """
+    매장 기초재고 + 물류센터 재고를 주간 합계 수요로 나눈 커버일과 리드타임으로
+    '이날까지 발주' 기한을 추정하고, 발주 수량은 sales_weeks 주 판매분(주간합계×주수) 기준.
+    """
+    sl = store_level[store_level["sku"] == sku]
+    if sl.empty:
+        return (
+            f"SKU <strong>{sku}</strong> 에 대한 매장 행이 없어 리오더 안내를 표시할 수 없습니다."
+        )
+
+    weekly_total = float(sl["주간예측수요"].sum())
+    store_stock_sum = int(sl["기초재고"].sum())
+    if isinstance(center_by_sku, pd.Series) and sku in center_by_sku.index:
+        center_qty = int(to_int_safe(center_by_sku.loc[sku]))
+    else:
+        center_qty = 0
+    total_inv = store_stock_sum + center_qty
+
+    lt = max(0, int(lead_time_days))
+    moq = max(0, int(minimum_capacity))
+    sw = float(sales_weeks)
+    if sw <= 0:
+        sw = 4.0
+
+    order_qty_raw = int(round(weekly_total * sw)) if weekly_total > 0 else 0
+    order_qty = max(order_qty_raw, moq) if moq > 0 else order_qty_raw
+
+    if ref_date is None:
+        ref_date = pd.Timestamp.now()
+    try:
+        base = pd.Timestamp(ref_date).normalize()
+    except Exception:
+        base = pd.Timestamp.now().normalize()
+
+    eps = 1e-6
+    if weekly_total <= eps:
+        sw_txt = str(int(sw)) if abs(sw - round(sw)) < 1e-9 else str(sw)
+        return (
+            f"리오더 리드타임 <strong>{lt}일</strong> 기준, 주간 수요 합이 <strong>0</strong>이라 "
+            f"결품 방지 발주 기한을 산출할 수 없습니다. "
+            f"(최소발주수량: <strong>{moq}장</strong>, <strong>{sw_txt}주</strong> 판매량 기준 발주 시 제안 수량: "
+            f"<strong>{order_qty}장</strong>)."
+        )
+
+    cover_days = 7.0 * float(total_inv) / weekly_total
+    days_until_must_order = cover_days - float(lt)
+    deadline = base + pd.Timedelta(days=int(np.floor(max(0.0, days_until_must_order))))
+
+    mo = int(deadline.month)
+    dd = int(deadline.day)
+    sw_disp = int(sw) if abs(sw - round(sw)) < 1e-9 else sw
+    sw_txt = str(sw_disp) if isinstance(sw_disp, int) else str(sw_disp)
+
+    return (
+        f"리오더 리드타임 <strong>{lt}일</strong> 기준, <strong>{mo}월 {dd}일</strong> 이내 "
+        f"<strong>{order_qty}장</strong> 리오더 발주 필요합니다 "
+        f"(최소발주수량: <strong>{moq}장</strong>, <strong>{sw_txt}주</strong> 판매량 기준 발주)."
+    )
+
+
 def reorder_params_by_sku(reorder_df: pd.DataFrame) -> pd.DataFrame:
     if reorder_df.empty:
         return pd.DataFrame(columns=["sku", "lead_time_days", "minimum_capacity"])
@@ -486,6 +555,17 @@ def inject_theme_css():
         h1 { font-weight: 700; letter-spacing: -0.02em; }
         .hl-short { color: #f87171; font-weight: 600; }
         .hl-ok { color: #34d399; }
+        .reorder-headline {
+            font-size: 1.2rem;
+            font-weight: 600;
+            line-height: 1.45;
+            margin: 0.35rem 0 0.5rem 0;
+            padding: 12px 14px;
+            background: linear-gradient(145deg, #1e293b 0%, #0f172a 100%);
+            border: 1px solid #334155;
+            border-radius: 10px;
+            color: #e2e8f0;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -506,6 +586,7 @@ def main():
     inject_theme_css()
 
     st.title("결품 예측 · 매장 회전 · 물류센터 반영 발주")
+    reorder_headline_ph = st.empty()
     st.caption(
         "선택 주차 기준으로 매장별 주간 예측 대비 기초재고를 비교합니다. "
         "PLC(재고÷주간예측)가 긴 매장은 회전 출고 가능 잉여로 보고, "
@@ -613,6 +694,14 @@ def main():
         step=0.5,
         help="재고÷주간예측이 이 값보다 크면 판매 부진·회전 출고 후보로 잉여 수량을 계산합니다.",
     )
+    reorder_sales_weeks = st.sidebar.number_input(
+        "리오더 발주 기준 판매 주수",
+        min_value=1.0,
+        max_value=52.0,
+        value=4.0,
+        step=0.5,
+        help="발주 제안 수량 = (해당 SKU 주간 예측 합) × 이 값. 업무 기준에 맞게 바꿀 수 있습니다.",
+    )
 
     if st.sidebar.button("데이터 새로고침"):
         st.cache_data.clear()
@@ -628,6 +717,7 @@ def main():
     if r_warn:
         st.info(r_warn)
 
+    # 취합·회전·물류 반영·리오더 문구: 항상 전체 매장 데이터로 계산 (매장 조회 필터는 아래 상세 표에만 적용)
     store_level = compute_store_rows_for_week(norm, year_week, plc_thr)
     if store_level.empty:
         st.warning(
@@ -637,6 +727,39 @@ def main():
         return
 
     summary = aggregate_sku_summary(store_level, center_by_sku, moq_df)
+
+    st.sidebar.markdown("### 리오더 안내")
+    sku_opts_headline = summary["sku"].tolist()
+    if not sku_opts_headline:
+        sku_opts_headline = sorted(store_level["sku"].unique().tolist())
+    guidance_sku = st.sidebar.selectbox(
+        "SKU (리오더 문구·상세 표)",
+        options=sku_opts_headline,
+        index=0,
+    )
+    g_row = summary[summary["sku"] == guidance_sku]
+    if not g_row.empty:
+        _lt = int(g_row["리드타임_일"].iloc[0])
+        _moq = int(g_row["MOQ(참고)"].iloc[0])
+    else:
+        _lt = 0
+        _moq = 0
+        if not moq_df.empty and guidance_sku in moq_df["sku"].astype(str).values:
+            m = moq_df[moq_df["sku"].astype(str) == str(guidance_sku)].iloc[-1]
+            _lt = int(m["lead_time_days"])
+            _moq = int(m["minimum_capacity"])
+    headline_txt = reorder_guidance_for_sku(
+        str(guidance_sku),
+        store_level,
+        center_by_sku,
+        _lt,
+        _moq,
+        reorder_sales_weeks,
+    )
+    reorder_headline_ph.markdown(
+        f'<div class="reorder-headline">{headline_txt}</div>',
+        unsafe_allow_html=True,
+    )
 
     total_extra = int(summary["물류+회전_반영_추가발주"].sum())
     total_short_stores = int(store_level[store_level["역할"] == "결품위험"]["매장"].nunique())
@@ -691,26 +814,35 @@ def main():
 
     st.markdown("---")
     st.subheader("매장별 상세 (드릴다운)")
+    st.caption(
+        "**매장** 선택은 이 표만 좁혀 보는 용도입니다. "
+        "SKU 취합·메트릭·리오더 안내·회전/물류 로직은 **항상 전체 매장** 기준입니다."
+    )
 
-    sku_options = summary["sku"].tolist()
-    if not sku_options:
-        sku_options = sorted(store_level["sku"].unique().tolist())
+    pick = guidance_sku
 
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        pick = st.selectbox("SKU 선택", options=sku_options, index=0)
-    with c2:
-        role_filter = st.multiselect(
-            "역할 필터",
-            options=["결품위험", "회전출고(판매부진)", "정상"],
-            default=["결품위험", "회전출고(판매부진)"],
-        )
+    _store_names = sorted(store_level["매장"].astype(str).unique().tolist())
+    view_store = st.selectbox(
+        "매장 (상세 표 조회만)",
+        options=["전체"] + _store_names,
+        index=0,
+    )
+
+    role_filter = st.multiselect(
+        "역할 필터",
+        options=["결품위험", "회전출고(판매부진)", "정상"],
+        default=["결품위험", "회전출고(판매부진)"],
+    )
 
     det = store_level[store_level["sku"] == pick].copy()
     if role_filter:
         det = det[det["역할"].isin(role_filter)].copy()
 
-    det_display = det[
+    view_det = det.copy()
+    if view_store != "전체":
+        view_det = view_det[view_det["매장"].astype(str) == str(view_store)].copy()
+
+    det_display = view_det[
         [
             "매장",
             "주간예측수요",
@@ -760,6 +892,8 @@ def main():
             5. **회전 출고**: PLC > 기준주(기본 4주)인 매장에서, 잉여 = 재고 − 기준주×예측 (0 이상).
             6. **SKU 추가 발주** = 먼저 `center_stock`으로 부족을 충당한 뒤, 남은 부족에 대해 회전 잉여로 `min(회전 잉여, 남은 부족)` 만큼 차감합니다.
             7. `reorder.minimum_capacity`가 있으면 발주가 필요한 경우에만 max(추정, MOQ)를 **제안**으로 표시합니다.
+            8. 상단 **리오더 문구**: `reorder.lead_time`·`minimum_capacity`와 (매장 기초재고 합+물류센터)÷주간예측합으로 **가용 일수**를 잡고, `가용 일수 − 리드타임` 만큼 오늘부터 일수를 더한 날짜를 **발주 기한(월·일)** 으로 표시합니다. 발주 수량은 사이드바 **판매 주수** × 해당 SKU **주간 예측 합**이며 MOQ 이상으로 맞춥니다.
+            9. **매장** 드롭다운은 하단 상세 표 **조회용**이며, 취합·이동·결품 판단 계산에는 사용하지 않습니다. (스타일 등 다른 차원 필터를 두는 경우에도 매장만큼은 계산 파이프라인에 넣지 않는 것이 안전합니다.)
             """
         )
 
