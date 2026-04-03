@@ -80,6 +80,65 @@ def sort_year_week_labels(labels: List[str]) -> List[str]:
     return sorted(uniq, key=year_week_sort_key, reverse=True)
 
 
+def diagnose_sku_weekly_forecast_unusable(weekly_df: pd.DataFrame) -> str:
+    """
+    normalize_weekly_slice 결과가 비었을 때, 테이블·원인을 문장으로 설명.
+    """
+    t = "`public.sku_weekly_forecast`"
+    if weekly_df.empty:
+        return (
+            f"{t}에서 **조회된 행이 없습니다**. "
+            "사이드바의 예측 배치 필터를 끄거나, 해당 배치에 맞는 데이터가 있는지 확인하세요."
+        )
+    sku_c = first_existing_col(weekly_df, ["sku", "SKU"])
+    yw_c = first_existing_col(weekly_df, ["year_week", "yearweek"])
+    missing_cols: List[str] = []
+    if not sku_c:
+        missing_cols.append("`sku`")
+    if not yw_c:
+        missing_cols.append("`year_week`")
+    if missing_cols:
+        cols = ", ".join(weekly_df.columns.astype(str).tolist())
+        return (
+            f"{t}에 필요한 컬럼이 없습니다: {', '.join(missing_cols)}. "
+            f"(현재 컬럼: {cols})"
+        )
+    sk = weekly_df[sku_c].astype(str).str.strip()
+    yw = weekly_df[yw_c].astype(str).str.strip()
+    if (sk == "").all() and len(weekly_df) > 0:
+        return f"{t}에 **`sku` 값이 비어 있는 행만** 있어 계산할 수 없습니다."
+    if (yw == "").all() and len(weekly_df) > 0:
+        return f"{t}에 **`year_week` 값이 비어 있는 행만** 있어 계산할 수 없습니다."
+    return (
+        f"{t} 데이터를 읽었으나 **`sku`·`year_week`가 모두 유효한 행이 없습니다**. "
+        "값에 공백만 있는지 확인하세요."
+    )
+
+
+def diagnose_center_stock_columns(center_df: pd.DataFrame) -> Optional[str]:
+    if center_df.empty:
+        return "`public.center_stock`에 **행이 없습니다** — 물류센터 재고는 **0**으로 계산됩니다."
+    sku_c = first_existing_col(center_df, ["sku", "SKU"])
+    qty_c = first_existing_col(center_df, ["stock_qty", "stockqty", "qty"])
+    miss: List[str] = []
+    if not sku_c:
+        miss.append("`sku`")
+    if not qty_c:
+        miss.append("`stock_qty`")
+    if not miss:
+        return None
+    return f"`public.center_stock`에 없는 컬럼: {', '.join(miss)} → 물류센터 재고는 **0**으로 계산됩니다."
+
+
+def diagnose_reorder_columns(reorder_df: pd.DataFrame) -> Optional[str]:
+    if reorder_df.empty:
+        return "`public.reorder`에 **행이 없습니다** — MOQ·리드타임은 반영하지 않습니다."
+    sku_c = first_existing_col(reorder_df, ["sku", "SKU"])
+    if sku_c:
+        return None
+    return "`public.reorder`에 `sku` 컬럼이 없어 MOQ·리드타임을 쓸 수 없습니다."
+
+
 def load_supabase_table(table_name: str, page_size: int = 1000) -> pd.DataFrame:
     all_rows = []
     start = 0
@@ -279,9 +338,9 @@ def center_stock_by_sku(center_df: pd.DataFrame) -> pd.Series:
     qty_c = first_existing_col(center_df, ["stock_qty", "stockqty", "qty"])
     if not sku_c or not qty_c:
         return pd.Series(dtype=float)
-    g = (
-        center_df.groupby(sku_c.astype(str).str.strip())[qty_c]
-        .apply(lambda s: sum(to_int_safe(x) for x in s))
+    sku_key = center_df[sku_c].astype(str).str.strip()
+    g = center_df.groupby(sku_key, dropna=False)[qty_c].apply(
+        lambda s: sum(to_int_safe(x) for x in s)
     )
     return g
 
@@ -453,17 +512,32 @@ def main():
         "물류센터 재고와 합산해 **추가 발주** 추정치를 냅니다."
     )
 
-    try:
-        weekly_raw = load_sku_weekly_forecast_df()
-        center_df = load_center_stock_df()
-        reorder_df = load_reorder_df()
-        runs_df = load_sku_forecast_run_df()
-    except Exception as e:
-        st.error(f"Supabase 테이블을 불러오지 못했습니다: {e}")
-        return
+    weekly_raw = pd.DataFrame()
+    center_df = pd.DataFrame()
+    reorder_df = pd.DataFrame()
+    runs_df = pd.DataFrame()
+    for label, loader, tname in [
+        ("sku_weekly_forecast", load_sku_weekly_forecast_df, "public.sku_weekly_forecast"),
+        ("center_stock", load_center_stock_df, "public.center_stock"),
+        ("reorder", load_reorder_df, "public.reorder"),
+        ("sku_forecast_run", load_sku_forecast_run_df, "public.sku_forecast_run"),
+    ]:
+        try:
+            df = loader()
+        except Exception as e:
+            st.error(f"`{tname}` 테이블을 불러오지 못했습니다: {e}")
+            return
+        if label == "sku_weekly_forecast":
+            weekly_raw = df
+        elif label == "center_stock":
+            center_df = df
+        elif label == "reorder":
+            reorder_df = df
+        else:
+            runs_df = df
 
     if weekly_raw.empty:
-        st.warning("sku_weekly_forecast에 데이터가 없습니다.")
+        st.warning("`public.sku_weekly_forecast` 테이블에 **데이터 행이 없습니다**.")
         return
 
     wk_fr = weekly_batch_key_col(weekly_raw)
@@ -502,9 +576,7 @@ def main():
 
     norm = normalize_weekly_slice(weekly_filtered)
     if norm.empty:
-        st.warning(
-            "sku_weekly_forecast에서 필수 컬럼(**sku**, **year_week**)을 찾지 못했습니다."
-        )
+        st.warning(diagnose_sku_weekly_forecast_unusable(weekly_filtered))
         return
 
     norm_before_fc = norm.copy()
@@ -517,8 +589,8 @@ def main():
         norm = norm_before_fc[norm_before_fc["_is_fc"] == True].copy()  # noqa: E712
         if norm.empty and not norm_before_fc.empty:
             st.warning(
-                "**is_forecast=true** 인 행이 없어 필터 결과가 비었습니다. "
-                "위 옵션을 끄면 `year_week`(예: 26년 12월 5주차)가 표시됩니다."
+                "`public.sku_weekly_forecast`에 **`is_forecast` = true** 인 행이 없어 필터 결과가 비었습니다. "
+                "위 옵션을 끄거나 DB의 `is_forecast` 값을 확인하세요."
             )
             norm = norm_before_fc.copy()
 
@@ -527,8 +599,8 @@ def main():
     yw_list = sort_year_week_labels(norm["_year_week"].tolist())
     if not yw_list:
         st.warning(
-            "**year_week** 값이 모두 비었거나, 배치 필터로 남은 행이 없습니다. "
-            "사이드바에서 배치 필터를 끄거나 데이터를 확인해 주세요."
+            "`public.sku_weekly_forecast`에서 유효한 **`year_week`** 값을 찾지 못했습니다. "
+            "(배치 필터로 행이 0건이 되었거나, `year_week` 컬럼이 모두 비어 있을 수 있습니다.)"
         )
         return
 
@@ -549,9 +621,19 @@ def main():
     center_by_sku = center_stock_by_sku(center_df)
     moq_df = reorder_params_by_sku(reorder_df)
 
+    c_warn = diagnose_center_stock_columns(center_df)
+    if c_warn:
+        st.info(c_warn)
+    r_warn = diagnose_reorder_columns(reorder_df)
+    if r_warn:
+        st.info(r_warn)
+
     store_level = compute_store_rows_for_week(norm, year_week, plc_thr)
     if store_level.empty:
-        st.warning(f"선택한 주차 **{year_week}** 에 해당하는 행이 없습니다.")
+        st.warning(
+            f"`public.sku_weekly_forecast`에 선택한 주차 **`{year_week}`** 와 일치하는 **`year_week`** 행이 없습니다. "
+            "사이드바에서 다른 주차를 선택하세요."
+        )
         return
 
     summary = aggregate_sku_summary(store_level, center_by_sku, moq_df)
@@ -663,7 +745,10 @@ def main():
             unsafe_allow_html=True,
         )
     elif pick:
-        st.info("선택한 SKU는 상단 취합표에 없을 수 있습니다. 아래 표는 매장별 원시 행입니다.")
+        st.info(
+            "선택한 SKU가 `public.sku_weekly_forecast` 기준 상단 취합에 없을 수 있습니다. "
+            "아래는 동일 테이블의 매장별 행입니다."
+        )
 
     with st.expander("계산 로직 요약"):
         st.markdown(
