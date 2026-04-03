@@ -469,12 +469,17 @@ def _display_sale_one_value(r0: Optional[pd.Series]) -> Tuple[float, bool]:
 def style_week_store_wide(
     df: pd.DataFrame,
     forecast_mask: pd.DataFrame,
-    sale_substr: str = " · 판매",
+    sale_substr: str = "판매량",
 ):
     """예측 판매 열만 빨간색(rose) 강조."""
-    sale_cols = [c for c in df.columns if sale_substr in str(c)]
-    inv_cols = [c for c in df.columns if "기초재고량" in str(c)]
-    logistics_col = "물류재고(합)" if "물류재고(합)" in df.columns else None
+    def _leaf_name(col) -> str:
+        if isinstance(col, tuple) and len(col) >= 2:
+            return str(col[1])
+        return str(col)
+
+    sale_cols = [c for c in df.columns if sale_substr in _leaf_name(c)]
+    inv_cols = [c for c in df.columns if "기초재고량" in _leaf_name(c)]
+    logistics_cols = [c for c in df.columns if "재고량" in _leaf_name(c) and c not in inv_cols]
 
     def _apply_row(row: pd.Series) -> List[str]:
         ri = int(row.name)
@@ -497,8 +502,8 @@ def style_week_store_wide(
         styler = styler.format("{:.2f}", subset=sale_cols, na_rep="0.00")
     if inv_cols:
         styler = styler.format("{:.0f}", subset=inv_cols, na_rep="0")
-    if logistics_col:
-        styler = styler.format("{:.0f}", subset=[logistics_col], na_rep="0")
+    if logistics_cols:
+        styler = styler.format("{:.0f}", subset=logistics_cols, na_rep="0")
     return styler
 
 
@@ -509,7 +514,7 @@ def build_sku_week_wide_table(
     center_by_sku: pd.Series,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
     """
-    스프레드시트형: 행=주차(과거→최신), 열=물류재고(합) + 매장별 판매(단일 값) + 기초재고량.
+    스프레드시트형: 행=주차(과거→최신), 열=물류센터1/2 재고량 + 매장별 판매량/기초재고량(2단 헤더).
     판매가 예쪽만 있을 때 forecast_mask 해당 열 True → 표에서 빨간색.
     """
     sku_key = str(sku).strip()
@@ -520,12 +525,7 @@ def build_sku_week_wide_table(
     if sub.empty:
         return pd.DataFrame(), empty_mask, ""
 
-    if isinstance(center_by_sku, pd.Series) and sku_key in center_by_sku.index:
-        center_qty_total = int(to_int_safe(center_by_sku.loc[sku_key]))
-    else:
-        center_qty_total = int(
-            to_int_safe(center_stock_by_sku(center_df).get(sku_key, 0))
-        )
+    (c1_name, c1_qty), (c2_name, c2_qty) = center_two_bucket_qty(center_df, sku_key)
 
     weeks = sort_year_week_labels_asc(sub["_year_week"].tolist())
     stores = sorted(
@@ -541,12 +541,21 @@ def build_sku_week_wide_table(
     rows_out: List[dict] = []
     mask_rows: List[dict] = []
     for yw in weeks:
-        row: dict = {"주차": yw, "물류재고(합)": center_qty_total}
-        mk: dict = {"주차": False, "물류재고(합)": False}
+        row: dict = {
+            ("주차", ""): yw,
+            (str(c1_name), "재고량"): int(c1_qty),
+            (str(c2_name), "재고량"): int(c2_qty),
+        }
+        mk: dict = {
+            ("주차", ""): False,
+            (str(c1_name), "재고량"): False,
+            (str(c2_name), "재고량"): False,
+        }
         sl = key_df[key_df["_year_week"].astype(str).str.strip() == str(yw).strip()]
-        for st in stores:
-            sale_col = f"{st} · 판매"
-            inv_col = f"{st} · 기초재고량"
+        for i, st in enumerate(stores, start=1):
+            plant = f"plant {i}"
+            sale_col = (plant, "판매량")
+            inv_col = (plant, "기초재고량")
             m = sl[sl["_store"].astype(str).str.strip() == st]
             if m.empty:
                 row[sale_col] = 0.0
@@ -565,9 +574,16 @@ def build_sku_week_wide_table(
 
     wide_df = pd.DataFrame(rows_out)
     fc_mask_df = pd.DataFrame(mask_rows)
+    ordered_cols = [("주차", ""), (str(c1_name), "재고량"), (str(c2_name), "재고량")]
+    for i in range(1, len(stores) + 1):
+        ordered_cols.extend([(f"plant {i}", "판매량"), (f"plant {i}", "기초재고량")])
+    wide_df = wide_df.reindex(columns=ordered_cols)
+    fc_mask_df = fc_mask_df.reindex(columns=ordered_cols, fill_value=False)
+    wide_df.columns = pd.MultiIndex.from_tuples(wide_df.columns)
+    fc_mask_df.columns = pd.MultiIndex.from_tuples(fc_mask_df.columns)
     note = (
-        "**물류재고(합)** 은 `center_stock`에서 해당 SKU **전 센터 재고 합**입니다(주차 무관·스냅샷). "
-        "**판매** 는 실적이 있으면 실적만, 없으면 예측만 표시하며 **예측만 쓸 때 빨간색**입니다."
+        "**헤더**는 요청하신 2단 구조(물류센터/plant + 재고량·판매량·기초재고량)입니다. "
+        "**판매량**은 실적 우선, 실적이 없고 예측만 있으면 빨간색으로 표시합니다."
     )
     return wide_df, fc_mask_df, note
 
@@ -818,12 +834,13 @@ def aggregate_sku_summary(store_df: pd.DataFrame, center_by_sku: pd.Series, moq_
 def overview_kpis(
     store_level: pd.DataFrame,
     summary: pd.DataFrame,
+    norm_df: Optional[pd.DataFrame] = None,
     stockout_horizon_weeks: float = 2.0,
 ) -> dict:
     """
     상단 4메트릭.
-    - 분배된 매장수: 선택 주차에서 기초재고 > 0 인 매장·SKU 중 고유 매장 수.
-    - 누판율: 실적 기판매 합이 있으면 100×(실적합/총기초재고), 없으면 주간수요 합으로 동일 식 근사(%).
+    - 분배된 매장수: `sku_weekly_forecast`의 plant(store) distinct 개수.
+    - 누판율: 100×(전체 총 판매량 / 전체 입고량).
     - 2주 내 결품 위험 매장 수: 주간수요>0 이고 기초재고/주간수요 < 2 인 행이 하나라도 있는 고유 매장 수.
     - 추가 발주량: SKU 취합 표의 물류+회전_반영_추가발주 합.
     """
@@ -836,21 +853,20 @@ def overview_kpis(
     if store_level.empty:
         return out
 
-    inv = pd.to_numeric(store_level["기초재고"], errors="coerce").fillna(0)
-    distributed_mask = inv > 0
-    out["분배된_매장수"] = int(store_level.loc[distributed_mask, "매장"].nunique())
+    if norm_df is not None and not norm_df.empty and "_store" in norm_df.columns:
+        stores = norm_df["_store"].astype(str).str.strip()
+        stores = stores[(stores != "") & (stores != "_unknown")]
+        out["분배된_매장수"] = int(stores.nunique())
+    else:
+        out["분배된_매장수"] = int(store_level["매장"].astype(str).str.strip().nunique())
 
-    hist = pd.to_numeric(store_level["기판매량"], errors="coerce")
-    hist_sum = float(hist.sum()) if hist.notna().any() else 0.0
-    dem = pd.to_numeric(store_level["주간예측수요"], errors="coerce").fillna(0.0)
-    dem_sum = float(dem.sum())
-    inv_sum = float(inv.sum())
-    eps = 1e-6
-    num = hist_sum if hist_sum > eps else dem_sum
-    out["누판율_퍼센트"] = round(100.0 * num / max(inv_sum, 1.0), 2)
+    total_sales = float(pd.to_numeric(store_level["기판매량"], errors="coerce").fillna(0.0).sum())
+    total_receipt = float(pd.to_numeric(store_level["기초재고"], errors="coerce").fillna(0.0).sum())
+    out["누판율_퍼센트"] = round(100.0 * total_sales / max(total_receipt, 1.0), 2)
 
     d = pd.to_numeric(store_level["주간예측수요"], errors="coerce").fillna(0.0)
     s = pd.to_numeric(store_level["기초재고"], errors="coerce").fillna(0.0)
+    eps = 1e-6
     risk = (d > eps) & (s / d < float(stockout_horizon_weeks))
     out["주차내_결품위험_매장수"] = int(store_level.loc[risk, "매장"].nunique())
 
@@ -1059,7 +1075,7 @@ def main():
         unsafe_allow_html=True,
     )
 
-    ov = overview_kpis(store_level, summary, stockout_horizon_weeks=2.0)
+    ov = overview_kpis(store_level, summary, norm_df=norm, stockout_horizon_weeks=2.0)
 
     m1, m2, m3, m4 = st.columns(4)
     with m1:
@@ -1115,7 +1131,7 @@ def main():
         norm, str(detail_sku), center_df, center_by_sku
     )
     st.caption(
-        "행=주차, 열=**물류재고(합)** + 매장별 **판매**(실적만 표시·예측만일 때 **빨간색**) + **기초재고량**. "
+        "행=주차, 열=**물류센터 1/2 재고량** + 매장별 **판매량**(실적 우선·예측만일 때 **빨간색**) + **기초재고량**. "
         + wide_note
     )
     if wide_df.empty:
