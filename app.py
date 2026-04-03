@@ -15,9 +15,6 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # 회전 출고(잉여 재고) 판단: PLC(주) = 기초재고÷주간예측이 이 값을 넘는 매장에서 잉여 계산. 화면에서 변경하지 않음.
 DEFAULT_PLC_WEEKS: float = 4.0
 
-# True면 is_forecast=true 행만 사용. 화면에서 변경하지 않음.
-FORECAST_ROWS_ONLY: bool = True
-
 # 리오더 제안 수량: (해당 SKU 주간 예측 합) × 이 주수. 웹에서 선택하지 않으며 코드만 수정.
 DEFAULT_REORDER_SALES_WEEKS: float = 4.0
 
@@ -195,10 +192,22 @@ def load_reorder_df() -> pd.DataFrame:
     return load_supabase_table("reorder")
 
 
+def _is_forecast_to_bool(x) -> bool:
+    """DB `is_forecast`: true=미래 예측 판매, false=실제 판매. 결측은 예측(true)로 두어 단일 행 스키마와 호환."""
+    if pd.isna(x):
+        return True
+    if isinstance(x, (bool, np.bool_)):
+        return bool(x)
+    s = str(x).strip().lower()
+    if s in ("false", "0", "no", "f", "n"):
+        return False
+    return True
+
+
 def normalize_weekly_slice(weekly_df: pd.DataFrame) -> pd.DataFrame:
     """
-    sku_weekly_forecast → 표준 컬럼: sku, store, year_week, demand_w, begin_stock,
-    is_forecast, sku_name, created_at (테이블의 모든 행 사용, 배치별 필터 없음)
+    sku_weekly_forecast → 표준 컬럼. `sale_qty` + `is_forecast` 규약:
+    false → 실제 판매(기판매), true → 미래 판매 예측. 동일 (sku, 매장, 주차)에 행이 둘 있을 수 있음.
     """
     if weekly_df.empty:
         return pd.DataFrame()
@@ -253,25 +262,38 @@ def normalize_weekly_slice(weekly_df: pd.DataFrame) -> pd.DataFrame:
         else pd.Series("_unknown", index=out.index)
     )
     out["_year_week"] = out[yw_c].astype(str).str.strip()
-    if dem_c:
-        out["_demand"] = out[dem_c].apply(clean_number)
-    else:
-        out["_demand"] = 0.0
-    if fc_qty_c:
-        out["_fc_sale"] = out[fc_qty_c].apply(clean_number)
-    else:
-        out["_fc_sale"] = np.nan
-    if hist_c:
-        out["_hist_sale"] = out[hist_c].apply(clean_number)
-    else:
-        out["_hist_sale"] = np.nan
-    out["_stock"] = out[st_c].apply(to_int_safe) if st_c else 0
     if fc_c:
-        out["_is_fc"] = out[fc_c].apply(
-            lambda x: bool(x) if pd.notna(x) else True
-        )
+        out["_is_fc"] = out[fc_c].apply(_is_forecast_to_bool)
     else:
         out["_is_fc"] = True
+
+    dem_name = (str(dem_c).strip().lower() if dem_c else "") or ""
+    use_sale_qty_by_flag = bool(fc_c) and dem_name in ("sale_qty", "saleqty")
+
+    if dem_c:
+        _raw_sale = out[dem_c].apply(clean_number)
+    else:
+        _raw_sale = pd.Series(0.0, index=out.index)
+
+    if use_sale_qty_by_flag:
+        fc_mask = out["_is_fc"].fillna(True).astype(bool)
+        out["_hist_sale"] = _raw_sale.mask(fc_mask, np.nan)
+        out["_fc_sale"] = _raw_sale.mask(~fc_mask, np.nan)
+        out["_demand"] = _raw_sale
+    else:
+        if dem_c:
+            out["_demand"] = _raw_sale
+        else:
+            out["_demand"] = 0.0
+        if fc_qty_c:
+            out["_fc_sale"] = out[fc_qty_c].apply(clean_number)
+        else:
+            out["_fc_sale"] = np.nan
+        if hist_c:
+            out["_hist_sale"] = out[hist_c].apply(clean_number)
+        else:
+            out["_hist_sale"] = np.nan
+    out["_stock"] = out[st_c].apply(to_int_safe) if st_c else 0
     out["_sku_name"] = (
         out[name_c].astype(str).str.strip()
         if name_c
@@ -296,12 +318,60 @@ def normalize_weekly_slice(weekly_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def dedupe_weekly_latest(df: pd.DataFrame) -> pd.DataFrame:
-    """동일 (sku, store, year_week) 최신 행만."""
+def merge_weekly_actual_forecast(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    (sku, 매장, 주차)당 1행으로 합침: 실적 행의 sale_qty→_hist_sale, 예측 행→_fc_sale.
+    주간 수요(_demand)는 예측 값이 있으면 예측, 없으면 실적, 둘 다 없으면 0.
+    기초재고는 예측 행이 있으면 그쪽 최신, 없으면 전체 최신.
+    """
     if df.empty:
         return df
-    df = df.sort_values(["_sku", "_store", "_year_week", "_created"], na_position="last")
-    return df.drop_duplicates(subset=["_sku", "_store", "_year_week"], keep="last")
+    rows: List[dict] = []
+    for (_sku, _store, _yw), g in df.groupby(["_sku", "_store", "_year_week"], dropna=False):
+        g = g.sort_values("_created", na_position="last")
+        hv = pd.to_numeric(g["_hist_sale"], errors="coerce").dropna()
+        fv = pd.to_numeric(g["_fc_sale"], errors="coerce").dropna()
+        hist = float(hv.iloc[-1]) if len(hv) else np.nan
+        fc = float(fv.iloc[-1]) if len(fv) else np.nan
+        if pd.notna(fc):
+            demand = float(fc)
+        elif pd.notna(hist):
+            demand = float(hist)
+        else:
+            dems = pd.to_numeric(g["_demand"], errors="coerce").dropna()
+            demand = float(dems.iloc[-1]) if len(dems) else 0.0
+
+        mask_fc = g["_is_fc"].fillna(True).astype(bool)
+        gfc = g[mask_fc]
+        if not gfc.empty:
+            stock = int(to_int_safe(gfc.iloc[-1].get("_stock", 0)))
+        else:
+            stock = int(to_int_safe(g.iloc[-1].get("_stock", 0)))
+
+        last = g.iloc[-1]
+        style_val = ""
+        if "_style_code" in last.index:
+            style_val = str(last["_style_code"]).strip()
+        rows.append(
+            {
+                "_sku": _sku,
+                "_store": _store,
+                "_year_week": _yw,
+                "_hist_sale": hist,
+                "_fc_sale": fc,
+                "_demand": demand,
+                "_stock": stock,
+                "_is_fc": True,
+                "_sku_name": last.get("_sku_name", _sku),
+                "_style_code": style_val,
+                "_created": last.get("_created", pd.NaT),
+                "_frid": last.get("_frid", np.nan),
+            }
+        )
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["_sku", "_store", "_year_week"], na_position="last")
+    return out.reset_index(drop=True)
 
 
 def center_stock_by_sku(center_df: pd.DataFrame) -> pd.Series:
@@ -380,61 +450,82 @@ def _sale_qty_from_norm_row(r: pd.Series) -> float:
     return round(max(dd, 0.0), 2)
 
 
-def _format_hist_fc_sale_cell(r0: Optional[pd.Series]) -> str:
+def _display_sale_one_value(r0: Optional[pd.Series]) -> Tuple[float, bool]:
     """
-    매장 열 1칸: 기판매량 / 예측판매량 (sku_weekly_forecast의 실적·예측 컬럼 매핑 결과).
-    비어 있으면 '—' 와 주간 수요 기반 예측 표시를 조합.
+    매장 칸에 넣을 단일 판매 값과, 예측(빨간색) 여부.
+    실적(_hist_sale)이 있으면 실적만 표시, 없으면 예측(_fc_sale) 표시=예측 스타일.
     """
-    if r0 is None or r0.empty:
-        return "— / —"
+    if r0 is None or (isinstance(r0, pd.Series) and r0.empty):
+        return (0.0, False)
     hist_raw = r0["_hist_sale"] if "_hist_sale" in r0.index else np.nan
     fc_raw = r0["_fc_sale"] if "_fc_sale" in r0.index else np.nan
-    d = r0["_demand"] if "_demand" in r0.index else 0.0
-    dem = float(d) if pd.notna(d) else 0.0
-    dem_r = round(max(dem, 0.0), 2)
-
     if pd.notna(hist_raw):
-        h_txt = str(round(max(float(hist_raw), 0.0), 2))
-    else:
-        h_txt = "—"
-
+        return (round(max(float(hist_raw), 0.0), 2), False)
     if pd.notna(fc_raw):
-        f_txt = str(round(max(float(fc_raw), 0.0), 2))
-    else:
-        f_txt = str(dem_r) if dem_r > 0 or h_txt != "—" else "—"
-
-    return f"{h_txt} / {f_txt}"
+        return (round(max(float(fc_raw), 0.0), 2), True)
+    return (0.0, False)
 
 
-def build_sku_logistics_two_rows(center_df: pd.DataFrame, sku: str) -> pd.DataFrame:
-    """물류 재고 2행: 센터(또는 창고) 단위 재고량 — 주차 표와 분리해 상단에 둠."""
-    sku_key = str(sku).strip()
-    (n1, q1), (n2, q2) = center_two_bucket_qty(center_df, sku_key)
-    return pd.DataFrame(
-        [
-            {"구분": f"{n1} · 재고량", "수량": int(q1)},
-            {"구분": f"{n2} · 재고량", "수량": int(q2)},
-        ]
-    )
+def style_week_store_wide(
+    df: pd.DataFrame,
+    forecast_mask: pd.DataFrame,
+    sale_substr: str = " · 판매",
+):
+    """예측 판매 열만 빨간색(rose) 강조."""
+    sale_cols = [c for c in df.columns if sale_substr in str(c)]
+    inv_cols = [c for c in df.columns if "기초재고량" in str(c)]
+    logistics_col = "물류재고(합)" if "물류재고(합)" in df.columns else None
+
+    def _apply_row(row: pd.Series) -> List[str]:
+        ri = int(row.name)
+        styles: List[str] = []
+        for c in row.index:
+            if (
+                c in sale_cols
+                and not forecast_mask.empty
+                and ri < len(forecast_mask)
+                and c in forecast_mask.columns
+            ):
+                if bool(forecast_mask.iloc[ri][c]):
+                    styles.append("color: #e11d48; font-weight: 600")
+                    continue
+            styles.append("")
+        return styles
+
+    styler = df.style.apply(_apply_row, axis=1)
+    if sale_cols:
+        styler = styler.format("{:.2f}", subset=sale_cols, na_rep="0.00")
+    if inv_cols:
+        styler = styler.format("{:.0f}", subset=inv_cols, na_rep="0")
+    if logistics_col:
+        styler = styler.format("{:.0f}", subset=[logistics_col], na_rep="0")
+    return styler
 
 
 def build_sku_week_wide_table(
     norm: pd.DataFrame,
     sku: str,
     center_df: pd.DataFrame,
+    center_by_sku: pd.Series,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, str]:
     """
-    스프레드시트형:
-    - 물류: `build_sku_logistics_two_rows` — 2행(센터별 재고), `center_stock` 스냅샷.
-    - 주차 표: 행=주차(과거→최신), 열=매장별 '판매(기판매/예측)' 한 칸 + 기초재고량.
+    스프레드시트형: 행=주차(과거→최신), 열=물류재고(합) + 매장별 판매(단일 값) + 기초재고량.
+    판매가 예쪽만 있을 때 forecast_mask 해당 열 True → 표에서 빨간색.
     """
     sku_key = str(sku).strip()
-    log_df = build_sku_logistics_two_rows(center_df, sku_key)
+    empty_mask = pd.DataFrame()
     if norm.empty or not sku_key:
-        return log_df, pd.DataFrame(), ""
+        return pd.DataFrame(), empty_mask, ""
     sub = norm[norm["_sku"].astype(str).str.strip() == sku_key].copy()
     if sub.empty:
-        return log_df, pd.DataFrame(), ""
+        return pd.DataFrame(), empty_mask, ""
+
+    if isinstance(center_by_sku, pd.Series) and sku_key in center_by_sku.index:
+        center_qty_total = int(to_int_safe(center_by_sku.loc[sku_key]))
+    else:
+        center_qty_total = int(
+            to_int_safe(center_stock_by_sku(center_df).get(sku_key, 0))
+        )
 
     weeks = sort_year_week_labels_asc(sub["_year_week"].tolist())
     stores = sorted(
@@ -448,26 +539,37 @@ def build_sku_week_wide_table(
     )
 
     rows_out: List[dict] = []
+    mask_rows: List[dict] = []
     for yw in weeks:
-        row: dict = {"주차": yw}
+        row: dict = {"주차": yw, "물류재고(합)": center_qty_total}
+        mk: dict = {"주차": False, "물류재고(합)": False}
         sl = key_df[key_df["_year_week"].astype(str).str.strip() == str(yw).strip()]
         for st in stores:
+            sale_col = f"{st} · 판매"
+            inv_col = f"{st} · 기초재고량"
             m = sl[sl["_store"].astype(str).str.strip() == st]
             if m.empty:
-                row[f"{st} · 판매(기판매/예측)"] = "— / —"
-                row[f"{st} · 기초재고량"] = 0
+                row[sale_col] = 0.0
+                row[inv_col] = 0
+                mk[sale_col] = False
+                mk[inv_col] = False
             else:
                 r0 = m.iloc[0]
-                row[f"{st} · 판매(기판매/예측)"] = _format_hist_fc_sale_cell(r0)
-                row[f"{st} · 기초재고량"] = int(to_int_safe(r0.get("_stock", 0)))
+                val, is_fc = _display_sale_one_value(r0)
+                row[sale_col] = val
+                row[inv_col] = int(to_int_safe(r0.get("_stock", 0)))
+                mk[sale_col] = is_fc
+                mk[inv_col] = False
         rows_out.append(row)
+        mask_rows.append(mk)
 
+    wide_df = pd.DataFrame(rows_out)
+    fc_mask_df = pd.DataFrame(mask_rows)
     note = (
-        "**물류**는 `center_stock` 기준 **2행**(센터·창고별 재고)으로만 표시합니다. "
-        "**매장 판매** 열은 `sku_weekly_forecast`에서 읽은 **기판매량 / 예측판매량** 문자열이며, "
-        "예측 컬럼이 없으면 주간 수요(`sale_qty` 등)를 예측 쪽에 씁니다."
+        "**물류재고(합)** 은 `center_stock`에서 해당 SKU **전 센터 재고 합**입니다(주차 무관·스냅샷). "
+        "**판매** 는 실적이 있으면 실적만, 없으면 예측만 표시하며 **예측만 쓸 때 빨간색**입니다."
     )
-    return log_df, pd.DataFrame(rows_out), note
+    return wide_df, fc_mask_df, note
 
 
 def reorder_lt_moq_for_skus(
@@ -803,17 +905,8 @@ def main():
         st.warning(diagnose_sku_weekly_forecast_unusable(weekly_raw))
         return
 
-    norm_before_fc = norm.copy()
-    if FORECAST_ROWS_ONLY:
-        norm = norm_before_fc[norm_before_fc["_is_fc"] == True].copy()  # noqa: E712
-        if norm.empty and not norm_before_fc.empty:
-            st.warning(
-                "`public.sku_weekly_forecast`에 **`is_forecast` = true** 인 행이 없어 필터 결과가 비었습니다. "
-                "코드 상수 `FORECAST_ROWS_ONLY`를 `False`로 두거나 DB의 `is_forecast` 값을 확인하세요."
-            )
-            norm = norm_before_fc.copy()
-
-    norm = dedupe_weekly_latest(norm)
+    # 동일 (sku, 매장, 주차)에 실적·예측 행이 나뉘어 있으면 한 행으로 합침 (sale_qty 의미는 is_forecast로 구분)
+    norm = merge_weekly_actual_forecast(norm)
 
     yw_list = sort_year_week_labels(norm["_year_week"].tolist())
     if not yw_list:
@@ -974,21 +1067,13 @@ def main():
     )
 
     st.markdown("---")
-    st.subheader("선택 SKU · 물류 2행 + 주차×매장 와이드 표")
-    log_wide, wide_df, wide_note = build_sku_week_wide_table(norm, str(detail_sku), center_df)
-    st.caption(
-        "**물류:** `center_stock` 기준 **2행**. **주차 표:** 행=주차(과거→최신), 열=매장마다 "
-        "`판매(기판매/예측)` + `기초재고량`. " + wide_note
+    st.subheader("선택 SKU · 주차 × 매장 표")
+    wide_df, wide_fc_mask, wide_note = build_sku_week_wide_table(
+        norm, str(detail_sku), center_df, center_by_sku
     )
-    st.markdown("**물류 재고 (2행)**")
-    st.dataframe(
-        log_wide,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "구분": st.column_config.TextColumn("구분"),
-            "수량": st.column_config.NumberColumn("수량", format="%d"),
-        },
+    st.caption(
+        "행=주차, 열=**물류재고(합)** + 매장별 **판매**(실적만 표시·예측만일 때 **빨간색**) + **기초재고량**. "
+        + wide_note
     )
     if wide_df.empty:
         st.warning(
@@ -996,22 +1081,8 @@ def main():
         )
     else:
         st.markdown("**주차 × 매장**")
-        num_cols: dict = {"주차": st.column_config.TextColumn("주차")}
-        for c in wide_df.columns:
-            if c == "주차":
-                continue
-            if "판매(기판매/예측)" in c:
-                num_cols[c] = st.column_config.TextColumn(c, width="medium")
-            elif "기초재고량" in c:
-                num_cols[c] = st.column_config.NumberColumn(c, format="%d")
-            else:
-                num_cols[c] = st.column_config.TextColumn(c)
-        st.dataframe(
-            wide_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config=num_cols,
-        )
+        styled = style_week_store_wide(wide_df.reset_index(drop=True), wide_fc_mask.reset_index(drop=True))
+        st.dataframe(styled, use_container_width=True, hide_index=True)
 
     sum_detail = summary[summary["sku"].astype(str) == str(detail_sku)]
 
