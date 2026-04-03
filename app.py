@@ -21,6 +21,9 @@ FORECAST_ROWS_ONLY: bool = True
 # 리오더 제안 수량: (해당 SKU 주간 예측 합) × 이 주수. 웹에서 선택하지 않으며 코드만 수정.
 DEFAULT_REORDER_SALES_WEEKS: float = 4.0
 
+# 회전 출고 시 매장당 반드시 남겨 둘 최소 기초재고(장). 이보다 적게는 넘기지 않음.
+MIN_STORE_RETAIN_QTY: int = 3
+
 
 # =========================
 # 공통 유틸
@@ -192,9 +195,30 @@ def normalize_weekly_slice(weekly_df: pd.DataFrame) -> pd.DataFrame:
         weekly_df, ["store_name", "storename", "매장", "plant", "PLANT"]
     )
     yw_c = first_existing_col(weekly_df, ["year_week", "yearweek"])
+    # 주간 수요(PLC·결품 등 계산): 기존과 동일한 후보 우선순위
     dem_c = first_existing_col(
         weekly_df, ["sale_qty", "forecast_qty", "forecastqty", "saleqty"]
     )
+    # 화면용: 기판매(실적/기반) vs 예측 판매 — 컬럼이 있으면 각각 매핑
+    fc_qty_c = first_existing_col(
+        weekly_df, ["forecast_qty", "forecastqty", "week_forecast_qty", "pred_sale_qty"]
+    )
+    hist_c = first_existing_col(
+        weekly_df,
+        [
+            "sold_qty",
+            "actual_sale_qty",
+            "hist_sale_qty",
+            "base_sale_qty",
+            "sale_qty",
+            "saleqty",
+        ],
+    )
+    if fc_qty_c and hist_c and fc_qty_c == hist_c:
+        hist_c = first_existing_col(
+            weekly_df,
+            ["sold_qty", "actual_sale_qty", "hist_sale_qty", "base_sale_qty", "saleqty"],
+        )
     st_c = first_existing_col(weekly_df, ["begin_stock", "beginstock", "stock_qty"])
     fc_c = first_existing_col(weekly_df, ["is_forecast", "isforecast"])
     name_c = first_existing_col(weekly_df, ["sku_name", "skuname", "SKU_NAME"])
@@ -220,6 +244,14 @@ def normalize_weekly_slice(weekly_df: pd.DataFrame) -> pd.DataFrame:
         out["_demand"] = out[dem_c].apply(clean_number)
     else:
         out["_demand"] = 0.0
+    if fc_qty_c:
+        out["_fc_sale"] = out[fc_qty_c].apply(clean_number)
+    else:
+        out["_fc_sale"] = np.nan
+    if hist_c:
+        out["_hist_sale"] = out[hist_c].apply(clean_number)
+    else:
+        out["_hist_sale"] = np.nan
     out["_stock"] = out[st_c].apply(to_int_safe) if st_c else 0
     if fc_c:
         out["_is_fc"] = out[fc_c].apply(
@@ -395,11 +427,13 @@ def compute_store_rows_for_week(
 ) -> pd.DataFrame:
     """
     한 주차 기준 매장별: 수요, 재고, PLC(주), 역할, 결품부족분, 회전가능 잉여.
+    회전 잉여는 PLC 초과분이어도 매장당 MIN_STORE_RETAIN_QTY 장은 남긴 뒤 넘길 수 있는 수량만 집계.
     """
     w = slice_norm[slice_norm["_year_week"] == str(year_week).strip()].copy()
     if w.empty:
         return pd.DataFrame()
 
+    retain_floor = max(0, int(MIN_STORE_RETAIN_QTY))
     rows = []
     for _, r in w.iterrows():
         sku = r["_sku"]
@@ -412,11 +446,26 @@ def compute_store_rows_for_week(
         weekly_sales = max(d, 0.0)
         plc = (stock / weekly_sales) if weekly_sales > eps else (np.inf if stock > 0 else 0.0)
 
+        hist_raw = r["_hist_sale"] if "_hist_sale" in r.index else np.nan
+        fc_raw = r["_fc_sale"] if "_fc_sale" in r.index else np.nan
+        기판매량 = np.nan
+        if pd.notna(hist_raw):
+            기판매량 = round(max(float(hist_raw), 0.0), 2)
+        예측판매량 = round(max(float(fc_raw), 0.0), 2) if pd.notna(fc_raw) else round(weekly_sales, 2)
+
         shortage = weekly_sales > stock + eps
         deficit = max(0.0, weekly_sales - stock) if shortage else 0.0
 
-        is_source = weekly_sales > eps and plc > plc_weeks_threshold
-        excess_transfer = max(0.0, stock - plc_weeks_threshold * weekly_sales) if is_source else 0.0
+        # PLC 높음 = 판매 대비 재고 과다 → 잉여 출고 후보. 실제 넘길 수량은 바닥 재고(retain)를 남긴 만큼만.
+        is_plc_source = weekly_sales > eps and plc > plc_weeks_threshold
+        retain_cap = max(0, stock - retain_floor)
+        plc_excess = (
+            max(0.0, float(stock) - plc_weeks_threshold * weekly_sales) if is_plc_source else 0.0
+        )
+        excess_transfer_raw = min(plc_excess, float(retain_cap)) if is_plc_source else 0.0
+        excess_transfer = int(round(excess_transfer_raw))
+        # 재고가 retain 이하여서 넘길 수 없으면 출고 후보 아님 → 역할 정상 유지
+        is_source = is_plc_source and retain_cap > 0 and excess_transfer > 0
 
         if shortage:
             role = "결품위험"
@@ -433,6 +482,8 @@ def compute_store_rows_for_week(
                 "style_code": style_val,
                 "매장": store,
                 "주차": year_week,
+                "기판매량": 기판매량,
+                "예측판매량": 예측판매량,
                 "주간예측수요": round(weekly_sales, 2),
                 "기초재고": stock,
                 "PLC_주": round(float(plc), 2) if np.isfinite(plc) else None,
@@ -495,6 +546,23 @@ def aggregate_sku_summary(store_df: pd.DataFrame, center_by_sku: pd.Series, moq_
         )
     out = pd.DataFrame(parts).sort_values("물류+회전_반영_추가발주", ascending=False)
     return out.reset_index(drop=True)
+
+
+def logistics_stock_two_rows(center_qty: int, store_deficit_total: int) -> pd.DataFrame:
+    """
+    물류 재고를 2행으로 표시: ① 센터 보유 합 ② 매장 결품 부족 충당 가정 후 센터 잔여.
+    (센터에서 매장 부족분을 우선 충당한다고 가정한 수치입니다.)
+    """
+    c = max(0, int(center_qty))
+    d = max(0, int(store_deficit_total))
+    ship_to_stores = min(c, d)
+    remaining = c - ship_to_stores
+    return pd.DataFrame(
+        [
+            {"구분": "보유 재고 (물류센터)", "수량": c},
+            {"구분": "매장 부족 충당 후 잔여", "수량": remaining},
+        ]
+    )
 
 
 def inject_theme_css():
@@ -661,6 +729,16 @@ def main():
                 _lt = int(m["lead_time_days"])
                 _moq = int(m["minimum_capacity"])
 
+    sku_choices = sorted(store_level["sku"].astype(str).unique().tolist())
+    _detail_default = pick if pick in sku_choices else (sku_choices[0] if sku_choices else "")
+    _detail_ix = sku_choices.index(_detail_default) if _detail_default in sku_choices else 0
+    detail_sku = st.sidebar.selectbox(
+        "매장 전개 · 물류 · 최종 발주 SKU",
+        options=sku_choices or [""],
+        index=min(_detail_ix, max(0, len(sku_choices) - 1)) if sku_choices else 0,
+        help="매장별 판매·재고 표, 물류 2행, 최종 추가 발주 요약에 쓰는 SKU입니다.",
+    )
+
     if st.sidebar.button("데이터 새로고침"):
         st.cache_data.clear()
         st.rerun()
@@ -696,7 +774,8 @@ def main():
     st.subheader("SKU별 취합")
     st.caption(
         "매장결품부족_합: 결품 위험 매장의 max(예측−기초재고) 합. "
-        "회전가능잉여_합: PLC 기준 초과 재고. "
+        "회전가능잉여_합: PLC(임계 초과)·판매 부진 매장만 대상으로, 매장마다 최소 기초재고 "
+        f"{MIN_STORE_RETAIN_QTY}장을 남긴 뒤 넘길 수 있는 잉여만 합산(상한 캡). "
         "물류+회전_반영_추가발주 = max(0, 부족합−물류센터) − min(회전잉여, 그 잔여)."
     )
 
@@ -730,6 +809,95 @@ def main():
     )
 
     st.markdown("---")
+    st.subheader("선택 SKU · 매장별 판매·재고 전개")
+    st.caption(
+        "`sku_weekly_forecast`에서 매장별 **기판매량**(실적·기반 컬럼)과 **예측판매량**(예측 전용 컬럼)을 읽어 표시합니다. "
+        "예측 전용 컬럼이 없으면 예측 열은 PLC·결품 계산에 쓰인 주간 수요와 동일하게 둡니다."
+    )
+    spread = store_level[store_level["sku"].astype(str) == str(detail_sku)].copy()
+    if spread.empty and detail_sku:
+        st.warning(f"SKU **`{detail_sku}`** 에 해당하는 매장 행이 없습니다.")
+    else:
+        spread_cols = [
+            "매장",
+            "기판매량",
+            "예측판매량",
+            "주간예측수요",
+            "기초재고",
+            "PLC_주",
+            "역할",
+            "결품부족분",
+            "회전가능잉여",
+        ]
+        spread_display = spread[spread_cols].sort_values(
+            ["역할", "결품부족분"], ascending=[True, False]
+        )
+        st.dataframe(
+            spread_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "기판매량": st.column_config.NumberColumn("기판매량", format="%.2f"),
+                "예측판매량": st.column_config.NumberColumn("예측판매량", format="%.2f"),
+                "주간예측수요": st.column_config.NumberColumn("주간수요(계산)", format="%.2f"),
+                "PLC_주": st.column_config.NumberColumn("PLC(주)", format="%.2f"),
+                "결품부족분": st.column_config.NumberColumn("결품 부족", format="%d"),
+                "회전가능잉여": st.column_config.NumberColumn("회전 잉여", format="%d"),
+            },
+        )
+
+    st.markdown("---")
+    st.subheader("물류센터 재고 · 동일 SKU (2행)")
+    st.caption(
+        "① 센터 **보유** ② 매장 **결품 부족 합**을 센터 재고로 먼저 충당했다고 가정한 뒤 **센터 잔여**입니다. "
+        "(실제 배분·출고 규칙과 다르면 수치는 참고용입니다.)"
+    )
+    sum_detail = summary[summary["sku"].astype(str) == str(detail_sku)]
+    if sum_detail.empty:
+        st.info("선택 SKU가 취합 요약에 없어 물류 2행을 표시하지 않습니다.")
+    else:
+        r_sum = sum_detail.iloc[0]
+        logistics_df = logistics_stock_two_rows(
+            int(r_sum["물류센터_재고"]),
+            int(r_sum["매장결품부족_합"]),
+        )
+        st.dataframe(
+            logistics_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={"수량": st.column_config.NumberColumn("수량", format="%d")},
+        )
+
+    st.markdown("---")
+    st.subheader("최종: 물류·회전 반영 후 추가 발주")
+    st.caption(
+        "**매장 부족 합**에서 물류 재고를 빼고, 남은 부족을 **회전 잉여**로 메운 뒤의 **추가 발주**와 MOQ 반영 제안입니다. "
+        "(SKU 취합 표의 `물류+회전_반영_추가발주`와 동일 로직.)"
+    )
+    if sum_detail.empty:
+        st.info("선택 SKU에 대한 취합 요약이 없습니다.")
+    else:
+        r0 = sum_detail.iloc[0]
+        deficit_all = int(r0["매장결품부족_합"])
+        center_q = int(r0["물류센터_재고"])
+        rot_pool = int(r0["회전가능잉여_합"])
+        rot_use = int(r0["회전으로_충당(상한)"])
+        after_center = max(0, deficit_all - center_q)
+        need_extra = int(r0["물류+회전_반영_추가발주"])
+        moq_sug = int(r0["MOQ반영_제안발주"])
+        use_center = min(center_q, deficit_all)
+        st.markdown(
+            f"**SKU:** `{detail_sku}` · {r0.get('sku_name', '')}  \n"
+            f"- 매장 결품 **부족 합:** **{deficit_all:,}**  \n"
+            f"- 물류센터 **보유:** **{center_q:,}** → 부족 충당에 **최대** **{use_center:,}** 사용 가정, "
+            f"부족 **잔여:** **{after_center:,}**  \n"
+            f"- 회전 가능 잉여 **합:** **{rot_pool:,}** → 위 잔여에 **{rot_use:,}** 까지 충당  \n"
+            f"- <span class='hl-short'>** 추가 발주 필요(추정):** **{need_extra:,}** </span>  \n"
+            f"- MOQ 반영 **제안 발주:** **{moq_sug:,}**",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
     st.subheader("매장별 상세 (드릴다운)")
     st.caption(
         "**매장** 선택은 이 표만 좁혀 보는 용도입니다. "
@@ -749,7 +917,7 @@ def main():
         default=["결품위험", "회전출고(판매부진)"],
     )
 
-    det = store_level[store_level["sku"] == pick].copy()
+    det = store_level[store_level["sku"].astype(str) == str(detail_sku)].copy()
     if role_filter:
         det = det[det["역할"].isin(role_filter)].copy()
 
@@ -760,6 +928,8 @@ def main():
     det_display = view_det[
         [
             "매장",
+            "기판매량",
+            "예측판매량",
             "주간예측수요",
             "기초재고",
             "PLC_주",
@@ -774,14 +944,16 @@ def main():
         use_container_width=True,
         hide_index=True,
         column_config={
-            "주간예측수요": st.column_config.NumberColumn("주간 예측", format="%.2f"),
+            "기판매량": st.column_config.NumberColumn("기판매량", format="%.2f"),
+            "예측판매량": st.column_config.NumberColumn("예측판매량", format="%.2f"),
+            "주간예측수요": st.column_config.NumberColumn("주간수요(계산)", format="%.2f"),
             "PLC_주": st.column_config.NumberColumn("PLC(주)", format="%.2f"),
             "결품부족분": st.column_config.NumberColumn("결품 부족", format="%d"),
             "회전가능잉여": st.column_config.NumberColumn("회전 잉여", format="%d"),
         },
     )
 
-    sub_sum = summary[summary["sku"] == pick]
+    sub_sum = summary[summary["sku"].astype(str) == str(detail_sku)]
     if not sub_sum.empty:
         row = sub_sum.iloc[0]
         st.markdown(
@@ -791,7 +963,7 @@ def main():
             f"<span class='hl-short'>추가 발주(추정): **{int(row['물류+회전_반영_추가발주']):,}**</span>",
             unsafe_allow_html=True,
         )
-    elif pick:
+    elif detail_sku:
         st.info(
             "선택한 SKU가 `public.sku_weekly_forecast` 기준 상단 취합에 없을 수 있습니다. "
             "아래는 동일 테이블의 매장별 행입니다."
