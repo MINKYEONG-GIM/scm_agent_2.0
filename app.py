@@ -93,6 +93,32 @@ def weekly_batch_key_col(weekly_df: pd.DataFrame) -> Optional[str]:
     return first_existing_col(weekly_df, ["forecast_run_id", "forecast_runid", "id"])
 
 
+def sortable_run_time(ts) -> float:
+    """
+    배치 정렬용 시각 → 비교 가능한 float (ns).
+    tz-aware / naive 혼합·datetime 혼합 시 Timestamp 직접 비교 TypeError 방지.
+    """
+    if ts is None:
+        return 0.0
+    try:
+        if pd.isna(ts):
+            return 0.0
+    except (TypeError, ValueError):
+        pass
+    try:
+        t = pd.Timestamp(ts)
+    except Exception:
+        return 0.0
+    if pd.isna(t):
+        return 0.0
+    try:
+        if t.tzinfo is not None:
+            t = t.tz_convert("UTC").tz_localize(None)
+    except Exception:
+        pass
+    return float(t.value)
+
+
 def list_run_batches(runs_df: pd.DataFrame, weekly_df: pd.DataFrame) -> List[Tuple[Any, pd.Timestamp, int]]:
     wk_fr = weekly_batch_key_col(weekly_df)
     if weekly_df.empty or wk_fr is None:
@@ -134,7 +160,7 @@ def list_run_batches(runs_df: pd.DataFrame, weekly_df: pd.DataFrame) -> List[Tup
         n_w = int((weekly_df[wk_fr] == k).sum())
         parts.append((k, rd, n_w))
 
-    parts.sort(key=lambda x: (x[1], x[2]), reverse=True)
+    parts.sort(key=lambda x: (sortable_run_time(x[1]), x[2]), reverse=True)
     return parts
 
 
