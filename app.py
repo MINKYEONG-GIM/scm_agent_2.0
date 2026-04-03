@@ -1058,41 +1058,6 @@ def main():
         st.cache_data.clear()
         st.rerun()
 
-    st.markdown("---")
-    st.subheader("주차별 취합")
-    st.caption(
-        "요청하신 6개 열만 표시합니다. "
-        f"회전 출고 가능 매장수 정의: **기초재고 > {MIN_STORE_RETAIN_QTY}** 이고 **PLC ≥ {DEFAULT_PLC_WEEKS}주** 인 매장."
-    )
-    weekly_summary = compute_weekly_summary_table(norm, center_df, reorder_df, plc_thr)
-    if weekly_summary.empty:
-        st.warning("주차별로 집계할 데이터가 없습니다. `year_week` 값과 데이터 행을 확인하세요.")
-    else:
-        keep_cols = [
-            "주차",
-            "결품위험 매장수",
-            "회전 출고 가능 매장수",
-            "물류센터 보유량",
-            "추가 입고량",
-            "MOQ",
-            "리드타임",
-        ]
-        weekly_summary = weekly_summary.reindex(columns=keep_cols)
-        st.dataframe(
-            weekly_summary,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "주차": st.column_config.TextColumn("주차"),
-                "결품위험 매장수": st.column_config.NumberColumn("결품위험 매장수", format="%d"),
-                "회전 출고 가능 매장수": st.column_config.NumberColumn("회전 출고 가능 매장수", format="%d"),
-                "물류센터 보유량": st.column_config.NumberColumn("물류센터 보유량", format="%d"),
-                "추가 입고량": st.column_config.NumberColumn("추가 입고량", format="%d"),
-                "MOQ": st.column_config.NumberColumn("MOQ", format="%d"),
-                "리드타임": st.column_config.NumberColumn("리드타임", format="%d"),
-            },
-        )
-
     # -------------------------
     # 기존 화면(주차 단일 스냅샷)
     # -------------------------
@@ -1197,6 +1162,41 @@ def main():
         st.metric("2주 내 결품 위험 매장 수", f"{ov['주차내_결품위험_매장수']:,}")
     with m4:
         st.metric("추가 발주량", f"{ov['추가_발주량']:,}")
+
+    st.markdown("---")
+    st.subheader("주차별 취합")
+    st.caption(
+        "요청하신 6개 열만 표시합니다. "
+        f"회전 출고 가능 매장수 정의: **기초재고 > {MIN_STORE_RETAIN_QTY}** 이고 **PLC ≥ {DEFAULT_PLC_WEEKS}주** 인 매장."
+    )
+    weekly_summary = compute_weekly_summary_table(norm, center_df, reorder_df, plc_thr)
+    if weekly_summary.empty:
+        st.warning("주차별로 집계할 데이터가 없습니다. `year_week` 값과 데이터 행을 확인하세요.")
+    else:
+        keep_cols = [
+            "주차",
+            "결품위험 매장수",
+            "회전 출고 가능 매장수",
+            "물류센터 보유량",
+            "추가 입고량",
+            "MOQ",
+            "리드타임",
+        ]
+        weekly_summary = weekly_summary.reindex(columns=keep_cols)
+        st.dataframe(
+            weekly_summary,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "주차": st.column_config.TextColumn("주차"),
+                "결품위험 매장수": st.column_config.NumberColumn("결품위험 매장수", format="%d"),
+                "회전 출고 가능 매장수": st.column_config.NumberColumn("회전 출고 가능 매장수", format="%d"),
+                "물류센터 보유량": st.column_config.NumberColumn("물류센터 보유량", format="%d"),
+                "추가 입고량": st.column_config.NumberColumn("추가 입고량", format="%d"),
+                "MOQ": st.column_config.NumberColumn("MOQ", format="%d"),
+                "리드타임": st.column_config.NumberColumn("리드타임", format="%d"),
+            },
+        )
 
     st.markdown("---")
     st.subheader("SKU별 취합")
