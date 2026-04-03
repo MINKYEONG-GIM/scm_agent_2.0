@@ -1200,12 +1200,6 @@ def main():
 
     st.markdown("---")
     st.subheader("SKU별 취합")
-    st.caption(
-        "매장결품부족_합: 결품 위험 매장의 max(예측−기초재고) 합. "
-        "회전가능잉여_합: PLC(임계 초과)·판매 부진 매장만 대상으로, 매장마다 최소 기초재고 "
-        f"{MIN_STORE_RETAIN_QTY}장을 남긴 뒤 넘길 수 있는 잉여만 합산(상한 캡). "
-        "물류+회전_반영_추가발주 = max(0, 부족합−물류센터) − min(회전잉여, 그 잔여)."
-    )
 
     display_cols = [
         "sku",
