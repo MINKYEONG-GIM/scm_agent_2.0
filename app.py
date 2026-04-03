@@ -88,8 +88,13 @@ def infer_run_batch_key(runs_df: pd.DataFrame) -> str:
     return "id"
 
 
+def weekly_batch_key_col(weekly_df: pd.DataFrame) -> Optional[str]:
+    """sku_weekly_forecast ↔ sku_forecast_run 연결 컬럼 (forecast_run_id 없으면 id)."""
+    return first_existing_col(weekly_df, ["forecast_run_id", "forecast_runid", "id"])
+
+
 def list_run_batches(runs_df: pd.DataFrame, weekly_df: pd.DataFrame) -> List[Tuple[Any, pd.Timestamp, int]]:
-    wk_fr = first_existing_col(weekly_df, ["forecast_run_id", "forecast_runid"])
+    wk_fr = weekly_batch_key_col(weekly_df)
     if weekly_df.empty or wk_fr is None:
         return []
 
@@ -103,7 +108,11 @@ def list_run_batches(runs_df: pd.DataFrame, weekly_df: pd.DataFrame) -> List[Tup
         parts.sort(key=lambda x: x[2], reverse=True)
         return parts
 
-    parent_key = infer_run_batch_key(runs_df)
+    # 주간 테이블이 id로 묶이면 부모도 sku_forecast_run.id 로 매칭
+    if wk_fr == "id" and "id" in runs_df.columns:
+        parent_key = "id"
+    else:
+        parent_key = infer_run_batch_key(runs_df)
     rd_col = first_existing_col(runs_df, ["run_date", "rundate", "created_at"])
     if not rd_col:
         rd_col = runs_df.columns[0]
@@ -138,7 +147,7 @@ def filter_by_run_key(df: pd.DataFrame, run_key_col: str, batch_key: object) -> 
 def normalize_weekly_slice(weekly_df: pd.DataFrame) -> pd.DataFrame:
     """
     sku_weekly_forecast → 표준 컬럼: sku, store, year_week, demand_w, begin_stock,
-    is_forecast, sku_name, created_at, forecast_run_id(optional)
+    is_forecast, sku_name, created_at, 배치 키(id 또는 forecast_run_id, 선택)
     """
     if weekly_df.empty:
         return pd.DataFrame()
@@ -155,7 +164,7 @@ def normalize_weekly_slice(weekly_df: pd.DataFrame) -> pd.DataFrame:
     fc_c = first_existing_col(weekly_df, ["is_forecast", "isforecast"])
     name_c = first_existing_col(weekly_df, ["sku_name", "skuname", "SKU_NAME"])
     ca_c = first_existing_col(weekly_df, ["created_at", "createdat"])
-    fr_c = first_existing_col(weekly_df, ["forecast_run_id", "forecast_runid"])
+    fr_c = first_existing_col(weekly_df, ["forecast_run_id", "forecast_runid", "id"])
 
     if not sku_c or not yw_c or not dem_c:
         return pd.DataFrame()
@@ -397,7 +406,7 @@ def main():
         st.warning("sku_weekly_forecast에 데이터가 없습니다.")
         return
 
-    wk_fr = first_existing_col(weekly_raw, ["forecast_run_id", "forecast_runid"])
+    wk_fr = weekly_batch_key_col(weekly_raw)
     weekly_filtered = weekly_raw.copy()
 
     st.sidebar.markdown("### 데이터 범위")
@@ -406,7 +415,12 @@ def main():
     if wk_fr and weekly_raw[wk_fr].notna().any():
         batches = list_run_batches(runs_df, weekly_raw)
         if batches:
-            use_batch = st.sidebar.checkbox("예측 배치(forecast_run_id)로 필터", value=True)
+            batch_filter_label = (
+                "예측 배치(id ↔ sku_forecast_run.id)로 필터"
+                if wk_fr == "id"
+                else "예측 배치(forecast_run_id)로 필터"
+            )
+            use_batch = st.sidebar.checkbox(batch_filter_label, value=True)
             if use_batch:
                 batch_labels = {
                     str(k): f"{pd.Timestamp(rd).strftime('%Y-%m-%d %H:%M')} · batch={k} · {n}행"
