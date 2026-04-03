@@ -977,8 +977,13 @@ def main():
         )
         return
 
-    # 주차 선택 없음: 데이터에 있는 year_week 중 정렬상 가장 최신 1개만 사용 (발주 시점 산출용 단일 스냅샷)
-    year_week = yw_list[0]
+    st.sidebar.markdown("### 주차 선택")
+    year_week = st.sidebar.selectbox(
+        "year_week",
+        options=yw_list,
+        index=0,
+        help="선택한 주차 기준으로 결품·회전·추가발주를 계산합니다. (기본값=가장 최신 주차)",
+    )
     plc_thr = float(DEFAULT_PLC_WEEKS)
 
     center_by_sku = center_stock_by_sku(center_df)
