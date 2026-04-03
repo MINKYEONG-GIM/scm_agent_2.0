@@ -1,10 +1,9 @@
 
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 from supabase import create_client
 
@@ -48,6 +47,37 @@ def to_int_safe(x, default: int = 0) -> int:
     if pd.isna(v):
         return default
     return int(round(v))
+
+
+# 예: "26년 12월 5주차", "2026-W03"
+_YW_KO_RE = re.compile(r"^\s*(\d+)\s*년\s*(\d+)\s*월\s*(\d+)\s*주차\s*$", re.UNICODE)
+_YW_ISO_RE = re.compile(r"^\s*(\d{4})\s*[-]?\s*[Ww]?\s*(\d{1,2})\s*$")
+
+
+def year_week_sort_key(label: str) -> Tuple:
+    """주차 라벨 정렬용 키 (최신 우선 = reverse=True)."""
+    s = str(label).strip()
+    m = _YW_KO_RE.match(s)
+    if m:
+        yy, mo, wk = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        cal_y = 2000 + yy if yy < 100 else yy
+        return (0, cal_y, mo, wk)
+    m2 = _YW_ISO_RE.match(s)
+    if m2:
+        return (1, int(m2.group(1)), int(m2.group(2)), 0)
+    return (2, s)
+
+
+def sort_year_week_labels(labels: List[str]) -> List[str]:
+    seen = set()
+    uniq: List[str] = []
+    for x in labels:
+        t = str(x).strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        uniq.append(t)
+    return sorted(uniq, key=year_week_sort_key, reverse=True)
 
 
 def load_supabase_table(table_name: str, page_size: int = 1000) -> pd.DataFrame:
@@ -192,7 +222,8 @@ def normalize_weekly_slice(weekly_df: pd.DataFrame) -> pd.DataFrame:
     ca_c = first_existing_col(weekly_df, ["created_at", "createdat"])
     fr_c = first_existing_col(weekly_df, ["forecast_run_id", "forecast_runid", "id"])
 
-    if not sku_c or not yw_c or not dem_c:
+    # 수요 컬럼: 없으면 0으로 두고 진행 (year_week·sku는 있으나 sale_qty 누락인 경우)
+    if not sku_c or not yw_c:
         return pd.DataFrame()
 
     out = weekly_df.copy()
@@ -203,7 +234,10 @@ def normalize_weekly_slice(weekly_df: pd.DataFrame) -> pd.DataFrame:
         else pd.Series("_unknown", index=out.index)
     )
     out["_year_week"] = out[yw_c].astype(str).str.strip()
-    out["_demand"] = out[dem_c].apply(clean_number)
+    if dem_c:
+        out["_demand"] = out[dem_c].apply(clean_number)
+    else:
+        out["_demand"] = 0.0
     out["_stock"] = out[st_c].apply(to_int_safe) if st_c else 0
     if fc_c:
         out["_is_fc"] = out[fc_c].apply(
@@ -469,19 +503,33 @@ def main():
     norm = normalize_weekly_slice(weekly_filtered)
     if norm.empty:
         st.warning(
-            "sku_weekly_forecast에서 필수 컬럼(sku, year_week, sale_qty 또는 forecast_qty)을 찾지 못했습니다."
+            "sku_weekly_forecast에서 필수 컬럼(**sku**, **year_week**)을 찾지 못했습니다."
         )
         return
 
-    fc_only = st.sidebar.checkbox("미래 예측 행만(is_forecast=true)", value=True)
+    norm_before_fc = norm.copy()
+    fc_only = st.sidebar.checkbox(
+        "미래 예측 행만(is_forecast=true)",
+        value=False,
+        help="DB에 is_forecast=true 행이 없으면 켜 두면 주차 목록이 비어 보일 수 있습니다.",
+    )
     if fc_only:
-        norm = norm[norm["_is_fc"] == True].copy()  # noqa: E712
+        norm = norm_before_fc[norm_before_fc["_is_fc"] == True].copy()  # noqa: E712
+        if norm.empty and not norm_before_fc.empty:
+            st.warning(
+                "**is_forecast=true** 인 행이 없어 필터 결과가 비었습니다. "
+                "위 옵션을 끄면 `year_week`(예: 26년 12월 5주차)가 표시됩니다."
+            )
+            norm = norm_before_fc.copy()
 
     norm = dedupe_weekly_latest(norm)
 
-    yw_list = sorted(norm["_year_week"].unique().tolist(), reverse=True)
+    yw_list = sort_year_week_labels(norm["_year_week"].tolist())
     if not yw_list:
-        st.warning("주차(year_week) 값이 없습니다.")
+        st.warning(
+            "**year_week** 값이 모두 비었거나, 배치 필터로 남은 행이 없습니다. "
+            "사이드바에서 배치 필터를 끄거나 데이터를 확인해 주세요."
+        )
         return
 
     year_week = st.sidebar.selectbox("기준 주차 (year_week)", options=yw_list, index=0)
