@@ -1067,32 +1067,295 @@ def main():
     weekly_summary = compute_weekly_summary_table(norm, center_df, reorder_df, plc_thr)
     if weekly_summary.empty:
         st.warning("주차별로 집계할 데이터가 없습니다. `year_week` 값과 데이터 행을 확인하세요.")
+    else:
+        keep_cols = [
+            "주차",
+            "결품위험 매장수",
+            "회전 출고 가능 매장수",
+            "물류센터 보유량",
+            "추가 입고량",
+            "MOQ",
+            "리드타임",
+        ]
+        weekly_summary = weekly_summary.reindex(columns=keep_cols)
+        st.dataframe(
+            weekly_summary,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "주차": st.column_config.TextColumn("주차"),
+                "결품위험 매장수": st.column_config.NumberColumn("결품위험 매장수", format="%d"),
+                "회전 출고 가능 매장수": st.column_config.NumberColumn("회전 출고 가능 매장수", format="%d"),
+                "물류센터 보유량": st.column_config.NumberColumn("물류센터 보유량", format="%d"),
+                "추가 입고량": st.column_config.NumberColumn("추가 입고량", format="%d"),
+                "MOQ": st.column_config.NumberColumn("MOQ", format="%d"),
+                "리드타임": st.column_config.NumberColumn("리드타임", format="%d"),
+            },
+        )
+
+    # -------------------------
+    # 기존 화면(주차 단일 스냅샷)
+    # -------------------------
+    st.sidebar.markdown("### 주차 선택")
+    year_week = st.sidebar.selectbox(
+        "year_week",
+        options=yw_list,
+        index=0,
+        help="선택한 주차 기준으로 기존 표(취합/드릴다운/리오더)를 계산합니다.",
+    )
+
+    center_by_sku = center_stock_by_sku(center_df)
+    moq_df = reorder_params_by_sku(reorder_df)
+
+    store_level = compute_store_rows_for_week(norm, year_week, plc_thr)
+    if store_level.empty:
+        st.warning(
+            f"`public.sku_weekly_forecast`에 선택한 주차 **`{year_week}`** 와 일치하는 **`year_week`** 행이 없습니다. "
+            "데이터의 `year_week` 값을 확인하세요."
+        )
         return
 
-    keep_cols = [
-        "주차",
-        "결품위험 매장수",
-        "회전 출고 가능 매장수",
-        "물류센터 보유량",
-        "추가 입고량",
-        "MOQ",
-        "리드타임",
+    summary = aggregate_sku_summary(store_level, center_by_sku, moq_df)
+
+    st.sidebar.markdown("### 리오더 (style_code)")
+    sku_opts_headline = summary["sku"].tolist()
+    if not sku_opts_headline:
+        sku_opts_headline = sorted(store_level["sku"].unique().tolist())
+
+    has_style = (
+        "style_code" in store_level.columns
+        and (store_level["style_code"].astype(str).str.strip() != "").any()
+    )
+
+    scope_prefix = ""
+    sl_headline = pd.DataFrame()
+    _lt, _moq = 0, 0
+    pick = str(sku_opts_headline[0]) if sku_opts_headline else ""
+
+    if has_style:
+        style_opts = sorted(
+            {str(x).strip() for x in store_level["style_code"].tolist() if str(x).strip() != ""}
+        )
+        guidance_style = st.sidebar.selectbox(
+            "style_code",
+            options=style_opts,
+            index=0,
+        )
+        sl_headline = store_level[
+            store_level["style_code"].astype(str) == str(guidance_style)
+        ].copy()
+        sk_list = sorted(sl_headline["sku"].astype(str).unique().tolist())
+        _lt, _moq = reorder_lt_moq_for_skus(sk_list, moq_df, summary)
+        scope_prefix = f"[style_code <strong>{guidance_style}</strong>] "
+        pick = str(sk_list[0]) if sk_list else (str(sku_opts_headline[0]) if sku_opts_headline else "")
+    else:
+        st.sidebar.caption(
+            "`style_code`가 없으면 이 항목을 고를 수 없습니다. 리오더·하단 상세는 첫 SKU로 자동 표시합니다."
+        )
+        if pick:
+            sl_headline = store_level[store_level["sku"].astype(str) == pick].copy()
+            g_row = summary[summary["sku"] == pick]
+            if not g_row.empty:
+                _lt = int(g_row["리드타임_일"].iloc[0])
+                _moq = int(g_row["MOQ(참고)"].iloc[0])
+            elif not moq_df.empty and pick in moq_df["sku"].astype(str).values:
+                m = moq_df[moq_df["sku"].astype(str) == str(pick)].iloc[-1]
+                _lt = int(m["lead_time_days"])
+                _moq = int(m["minimum_capacity"])
+
+    sku_choices = sorted(store_level["sku"].astype(str).unique().tolist())
+    _detail_default = pick if pick in sku_choices else (sku_choices[0] if sku_choices else "")
+    _detail_ix = sku_choices.index(_detail_default) if _detail_default in sku_choices else 0
+    detail_sku = st.sidebar.selectbox(
+        "매장 전개 · 물류 · 최종 발주 SKU",
+        options=sku_choices or [""],
+        index=min(_detail_ix, max(0, len(sku_choices) - 1)) if sku_choices else 0,
+        help="주차×매장 표(물류재고 열·판매·기초재고), 최종 추가 발주 요약에 쓰는 SKU입니다.",
+    )
+
+    headline_txt = reorder_guidance_for_store_slice(
+        sl_headline,
+        center_by_sku,
+        _lt,
+        _moq,
+        float(DEFAULT_REORDER_SALES_WEEKS),
+        scope_prefix=scope_prefix,
+    )
+    reorder_headline_ph.markdown(
+        f'<div class="reorder-headline">{headline_txt}</div>',
+        unsafe_allow_html=True,
+    )
+
+    ov = overview_kpis(store_level, summary, norm_df=norm, stockout_horizon_weeks=2.0)
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("분배된 매장수", f"{ov['분배된_매장수']:,}")
+    with m2:
+        st.metric("누판율", f"{ov['누판율_퍼센트']:.1f}%")
+    with m3:
+        st.metric("2주 내 결품 위험 매장 수", f"{ov['주차내_결품위험_매장수']:,}")
+    with m4:
+        st.metric("추가 발주량", f"{ov['추가_발주량']:,}")
+
+    st.markdown("---")
+    st.subheader("SKU별 취합")
+    st.caption(
+        "매장결품부족_합: 결품 위험 매장의 max(예측−기초재고) 합. "
+        "회전가능잉여_합: PLC(임계 초과)·판매 부진 매장만 대상으로, 매장마다 최소 기초재고 "
+        f"{MIN_STORE_RETAIN_QTY}장을 남긴 뒤 넘길 수 있는 잉여만 합산(상한 캡). "
+        "물류+회전_반영_추가발주 = max(0, 부족합−물류센터) − min(회전잉여, 그 잔여)."
+    )
+
+    display_cols = [
+        "sku",
+        "sku_name",
+        "결품위험_매장수",
+        "회전출고_매장수",
+        "매장결품부족_합",
+        "물류센터_재고",
+        "회전가능잉여_합",
+        "회전으로_충당(상한)",
+        "물류+회전_반영_추가발주",
+        "MOQ(참고)",
+        "MOQ반영_제안발주",
+        "리드타임_일",
     ]
-    weekly_summary = weekly_summary.reindex(columns=keep_cols)
     st.dataframe(
-        weekly_summary,
+        summary[display_cols],
         use_container_width=True,
         hide_index=True,
         column_config={
-            "주차": st.column_config.TextColumn("주차"),
-            "결품위험 매장수": st.column_config.NumberColumn("결품위험 매장수", format="%d"),
-            "회전 출고 가능 매장수": st.column_config.NumberColumn("회전 출고 가능 매장수", format="%d"),
-            "물류센터 보유량": st.column_config.NumberColumn("물류센터 보유량", format="%d"),
-            "추가 입고량": st.column_config.NumberColumn("추가 입고량", format="%d"),
-            "MOQ": st.column_config.NumberColumn("MOQ", format="%d"),
-            "리드타임": st.column_config.NumberColumn("리드타임", format="%d"),
+            "sku": st.column_config.TextColumn("SKU"),
+            "sku_name": st.column_config.TextColumn("상품명"),
+            "매장결품부족_합": st.column_config.NumberColumn("매장 부족 합", format="%d"),
+            "물류센터_재고": st.column_config.NumberColumn("물류센터", format="%d"),
+            "회전가능잉여_합": st.column_config.NumberColumn("회전 잉여 합", format="%d"),
+            "물류+회전_반영_추가발주": st.column_config.NumberColumn("추가 발주", format="%d"),
+            "MOQ반영_제안발주": st.column_config.NumberColumn("MOQ 반영 제안", format="%d"),
         },
     )
+
+    st.markdown("---")
+    st.subheader("선택 SKU · 주차 × 매장 표")
+    wide_df, wide_fc_mask, wide_note = build_sku_week_wide_table(
+        norm, str(detail_sku), center_df, center_by_sku
+    )
+    st.caption(
+        "행=주차, 열=**물류센터 1/2 재고량** + 매장별 **판매량**(실적 우선·예측만일 때 **빨간색**) + **기초재고량**. "
+        + wide_note
+    )
+    if wide_df.empty:
+        st.warning(
+            f"SKU **`{detail_sku}`** 에 해당하는 `sku_weekly_forecast` 행이 없어 주차·매장 표를 만들 수 없습니다."
+        )
+    else:
+        st.markdown("**주차 × 매장**")
+        styled = style_week_store_wide(wide_df.reset_index(drop=True), wide_fc_mask.reset_index(drop=True))
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    sum_detail = summary[summary["sku"].astype(str) == str(detail_sku)]
+
+    st.markdown("---")
+    st.subheader("최종: 물류·회전 반영 후 추가 발주")
+    st.caption(
+        "**매장 부족 합**에서 물류 재고를 빼고, 남은 부족을 **회전 잉여**로 메운 뒤의 **추가 발주**와 MOQ 반영 제안입니다. "
+        "(SKU 취합 표의 `물류+회전_반영_추가발주`와 동일 로직.)"
+    )
+    if sum_detail.empty:
+        st.info("선택 SKU에 대한 취합 요약이 없습니다.")
+    else:
+        r0 = sum_detail.iloc[0]
+        deficit_all = int(r0["매장결품부족_합"])
+        center_q = int(r0["물류센터_재고"])
+        rot_pool = int(r0["회전가능잉여_합"])
+        rot_use = int(r0["회전으로_충당(상한)"])
+        after_center = max(0, deficit_all - center_q)
+        need_extra = int(r0["물류+회전_반영_추가발주"])
+        moq_sug = int(r0["MOQ반영_제안발주"])
+        use_center = min(center_q, deficit_all)
+        st.markdown(
+            f"**SKU:** `{detail_sku}` · {r0.get('sku_name', '')}  \n"
+            f"- 매장 결품 **부족 합:** **{deficit_all:,}**  \n"
+            f"- 물류센터 **보유:** **{center_q:,}** → 부족 충당에 **최대** **{use_center:,}** 사용 가정, "
+            f"부족 **잔여:** **{after_center:,}**  \n"
+            f"- 회전 가능 잉여 **합:** **{rot_pool:,}** → 위 잔여에 **{rot_use:,}** 까지 충당  \n"
+            f"- <span class='hl-short'>** 추가 발주 필요(추정):** **{need_extra:,}** </span>  \n"
+            f"- MOQ 반영 **제안 발주:** **{moq_sug:,}**",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
+    st.subheader("매장별 상세 (드릴다운)")
+    st.caption(
+        "**매장** 선택은 이 표만 좁혀 보는 용도입니다. "
+        "SKU 취합·메트릭·리오더 안내·회전/물류 로직은 **항상 전체 매장** 기준입니다."
+    )
+
+    _store_names = sorted(store_level["매장"].astype(str).unique().tolist())
+    view_store = st.selectbox(
+        "매장 (상세 표 조회만)",
+        options=["전체"] + _store_names,
+        index=0,
+    )
+
+    role_filter = st.multiselect(
+        "역할 필터",
+        options=["결품위험", "회전출고(판매부진)", "정상"],
+        default=["결품위험", "회전출고(판매부진)"],
+    )
+
+    det = store_level[store_level["sku"].astype(str) == str(detail_sku)].copy()
+    if role_filter:
+        det = det[det["역할"].isin(role_filter)].copy()
+
+    view_det = det.copy()
+    if view_store != "전체":
+        view_det = view_det[view_det["매장"].astype(str) == str(view_store)].copy()
+
+    det_display = view_det[
+        [
+            "매장",
+            "기판매량",
+            "예측판매량",
+            "주간예측수요",
+            "기초재고",
+            "PLC_주",
+            "역할",
+            "결품부족분",
+            "회전가능잉여",
+        ]
+    ].sort_values(["역할", "결품부족분"], ascending=[True, False])
+
+    st.dataframe(
+        det_display,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "기판매량": st.column_config.NumberColumn("기판매량", format="%.2f"),
+            "예측판매량": st.column_config.NumberColumn("예측판매량", format="%.2f"),
+            "주간예측수요": st.column_config.NumberColumn("주간수요(계산)", format="%.2f"),
+            "PLC_주": st.column_config.NumberColumn("PLC(주)", format="%.2f"),
+            "결품부족분": st.column_config.NumberColumn("결품 부족", format="%d"),
+            "회전가능잉여": st.column_config.NumberColumn("회전 잉여", format="%d"),
+        },
+    )
+
+    sub_sum = summary[summary["sku"].astype(str) == str(detail_sku)]
+    if not sub_sum.empty:
+        row = sub_sum.iloc[0]
+        st.markdown(
+            f"**선택 SKU 요약** — 부족 합: **{int(row['매장결품부족_합']):,}**, "
+            f"물류센터: **{int(row['물류센터_재고']):,}**, "
+            f"회전 잉여 합: **{int(row['회전가능잉여_합']):,}**, "
+            f"<span class='hl-short'>추가 발주(추정): **{int(row['물류+회전_반영_추가발주']):,}**</span>",
+            unsafe_allow_html=True,
+        )
+    elif detail_sku:
+        st.info(
+            "선택한 SKU가 `public.sku_weekly_forecast` 기준 상단 취합에 없을 수 있습니다. "
+            "아래는 동일 테이블의 매장별 행입니다."
+        )
 
 
 if __name__ == "__main__":
