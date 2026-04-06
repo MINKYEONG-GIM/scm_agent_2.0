@@ -596,6 +596,22 @@ def health():
     return {"ok": True}
 
 
+@app.get("/debug-env")
+def debug_env():
+    """
+    배포 디버깅용: 환경변수 존재 여부만 반환(키 값은 절대 노출하지 않음).
+    """
+    url = os.getenv("SUPABASE_URL", "").strip()
+    key = os.getenv("SUPABASE_KEY", "").strip()
+    return {
+        "has_SUPABASE_URL": bool(url),
+        "has_SUPABASE_KEY": bool(key),
+        "SUPABASE_URL_host": (url.split("://", 1)[-1].split("/", 1)[0] if url else ""),
+        "SUPABASE_KEY_len": (len(key) if key else 0),
+        "note": "값은 숨기고 존재 여부만 표시합니다.",
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def home(
     year_week: Optional[str] = Query(default=None),
