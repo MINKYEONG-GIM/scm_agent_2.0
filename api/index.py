@@ -145,6 +145,43 @@ def load_supabase_table(table_name: str, page_size: int = 1000) -> pd.DataFrame:
     return pd.DataFrame(all_rows)
 
 
+def load_supabase_filtered(
+    table_name: str,
+    *,
+    eq_filters: Optional[dict] = None,
+    in_filters: Optional[dict] = None,
+    order_by: Optional[str] = None,
+    ascending: bool = True,
+    range_from: Optional[int] = None,
+    range_to: Optional[int] = None,
+    select_cols: str = "*",
+) -> pd.DataFrame:
+    """
+    서버리스 타임아웃 회피용: 필요한 행만 Supabase에서 필터링해 로드.
+    - eq_filters: {"year_week": "2026-W03"}
+    - in_filters: {"sku": ["A", "B"]}
+    - range_from/to: pagination (inclusive)
+    """
+    if supabase is None:
+        return pd.DataFrame()
+
+    q = supabase.table(table_name).select(select_cols)
+    if eq_filters:
+        for k, v in eq_filters.items():
+            q = q.eq(k, v)
+    if in_filters:
+        for k, vs in in_filters.items():
+            vs2 = [x for x in (vs or []) if str(x).strip() != ""]
+            if vs2:
+                q = q.in_(k, vs2)
+    if order_by:
+        q = q.order(order_by, desc=not ascending)
+    if range_from is not None and range_to is not None:
+        q = q.range(int(range_from), int(range_to))
+    res = q.execute()
+    return pd.DataFrame(res.data or [])
+
+
 def _is_forecast_to_bool(x) -> bool:
     if pd.isna(x):
         return True
@@ -609,6 +646,99 @@ def debug_env():
         "SUPABASE_URL_host": (url.split("://", 1)[-1].split("/", 1)[0] if url else ""),
         "SUPABASE_KEY_len": (len(key) if key else 0),
         "note": "값은 숨기고 존재 여부만 표시합니다.",
+    }
+
+
+@app.get("/api/analyze")
+def analyze(
+    year_week: str = Query(..., description="분석 기준 주차"),
+    offset: int = Query(0, ge=0, description="SKU 페이지네이션 오프셋(행 기준)"),
+    limit: int = Query(100, ge=1, le=500, description="한 번에 계산할 SKU 수(권장 100~300)"),
+    plc_weeks: float = Query(DEFAULT_PLC_WEEKS, gt=0, le=52, description="PLC(주) 임계값"),
+):
+    """
+    서버리스(5분) 타임아웃 회피용 배치 API.
+    - 한 번에 전체 SKU를 계산하지 않고, offset/limit 단위로 잘라서 처리합니다.
+    - 반환값에는 next_offset(다음 호출용)과 rows(요약 표)가 포함됩니다.
+    """
+    msg = diagnose_env()
+    if msg:
+        return JSONResponse({"ok": False, "error": msg}, status_code=500)
+
+    yw = str(year_week).strip()
+    if not yw:
+        return JSONResponse({"ok": False, "error": "`year_week`가 비어 있습니다."}, status_code=400)
+
+    # 1) SKU 목록을 '행 기준'으로 페이징하며 unique SKU를 limit개 채움
+    #    (Supabase distinct가 제한적이라, 행을 조금 넉넉히 읽고 unique로 압축합니다.)
+    unique_skus: List[str] = []
+    scan_offset = int(offset)
+    scan_hard_limit = int(limit) * 30  # 중복이 많을 수 있어 여유
+    scanned_rows = 0
+
+    while len(unique_skus) < int(limit) and scanned_rows < scan_hard_limit:
+        page = load_supabase_filtered(
+            "sku_weekly_forecast",
+            eq_filters={"year_week": yw},
+            order_by="sku",
+            ascending=True,
+            range_from=scan_offset,
+            range_to=scan_offset + 999,
+            select_cols="sku",
+        )
+        if page.empty or "sku" not in page.columns:
+            break
+        scanned_rows += len(page)
+        for s in page["sku"].astype(str).tolist():
+            s = str(s).strip()
+            if s and s not in unique_skus:
+                unique_skus.append(s)
+                if len(unique_skus) >= int(limit):
+                    break
+        scan_offset += len(page)
+        if len(page) < 1000:
+            break
+
+    if not unique_skus:
+        return {
+            "ok": True,
+            "year_week": yw,
+            "offset": offset,
+            "limit": limit,
+            "next_offset": scan_offset,
+            "skus": [],
+            "rows": [],
+            "note": "해당 주차에 데이터가 없거나, 더 이상 SKU가 없습니다.",
+        }
+
+    # 2) 선택된 SKU들에 대해서만 필요한 테이블을 로드
+    weekly_raw = load_supabase_filtered(
+        "sku_weekly_forecast",
+        eq_filters={"year_week": yw},
+        in_filters={"sku": unique_skus},
+    )
+    center_df = load_supabase_filtered("center_stock", in_filters={"sku": unique_skus})
+    reorder_df = load_supabase_filtered("reorder", in_filters={"sku": unique_skus})
+
+    norm = normalize_weekly_slice(weekly_raw.copy())
+    norm = merge_weekly_actual_forecast(norm) if not norm.empty else norm
+
+    store_level = compute_store_rows_for_week(norm, yw, float(plc_weeks))
+    center_by_sku = center_stock_by_sku(center_df)
+    moq_df = reorder_params_by_sku(reorder_df)
+    summary = aggregate_sku_summary(store_level, center_by_sku, moq_df) if not store_level.empty else pd.DataFrame()
+
+    rows = summary.to_dict(orient="records") if summary is not None and not summary.empty else []
+    return {
+        "ok": True,
+        "year_week": yw,
+        "offset": offset,
+        "limit": limit,
+        "next_offset": scan_offset,  # 다음 호출 때 offset으로 그대로 넣으면 됩니다(행 기준)
+        "sku_count": len(unique_skus),
+        "skus": unique_skus,
+        "rows": rows,
+        "note": "서버리스 타임아웃 회피를 위해 SKU를 청크로 계산합니다.",
     }
 
 
